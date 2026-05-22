@@ -1,25 +1,19 @@
 // loader/early_diag.c — paint colour blocks at candidate FB addrs.
 //
-// See include/early_diag.h for the why.  The list of candidates is
-// hand-picked from the "lower 4 GiB" Pi 5 RAM window, which is
-// guaranteed to be mapped on every Pi 5 variant (4/8/16 GiB SKUs all
-// have RAM here).  We avoid MMIO ranges (anything inside the
-// 0x107C000000 / 0x107D000000 peripheral blocks) so a wrong guess
-// doesn't trigger a data-abort to a missing exception vector.
-//
-// Each block is 256x256 px of ARGB8888 colour, written to memory and
-// then flushed out of the D-cache so the HDMI controller's DMA can
-// see it.  If any of these addresses is the actual framebuffer base,
-// the user sees a solid coloured square stamped over the firmware's
-// rainbow test pattern — and the colour tells us exactly which
-// candidate hit.
+// See include/early_diag.h for the why.  After Pi OS Lite was layered
+// on the SD card and our kernel started actually running (rainbow gone
+// → screen black instead), the original 6-candidate list wasn't dense
+// enough to catch wherever the firmware allocates the HDMI FB on a
+// 8 GiB Pi 5.  This version writes a 256 KiB CONTIGUOUS block of solid
+// colour (no row-pitch assumption!) at 16 different candidate addresses
+// covering the low 4 GiB at roughly 0.25 GiB spacing.  Pitch-independent
+// means even if the FB is wider/narrower than we'd guess, the start of
+// it gets stamped.
 
 #include "early_diag.h"
 
-#define BLOCK_W       256
-#define BLOCK_H       256
-#define PITCH_PX     1920   /* assume worst-case 1920-wide FB        */
-#define CACHE_LINE     64   /* Cortex-A76 D-cache line size          */
+#define BLOCK_BYTES    (256 * 1024)   /* 256 KiB contiguous fill      */
+#define CACHE_LINE       64           /* Cortex-A76 D-cache line size */
 
 static void clean_dcache_range(unsigned long start, unsigned long size)
 {
@@ -32,19 +26,12 @@ static void clean_dcache_range(unsigned long start, unsigned long size)
     __asm__ volatile ("dsb sy" ::: "memory");
 }
 
-static void paint_block(unsigned long addr, unsigned int colour)
+static void paint_contiguous(unsigned long addr, unsigned int colour)
 {
     volatile unsigned int *p = (volatile unsigned int *)addr;
-    for (int y = 0; y < BLOCK_H; y++) {
-        for (int x = 0; x < BLOCK_W; x++) {
-            p[y * PITCH_PX + x] = colour;
-        }
-    }
-    /* Flush so any cached writes hit RAM where the HDMI DMA reads
-     * from.  Cleaning by VA is cheap relative to a full ::sw flush
-     * and avoids the "clean by set/way" instructions that may not
-     * cover all the way to the point of coherency on Pi 5. */
-    clean_dcache_range(addr, BLOCK_H * PITCH_PX * 4);
+    int n = BLOCK_BYTES / 4;             /* 32 bpp -> 4 B/pixel       */
+    for (int i = 0; i < n; i++) p[i] = colour;
+    clean_dcache_range(addr, BLOCK_BYTES);
 }
 
 void early_paint_diagnostic(void)
@@ -58,24 +45,37 @@ void early_paint_diagnostic(void)
     return;
 #endif
 
-    /* (address, ARGB colour, mnemonic) tuples.  If you see any
-     * of these solid colours on screen, the corresponding address
-     * is the firmware's framebuffer (or at least overlaps it). */
+    /* 16 candidates across the low 4 GiB.  Stops at 0xF8000000 to
+     * keep clear of any peripheral / firmware-reserved areas the
+     * Pi 5 might map between 0xFC000000 and 0xFFFFFFFF.
+     *
+     * Colours are chosen distinct enough to identify by name on a
+     * normal monitor: tell us which colour fills the screen and we
+     * know the FB base to within ~256 MiB. */
     static const struct {
         unsigned long addr;
         unsigned int  colour;
-        /* tag is for the source comment; not printed. */
     } candidates[] = {
-        { 0x40000000UL, 0xFFFF0000U },  /* RED   — 1 GiB mark        */
-        { 0x60000000UL, 0xFF00FF00U },  /* GREEN — 1.5 GiB mark      */
-        { 0x80000000UL, 0xFF0000FFU },  /* BLUE  — 2 GiB mark        */
-        { 0xA0000000UL, 0xFFFFFF00U },  /* YELLOW — 2.5 GiB mark     */
-        { 0xC0000000UL, 0xFFFF00FFU },  /* MAGENTA — 3 GiB mark      */
-        { 0xE0000000UL, 0xFF00FFFFU },  /* CYAN  — 3.5 GiB mark      */
+        { 0x10000000UL, 0xFFFF0000U },  /* 0.25 GiB — RED            */
+        { 0x20000000UL, 0xFFFF8000U },  /* 0.50 GiB — ORANGE         */
+        { 0x30000000UL, 0xFFFFFF00U },  /* 0.75 GiB — YELLOW         */
+        { 0x40000000UL, 0xFF80FF00U },  /* 1.00 GiB — LIME           */
+        { 0x50000000UL, 0xFF00FF00U },  /* 1.25 GiB — GREEN          */
+        { 0x60000000UL, 0xFF00FF80U },  /* 1.50 GiB — TEAL           */
+        { 0x70000000UL, 0xFF00FFFFU },  /* 1.75 GiB — CYAN           */
+        { 0x80000000UL, 0xFF0080FFU },  /* 2.00 GiB — SKY            */
+        { 0x90000000UL, 0xFF0000FFU },  /* 2.25 GiB — BLUE           */
+        { 0xA0000000UL, 0xFF8000FFU },  /* 2.50 GiB — PURPLE         */
+        { 0xB0000000UL, 0xFFFF00FFU },  /* 2.75 GiB — MAGENTA        */
+        { 0xC0000000UL, 0xFFFF80FFU },  /* 3.00 GiB — PINK           */
+        { 0xD0000000UL, 0xFFFFFFFFU },  /* 3.25 GiB — WHITE          */
+        { 0xE0000000UL, 0xFF808080U },  /* 3.50 GiB — GREY           */
+        { 0xF0000000UL, 0xFF800000U },  /* 3.75 GiB — DARK RED       */
+        { 0xF8000000UL, 0xFF008000U },  /* 3.875 GiB — DARK GREEN    */
     };
 
     int n = (int)(sizeof(candidates) / sizeof(candidates[0]));
     for (int i = 0; i < n; i++) {
-        paint_block(candidates[i].addr, candidates[i].colour);
+        paint_contiguous(candidates[i].addr, candidates[i].colour);
     }
 }
