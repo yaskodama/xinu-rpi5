@@ -46,10 +46,10 @@ OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 # ----- source discovery -----------------------------------------------
 COMPONENTS = loader mem system shell fs \
              device/uart device/mbox device/video device/sd device/usb \
-             device/usb/xhci device/gic device/timer device/genet
-# network/ subsystem (xinu-raz port) is staged under network/{arp,ipv4,icmp,
-# netaddr,net} but NOT built yet — depends on porting Xinu sem/mbox/ready/
-# wait kernel APIs to xinu-rpi5's cooperative scheduler.  See NEXT_SESSION.md.
+             device/usb/xhci device/gic device/timer device/genet \
+             network/arp network/net network/netaddr network/ipv4 network/icmp
+# Step 2 of NET-E: building xinu-raz network/{arp,net,netaddr,ipv4,icmp}
+# on top of the xinu_compat layer.
 # extern/uspi/lib disabled — USPi only drives DWC2 (Pi 4 USB-C OTG).
 # Pi 4 USB-A keyboards / mice route through VL805 PCIe xHCI, which
 # needs a hand-rolled driver under device/usb/xhci/.
@@ -68,7 +68,7 @@ QEMU_OBJS := $(patsubst %.c,obj/qemu/%.o,$(notdir $(C_SRCS))) \
 VPATH := $(addprefix ../,$(COMPONENTS))
 
 # ----- flags ----------------------------------------------------------
-INCLUDE = -I../include
+INCLUDE = -I../include -I../extern/xinu-raz-include
 COMMON  = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
           -mgeneral-regs-only $(INCLUDE)
 

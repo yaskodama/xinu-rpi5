@@ -18,7 +18,8 @@ typedef unsigned char uchar;    /**< unsigned char type                 */
 typedef unsigned short ushort;  /**< unsigned short type                */
 typedef unsigned int uint;      /**< unsigned int type                  */
 typedef unsigned long ulong;    /**< unsigned long type                 */
-typedef char bool;              /**< boolean type                       */
+/* `bool` is a reserved keyword in modern C — skip the typedef. */
+/* typedef char bool; */
 typedef unsigned long size_t;   /**< size type                          */
 
 /* Function declaration return types */

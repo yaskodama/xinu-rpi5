@@ -27,7 +27,7 @@ typedef unsigned int   semaphore;
 typedef unsigned int   mailbox;
 typedef int            tid_typ;
 typedef unsigned int   uint;
-typedef unsigned long  intmask;
+typedef unsigned long  irqmask;
 typedef int            qid_typ;
 typedef unsigned char  uchar;
 typedef unsigned long  ulong;
@@ -301,15 +301,15 @@ syscall unsleep(tid_typ tid)     { (void)tid; return OK; }
 
 /* ===== IRQ mask ===== */
 
-intmask disable(void)
+irqmask disable(void)
 {
-    intmask saved;
+    irqmask saved;
     __asm__ volatile ("mrs %0, daif" : "=r"(saved));
     irq_disable_all();
     return saved;
 }
 
-void restore(intmask im)
+void restore(irqmask im)
 {
     __asm__ volatile ("msr daif, %0" :: "r"(im) : "memory");
 }
@@ -341,6 +341,84 @@ static void kp_puthex(unsigned long v)
     }
     while (n--) uart_putc(buf[n]);
 }
+
+/* ===== libc-style helpers used by xinu-raz network code ===== */
+
+void *bzero(void *s, unsigned long n)
+{
+    unsigned char *p = (unsigned char *)s;
+    while (n--) *p++ = 0;
+    return s;
+}
+
+int memcmp(const void *a, const void *b, unsigned long n)
+{
+    const unsigned char *pa = (const unsigned char *)a;
+    const unsigned char *pb = (const unsigned char *)b;
+    while (n--) { if (*pa != *pb) return *pa - *pb; pa++; pb++; }
+    return 0;
+}
+
+/* sprintf / sscanf — extremely minimal.  network/ uses them mostly
+ * for diagnostic messages; we just write a placeholder so links
+ * succeed.  Real format-string parsing can be added later. */
+int sprintf(char *s, const char *fmt, ...)
+{
+    (void)fmt;
+    if (s) s[0] = 0;
+    return 0;
+}
+int sscanf(const char *s, const char *fmt, ...)
+{
+    (void)s; (void)fmt;
+    return 0;
+}
+int snprintf(char *s, unsigned long size, const char *fmt, ...)
+{
+    (void)fmt;
+    if (s && size) s[0] = 0;
+    return 0;
+}
+
+/* ===== Clock ===== */
+
+/* Forward decls so we don't need to include timer.h. */
+unsigned long timer_ticks(void);
+
+unsigned long clktime  = 0;   /* seconds since boot — updated by tick */
+unsigned long clkticks = 0;
+unsigned long clkcount(void) { return timer_ticks(); }
+
+/* ===== Xinu device API stubs ===== */
+
+struct dentry { int dummy; };   /* opaque; network code uses pointer/index only */
+struct dentry devtab[64];        /* NDEV plenty; entries are stubs */
+
+syscall open(int dev, ...)        { (void)dev; return SYSERR; }
+syscall close(int dev)            { (void)dev; return SYSERR; }
+syscall read(int dev, void *buf, uint len)  { (void)dev; (void)buf; (void)len; return SYSERR; }
+syscall write(int dev, const void *buf, uint len){ (void)dev; (void)buf; (void)len; return SYSERR; }
+syscall control(int dev, int func, long arg1, long arg2) { (void)dev; (void)func; (void)arg1; (void)arg2; return SYSERR; }
+syscall getc_dev(int dev)         { (void)dev; return SYSERR; }
+syscall putc_dev(int dev, char c) { (void)dev; (void)c; return SYSERR; }
+
+/* ===== Routing / higher-layer protocol stubs ===== */
+
+syscall rtInit(void)             { return OK; }
+syscall rtAdd(void *a, void *b, void *c, int d) { (void)a; (void)b; (void)c; (void)d; return OK; }
+syscall rtClear(void *e)         { (void)e; return OK; }
+syscall rtDefault(void *a, int b){ (void)a; (void)b; return OK; }
+syscall rtLookup(void *dst, void *gw) { (void)dst; (void)gw; return SYSERR; }
+void    rtRecv(void *pkt)        { (void)pkt; }
+
+void tcpRecv(void *pkt)          { (void)pkt; }
+void tcpTimer(void)              { }
+void udpRecv(void *pkt)          { (void)pkt; }
+void rawRecv(void *pkt)          { (void)pkt; }
+
+void snoopCapture(void *snoop, void *pkt) { (void)snoop; (void)pkt; }
+
+/* ===== Kernel printf ===== */
 
 syscall kprintf(const char *fmt, ...)
 {
