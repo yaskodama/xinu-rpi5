@@ -38,4 +38,26 @@ void screen_puts(const char *s);
  * 8 bytes each (one per row, MSB = leftmost pixel). */
 extern const unsigned char font8x8[96][8];
 
+/* ===== Drawing primitives (implemented in video.c) ============== */
+
+/* Live FB dimensions — only meaningful after a successful
+ * video_init().  Used by wm.c to size the desktop. */
+unsigned int video_screen_width(void);
+unsigned int video_screen_height(void);
+
+/* Solid fill / outline rectangle at pixel (x,y), dimensions w×h. */
+void fill_rect(int x, int y, int w, int h, unsigned int color);
+void draw_rect(int x, int y, int w, int h, unsigned int color);
+
+/* 8x8 glyph drawing with explicit foreground / background colour.
+ * draw_string_at advances 8 pixels per character; caller wraps. */
+void draw_glyph_at(int px, int py, char c,
+                   unsigned int fg, unsigned int bg);
+void draw_string_at(int px, int py, const char *s,
+                    unsigned int fg, unsigned int bg);
+
+/* Busy-wait based on the AArch64 generic timer (CNTPCT_EL0).
+ * Used for animation pacing in wm_run(). */
+void delay_ms(unsigned int ms);
+
 #endif /* XINU_RPI5_VIDEO_H */

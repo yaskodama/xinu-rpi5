@@ -182,3 +182,86 @@ void screen_puts(const char *s)
 {
     while (*s) screen_putc(*s++);
 }
+
+/* ===================================================================
+ * Drawing primitives for the window system (wm.c).
+ *
+ * All coordinates are pixels relative to the framebuffer's top-left.
+ * No clipping: caller is responsible for staying within the screen
+ * (fb_width × fb_height).  When fb_ready is false (video_init failed
+ * or hasn't been called yet) every primitive becomes a no-op so
+ * builds without HDMI just silently skip drawing.
+ * ===================================================================
+ */
+
+unsigned int video_screen_width(void)  { return fb_width;  }
+unsigned int video_screen_height(void) { return fb_height; }
+
+void fill_rect(int x, int y, int w, int h, unsigned int color)
+{
+    if (!fb_ready) return;
+    for (int dy = 0; dy < h; dy++) {
+        unsigned int *row =
+            (unsigned int *)(fb_base + (y + dy) * fb_pitch + x * 4);
+        for (int dx = 0; dx < w; dx++) row[dx] = color;
+    }
+}
+
+void draw_rect(int x, int y, int w, int h, unsigned int color)
+{
+    if (!fb_ready) return;
+    /* top + bottom edges */
+    unsigned int *top =
+        (unsigned int *)(fb_base + y * fb_pitch + x * 4);
+    unsigned int *bot =
+        (unsigned int *)(fb_base + (y + h - 1) * fb_pitch + x * 4);
+    for (int dx = 0; dx < w; dx++) { top[dx] = color; bot[dx] = color; }
+    /* left + right edges */
+    for (int dy = 0; dy < h; dy++) {
+        *(unsigned int *)(fb_base + (y + dy) * fb_pitch + x * 4)           = color;
+        *(unsigned int *)(fb_base + (y + dy) * fb_pitch + (x + w - 1) * 4) = color;
+    }
+}
+
+void draw_glyph_at(int px, int py, char c,
+                   unsigned int fg, unsigned int bg)
+{
+    if (!fb_ready) return;
+    unsigned char ci = (unsigned char)c;
+    if (ci < 0x20 || ci > 0x7F) ci = '?';
+    const unsigned char *glyph = font8x8[ci - 0x20];
+    for (int gy = 0; gy < FONT_HEIGHT; gy++) {
+        unsigned char bits = glyph[gy];
+        unsigned int *line =
+            (unsigned int *)(fb_base + (py + gy) * fb_pitch + px * 4);
+        for (int gx = 0; gx < FONT_WIDTH; gx++) {
+            line[gx] = (bits & (0x80 >> gx)) ? fg : bg;
+        }
+    }
+}
+
+void draw_string_at(int px, int py, const char *s,
+                    unsigned int fg, unsigned int bg)
+{
+    if (!fb_ready) return;
+    while (*s) {
+        draw_glyph_at(px, py, *s, fg, bg);
+        px += FONT_WIDTH;
+        s++;
+    }
+}
+
+/* Busy-wait `ms` milliseconds based on the AArch64 generic timer.
+ * CNTFRQ_EL0 returns the timer frequency in Hz (usually 54 MHz on
+ * Pi 4 / Pi 5 / QEMU virt -cpu cortex-a76).  Used by wm_run() between
+ * frame redraws for animation pacing. */
+void delay_ms(unsigned int ms)
+{
+    unsigned long freq, start, now, target;
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+    target = (freq / 1000UL) * (unsigned long)ms;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
+    do {
+        __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+    } while (now - start < target);
+}
