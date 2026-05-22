@@ -1,43 +1,46 @@
-# config.txt — Pi 5 firmware → Xinu kernel handoff (v2).
+# config.txt — Pi 5 firmware → Xinu kernel handoff (v3 = v1 restored).
 #
-# Critical change from v1: removed Linux-KMS hints so that firmware
-# allocates a legacy framebuffer and writes its address into the DTB.
-# Our kernel doesn't have a DRM/KMS driver yet, so leaving the
-# firmware in "skip FB setup, the kernel will do it" mode produced
-# a black HDMI screen on hand-off.
+# v2 attempt: stripped vc4-kms-v3d / max_framebuffers / disable_fw_kms_setup
+# and forced hdmi_mode=4 (640x480 DMT).  Result on the test board:
+# an even bigger rainbow pattern, suggesting the firmware never made it
+# to loading the kernel.  That was strictly a regression — v1 had the
+# kernel running (rainbow → black screen on hand-off), so this v3
+# config is identical to v1 with the KMS hints preserved.
 
-# --- preserved Pi OS defaults that don't conflict ---------------------
-camera_auto_detect=0          # don't probe cameras at boot
+# --- preserved from the Pi OS default config.txt ---------------------
+dtparam=audio=on
+camera_auto_detect=1
 display_auto_detect=1
+auto_initramfs=1
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+disable_fw_kms_setup=1
 arm_64bit=1
 disable_overscan=1
 arm_boost=1
-
-# REMOVED — vc4-kms-v3d + max_framebuffers + disable_fw_kms_setup
-# These tell firmware "let the kernel handle framebuffer" which we
-# don't yet do.  Without them, firmware allocates a legacy FB itself.
 
 # --- Xinu overrides --------------------------------------------------
 kernel=kernel_2712.img
 kernel_address=0x80000
 
-# UART0 (PL011) on header pins 8/10 so bootloader + kernel logs go
-# out the USB-serial cable.
+# UART0 (PL011) on the GPIO header pins so bootloader + kernel logs
+# reach a 3.3V USB-serial cable.
 enable_uart=1
 uart_2ndstage=1
 dtparam=uart0=on
 
-# LEGACY HDMI framebuffer.  Firmware allocates 640x480x32 ARGB at
-# a fixed physical address and writes it into the DTB; our kernel
-# can find it either by parsing DT or — once mailbox works on this
-# Pi 5 board — by querying GET_FRAMEBUFFER_ADDR via VC mailbox.
+# Ask firmware to pre-allocate a 640x480x32 HDMI framebuffer.  Even
+# with vc4-kms-v3d above, these legacy hints make the firmware also
+# expose a simple-framebuffer via the device tree, which our
+# early_paint_diagnostic + future DTB-scanning code can find.
 hdmi_force_hotplug=1
-hdmi_group=2                    # DMT mode (PC-style timings)
-hdmi_mode=4                     # 640x480 @ 60 Hz
 framebuffer_width=640
 framebuffer_height=480
 framebuffer_depth=32
 framebuffer_ignore_alpha=1
+
+[cm4]
+otg_mode=1
 
 [cm5]
 dtoverlay=dwc2,dr_mode=host

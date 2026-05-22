@@ -64,11 +64,26 @@ void kernel_main(void)
      * mailbox is elsewhere this just leaves screen_putc() as a no-op. */
     video_rc = video_init();
 
+    /* BOARD_NAME / SOC_NAME / KERNEL_NAME come from the Makefile
+     * (-DBOARD_NAME=\"Pi4\" etc.) so each variant prints a banner
+     * that matches the hardware it was built for. */
+#ifndef BOARD_NAME
+#define BOARD_NAME  "?"
+#endif
+#ifndef SOC_NAME
+#define SOC_NAME    "?"
+#endif
+#ifndef KERNEL_NAME
+#define KERNEL_NAME "?"
+#endif
+#define _STR(s) #s
+#define STR(s)  _STR(s)
+
     uart_puts("\n");
     uart_puts("================================================\n");
-    uart_puts("  Xinu Pi5 hello (AArch64, BCM2712, kernel_2712.img)\n");
-    uart_puts("  PL011 UART0 @ 0x107D001000, 115200 8N1\n");
-    uart_puts("  bootstrap: leex-style stub + xinu-rpi5 main\n");
+    uart_puts("  Xinu " BOARD_NAME " hello (AArch64, " SOC_NAME ", " KERNEL_NAME ")\n");
+    uart_puts("  PL011 UART0 @ " STR(UART0_BASE) ", 115200 8N1\n");
+    uart_puts("  bootstrap: leex-style stub + xinu-rpi main\n");
     uart_puts("================================================\n");
     uart_puts("\n");
     if (video_rc == 0) {

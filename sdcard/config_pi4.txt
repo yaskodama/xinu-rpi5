@@ -1,0 +1,41 @@
+# sdcard/config_pi4.txt — Raspberry Pi 4 firmware → Xinu kernel handoff.
+#
+# Used by `make install_pi4`.  Pi 4 boots `kernel8.img` by default
+# when arm_64bit=1, but we set `kernel=` explicitly so the firmware
+# log shows us which file got picked.
+
+# --- preserved from the Pi OS default config.txt ---------------------
+dtparam=audio=on
+camera_auto_detect=1
+display_auto_detect=1
+auto_initramfs=1
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+disable_fw_kms_setup=1
+arm_64bit=1
+disable_overscan=1
+arm_boost=1
+
+# --- Xinu overrides for Pi 4 -----------------------------------------
+kernel=kernel8.img
+kernel_address=0x80000
+
+# UART0 (PL011) on header pins 8/10 — Pi 4 has UART0 wired directly
+# from BCM2711 to the GPIO header (no RP1 in the way like Pi 5).
+enable_uart=1
+uart_2ndstage=1
+dtparam=uart0=on
+
+# Ask firmware to pre-allocate a 640x480x32 HDMI framebuffer.  Even
+# with the KMS overlay above, these legacy hints make firmware also
+# expose a simple-framebuffer node in the DTB.
+hdmi_force_hotplug=1
+framebuffer_width=640
+framebuffer_height=480
+framebuffer_depth=32
+framebuffer_ignore_alpha=1
+
+[cm4]
+otg_mode=1
+
+[all]
