@@ -30,6 +30,7 @@
 #include "timer.h"
 #include "irq.h"
 #include "xhci.h"
+#include "genet.h"
 
 /* USPi is gone (DWC2 only — Pi 4 USB-A keyboards/mice need xHCI).
  * Keyboard input from the future xHCI HID driver will land here. */
@@ -569,11 +570,18 @@ void kernel_main(void)
     uart_puts("gic+timer: 100 Hz PPI 30 armed; unmasking DAIF.I\n");
     irq_enable_all();
 
-    /* XHCI-A — probe the Pi 4 BCM2711 PCIe-1 controller.  Step 1 of
-     * the multi-phase xHCI bring-up that will eventually drive the
-     * USB-A ports.  Today: just read the controller revision so we
-     * can see "the MMIO at 0xFD500000 responds". */
+    /* XHCI-A — PCIe-1 controller MMIO probe.  Skipped at boot: the
+     * controller is clock/power-gated until we implement CPRMAN
+     * + brcmstb-pcie bring-up, so the dump just slows the log.
+     * Re-enable once XHCI-B lands. */
+#if 0
     xhci_init();
+#endif
+
+    /* NET-A — probe BCM2711 GENET Ethernet MAC.  Goal today: see
+     * if SYS_REV_CTRL responds with a sane value (expected to be
+     * ~0x06000000 on Pi 4) so we know the controller is powered. */
+    genet_init();
 
     uart_puts("\n");
     uart_puts("Round 1: B/U/M1/S0/X0 done.\n");
