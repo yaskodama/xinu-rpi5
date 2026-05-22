@@ -1,0 +1,29 @@
+# sdcard/config.txt — Raspberry Pi 5 firmware configuration for Xinu.
+#
+# Place this in the FAT32 bootfs partition alongside kernel_2712.img.
+#
+# Notes:
+#   - Pi 5 firmware uses kernel_2712.img specifically; other names
+#     (kernel8.img, kernel.img, kernel7l.img) are silently ignored.
+#   - arm_64bit=1 is implicit on Pi 5 (AArch64 only) but we set it
+#     explicitly for clarity.
+#   - enable_uart=1 + the dtparam line below clamp the GPIO14/15
+#     pins to PL011 UART0 at the fixed 48 MHz reference clock so
+#     115200 baud is stable.  Without these the firmware would
+#     hand UART0 to Bluetooth and you'd see nothing on the cable.
+#   - kernel_address is the load address; matches kernel/link.ld.
+
+arm_64bit=1
+kernel=kernel_2712.img
+kernel_address=0x80000
+
+# Debug UART via header pins 8 (TXD = GPIO14) and 10 (RXD = GPIO15).
+# Use a 3.3 V FTDI cable, e.g.  screen /dev/tty.usbserial-XXXX 115200
+enable_uart=1
+uart_2ndstage=1
+dtparam=uart0=on
+
+# Helpful while bringing up: keep the firmware's diagnostic
+# messages on the same UART so kernel output is interleaved with
+# bootrom output for context.
+disable_overscan=1

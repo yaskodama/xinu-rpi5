@@ -1,0 +1,16 @@
+# Build artifacts
+*.o
+*.elf
+*.img
+*.lst
+*.map
+*.bin
+
+# Editor scratch
+*.swp
+*.swo
+.DS_Store
+*~
+
+# Toolchain debug
+*.dump
