@@ -21,8 +21,8 @@ clean split easier than ifdef-walling everything in place.
 | **U0** PL011 UART0 driver                  | ✅ |
 | **U1** kprintf — banner only for now       | ✅ (basic puts; full kprintf later) |
 | M0 MMU flat identity map                  | ⏳ |
-| M1 Kernel heap                            | ⏳ |
-| S0 AArch64 context switch                 | ⏳ |
+| **M1** Kernel heap                         | ✅ first-fit (Xinu `getmem`/`freemem`), 16-byte align, coalescing |
+| **S0** AArch64 context switch              | ✅ cooperative `ctxsw.S` + `proctab[8]` + FIFO ready list |
 | S1 GIC-400 + generic timer                | ⏳ |
 | **X0** xsh on Pi 5 — interactive REPL      | ✅ minimal (help/echo/hello/mem/peek/uptime/reboot) |
 | X1 AIPL hello                             | ⏳ |
@@ -59,6 +59,7 @@ The shell handles backspace/DEL, echoes input, and dispatches via a
 | `ps`              | core / EL status table (placeholder until phase S0) |
 | `halt`            | mask DAIF + PSCI `SYSTEM_OFF` via HVC — QEMU virt exits cleanly |
 | `pingpong [N]`    | 2-actor AIPL-style PingPong, cooperative dispatch, N rounds (1..50, default 5), auto-terminates |
+| `procdemo [N]`    | **real** 2-process ctxsw demo: creates pid 1 (ping) + pid 2 (pong), each prints its live `currpid` and `proc_yield()`s for N iters (1..30, default 5), then both `proc_exit()` and control returns to the shell |
 | `reboot`          | stub — spins until power-cycle (RP1 watchdog TBD)   |
 
 ## Hardware vs Pi 4 (leex baseline)
@@ -171,13 +172,47 @@ MIDR `0x414fd0b1` is the published Cortex-A76 part number — proof the
 core actually emulates A76, not a generic ARMv8.
 
 **pingpong is the AIPL Ping/Pong actor pair, ported to the bare-metal
-shell** until phase S0 lands a real scheduler.  Two static `pp_actor_t`
-structs (`Ping`, `Pong`) each own a 1-slot inbox; the outer dispatcher
-in `cmd_pingpong` just drains whichever inbox is non-empty.  Each
-actor stops sending once its `sent` budget hits the round count, so
-the run self-terminates the moment both inboxes go empty — no
-preemption, no scheduler, but the trace matches what AIPL emits on
-the Python and OCaml runtimes.  Argument is clamped to `[1, 50]`.
+shell** as a single-stack simulation.  Two static `pp_actor_t` structs
+(`Ping`, `Pong`) each own a 1-slot inbox; the outer dispatcher in
+`cmd_pingpong` just drains whichever inbox is non-empty.  Each actor
+stops sending once its `sent` budget hits the round count, so the
+run self-terminates the moment both inboxes go empty.  Trace matches
+what AIPL emits on the Python and OCaml runtimes.  Clamped to `[1,50]`.
+
+**procdemo is the actual S0 scheduler in action.**  `proc_create()`
+allocates a 4 KiB stack via `getmem()` and hand-builds a fake ctxsw
+save-frame on it (12 quadwords: x19-x28 + FP + LR) so the first
+`ctxsw` into the new SP pops the frame and `ret`s directly into the
+entry function.  `cmd_procdemo` creates pid 1 (ping) + pid 2 (pong)
+and calls `proc_resched()`; the dispatcher picks the ready list head,
+ctxsw'es into it, and the two children take turns through `proc_yield`
+until both call `proc_exit()` — at which point the ready list empties,
+the dispatcher ctxsw'es back to NULLPROC (pid 0 = shell), and
+cmd_procdemo returns from `proc_resched()`.
+
+```
+xinu-pi5$ procdemo 3
+procdemo: created pid=1 (ping) and pid=2 (pong), iters=3
+---------------------------------------------
+  [Ping pid=1] tick 1
+  [Pong pid=2] tock 1        # ← real ctxsw between iterations
+  [Ping pid=1] tick 2
+  [Pong pid=2] tock 2
+  [Ping pid=1] tick 3
+  [Pong pid=2] tock 3
+  [Ping pid=1] exit at iter 3
+  [Pong pid=2] exit at iter 3
+---------------------------------------------
+procdemo: both processes exited; back in shell.
+```
+
+Each iteration's `pid=N` is read live from the global `currpid`, so
+the alternation in that column is direct evidence that the scheduler
+flipped contexts (not just the dispatcher re-ordering printlns).
+Stacks are not currently reclaimed on `proc_exit` — `mem` after a
+run shows ~8 KiB consumed, which is correct (2 × 4 KiB stacks).
+Phase S1 (clock IRQ) will let us reap exited stacks from the dispatcher
+tick.
 
 ## Layout
 
@@ -185,10 +220,15 @@ the Python and OCaml runtimes.  Argument is clamped to `[1, 50]`.
 xinu-rpi5/
 ├── kernel/
 │   ├── boot.S          # AArch64 entry stub (leex pattern, Pi-5 tuned)
+│   ├── ctxsw.S         # AArch64 callee-saved (x19-x30) save/restore
 │   ├── link.ld         # load address 0x80000 (Pi 5 firmware)
 │   ├── link_virt.ld    # load address 0x40080000 (QEMU virt)
 │   ├── Makefile        # aarch64-elf → kernel_2712.img + kernel_virt.img
-│   ├── main.c          # banner + shell handoff
+│   ├── main.c          # banner + heap init + proc init + shell handoff
+│   ├── memory.c        # first-fit getmem/freemem (Xinu-style)
+│   ├── memory.h
+│   ├── proc.c          # proctab + ready list + resched + create/exit
+│   ├── proc.h
 │   ├── shell.c         # bare-metal REPL (davidxyz/xinuPi-style)
 │   ├── shell.h
 │   ├── uart.c          # PL011 UART0 @ 0x107D001000 (+ getc/getline)

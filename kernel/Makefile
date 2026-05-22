@@ -16,7 +16,9 @@
 #     state for ctxsw to save in Round 1)
 
 CFILES   = $(wildcard *.c)
-OFILES   = $(CFILES:.c=.o)
+SFILES   = $(wildcard *.S)
+OFILES   = $(CFILES:.c=.o)   $(SFILES:.S=.o)
+QEMU_OFILES = $(CFILES:.c=.qemu.o) $(SFILES:.S=.qemu.o)
 
 # Toolchain — Homebrew installs either `aarch64-elf-gcc` (gcc-aarch64-elf
 # formula) or `aarch64-none-elf-gcc` (arm-toolchain cask); auto-detect.
@@ -27,7 +29,8 @@ LD       = $(GCCPATH)/bin/$(CROSS)ld
 OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 
 CFLAGS = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
-         -mcpu=cortex-a76 -mgeneral-regs-only
+         -mcpu=cortex-a76 -mgeneral-regs-only \
+         -DHEAP_END=0x40000000UL
 
 # $(SDCARD)/bootfs is the FAT32 partition on the Pi-5 SD card.
 # Override e.g. `make install SDCARD=/Volumes/RPI5SD`.
@@ -36,32 +39,34 @@ DEST    = $(SDCARD)/bootfs
 
 all: kernel_2712.img
 
-boot.o: boot.S
-	$(CC) $(CFLAGS) -c boot.S -o boot.o
-
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-kernel_2712.img: boot.o $(OFILES) link.ld
-	$(LD) -nostdlib boot.o $(OFILES) -T link.ld -o kernel_2712.elf
+%.o: %.S
+	$(CC) $(CFLAGS) -c $< -o $@
+
+kernel_2712.img: $(OFILES) link.ld
+	$(LD) -nostdlib $(OFILES) -T link.ld -o kernel_2712.elf
 	$(OBJCOPY) -O binary kernel_2712.elf kernel_2712.img
 	@ls -la kernel_2712.img
 
 # ----- QEMU `virt` variant -----------------------------------------
-# Same sources, two compile-time overrides: PL011 base lives at
-# 0x09000000 on the virt machine, and the binary is loaded at the
-# RAM_base + 0x80000 = 0x40080000 offset that QEMU's -kernel uses.
-QEMU_CFLAGS = $(CFLAGS) -DUART0_BASE=0x09000000UL
-QEMU_OBJS   = $(CFILES:.c=.qemu.o) boot.qemu.o
+# Same sources, three compile-time overrides: PL011 base lives at
+# 0x09000000 on the virt machine, the binary is loaded at the
+# RAM_base + 0x80000 = 0x40080000 offset, and the heap top is
+# bumped from 1 GiB (the conservative Pi-5 default) to the 256 MiB
+# QEMU was told to model (`-m 256M`).
+QEMU_CFLAGS = $(CFLAGS) -DUART0_BASE=0x09000000UL \
+              -UHEAP_END -DHEAP_END=0x50000000UL
 
 %.qemu.o: %.c
 	$(CC) $(QEMU_CFLAGS) -c $< -o $@
 
-boot.qemu.o: boot.S
-	$(CC) $(QEMU_CFLAGS) -c boot.S -o boot.qemu.o
+%.qemu.o: %.S
+	$(CC) $(QEMU_CFLAGS) -c $< -o $@
 
-kernel_virt.img: $(QEMU_OBJS) link_virt.ld
-	$(LD) -nostdlib $(QEMU_OBJS) -T link_virt.ld -o kernel_virt.elf
+kernel_virt.img: $(QEMU_OFILES) link_virt.ld
+	$(LD) -nostdlib $(QEMU_OFILES) -T link_virt.ld -o kernel_virt.elf
 	$(OBJCOPY) -O binary kernel_virt.elf kernel_virt.img
 	@ls -la kernel_virt.img
 
@@ -87,7 +92,7 @@ qemu: kernel_virt.img
 # so the first byte after open() is consistently dropped).  The shell
 # silently re-prompts on empty input, so no harm done.
 qemu-smoke: kernel_virt.img
-	printf '\n\nhello\nmem\npeek 0x09000018\nuptime\nps\npingpong 3\necho --- smoke ok ---\nhalt\n' | \
+	printf '\n\nhello\nmem\npeek 0x09000018\nuptime\nps\npingpong 3\nprocdemo 3\nps\necho --- smoke ok ---\nhalt\n' | \
 	  timeout 15 $(QEMU) $(QEMU_SMOKE_FLAGS) | tee qemu-smoke.log
 
 install: kernel_2712.img

@@ -42,6 +42,8 @@
 
 #include "uart.h"
 #include "shell.h"
+#include "memory.h"
+#include "proc.h"
 
 /* Linker-script symbols (from kernel/link.ld). */
 extern unsigned long __bss_start;
@@ -160,6 +162,17 @@ static int cmd_mem(int argc, char **argv)
     uart_puts("__bss_start = "); puts_hex((unsigned long)&__bss_start); uart_puts("\n");
     uart_puts("__bss_end   = "); puts_hex((unsigned long)&__bss_end);   uart_puts("\n");
     uart_puts("_end        = "); puts_hex((unsigned long)&_end);        uart_puts("\n");
+
+    /* Heap stats from the first-fit allocator. */
+    uart_puts("\nheap:\n");
+    uart_puts("  total      = "); puts_dec((int)(mem_total_bytes() >> 10));
+    uart_puts(" KiB\n");
+    uart_puts("  free       = "); puts_dec((int)(mem_free_bytes() >> 10));
+    uart_puts(" KiB  ("); puts_dec((int)mem_free_bytes()); uart_puts(" bytes)\n");
+    uart_puts("  largest    = "); puts_dec((int)mem_largest_block());
+    uart_puts(" bytes\n");
+    uart_puts("  free blocks= "); puts_dec(mem_free_block_count());
+    uart_puts("\n");
     return 0;
 }
 
@@ -301,6 +314,105 @@ static int cmd_pingpong(int argc, char **argv)
     return 0;
 }
 
+/* ---------- procdemo (real ctxsw, 2 processes) ---------- */
+/*
+ * Ground-truth demo for the S0 scheduler: two genuine processes
+ * (each with its own getmem'd stack) that yield to each other in a
+ * tight loop.  Unlike `pingpong` — which simulates message passing
+ * inside one C call stack — these two functions run on independent
+ * SPs and only resume each other through ctxsw.S.
+ *
+ * Each process logs the current pid (read live from `currpid`) so
+ * you can see the scheduler flipping control between them in the
+ * output stream.  When both reach the end of their loop they call
+ * proc_exit(), which drops them from the ready list; the dispatcher
+ * then ctxsw'es back to NULLPROC (the shell) and cmd_procdemo
+ * returns from proc_resched().
+ */
+
+#define PROCDEMO_DEFAULT_ITERS  5
+#define PROCDEMO_MAX_ITERS      30
+#define PROCDEMO_STK            4096
+
+static int procdemo_iters;
+
+static void procdemo_log(const char *who, const char *verb, int i)
+{
+    uart_puts("  ["); uart_puts(who);
+    uart_puts(" pid="); puts_dec(currpid);
+    uart_puts("] "); uart_puts(verb);
+    uart_puts(" "); puts_dec(i); uart_puts("\n");
+}
+
+static void procdemo_ping_entry(void)
+{
+    int i;
+    for (i = 1; i <= procdemo_iters; i++) {
+        procdemo_log("Ping", "tick", i);
+        proc_yield();
+    }
+    procdemo_log("Ping", "exit at iter", procdemo_iters);
+    proc_exit();
+}
+
+static void procdemo_pong_entry(void)
+{
+    int i;
+    for (i = 1; i <= procdemo_iters; i++) {
+        procdemo_log("Pong", "tock", i);
+        proc_yield();
+    }
+    procdemo_log("Pong", "exit at iter", procdemo_iters);
+    proc_exit();
+}
+
+static int cmd_procdemo(int argc, char **argv)
+{
+    int iters = PROCDEMO_DEFAULT_ITERS;
+    int p, q;
+
+    if (argc >= 2) {
+        int v = 0;
+        const char *s = argv[1];
+        while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
+        if (*s != 0 || v < 1) {
+            uart_puts("usage: procdemo [N]   (1..");
+            puts_dec(PROCDEMO_MAX_ITERS); uart_puts(", default ");
+            puts_dec(PROCDEMO_DEFAULT_ITERS); uart_puts(")\n");
+            return 1;
+        }
+        if (v > PROCDEMO_MAX_ITERS) v = PROCDEMO_MAX_ITERS;
+        iters = v;
+    }
+    procdemo_iters = iters;
+
+    p = proc_create(procdemo_ping_entry, PROCDEMO_STK, "ping-proc");
+    if (p < 0) {
+        uart_puts("procdemo: proc_create(ping) failed\n");
+        return 1;
+    }
+    q = proc_create(procdemo_pong_entry, PROCDEMO_STK, "pong-proc");
+    if (q < 0) {
+        uart_puts("procdemo: proc_create(pong) failed\n");
+        proctab[p].state = PR_FREE;
+        return 1;
+    }
+
+    uart_puts("procdemo: created pid="); puts_dec(p);
+    uart_puts(" (ping) and pid=");      puts_dec(q);
+    uart_puts(" (pong), iters=");       puts_dec(iters);
+    uart_puts("\n---------------------------------------------\n");
+
+    /* Surrender the CPU to the ready list.  Returns here only after
+     * both children have called proc_exit() and the dispatcher has
+     * ctxsw'ed back to NULLPROC. */
+    proc_resched();
+
+    uart_puts("---------------------------------------------\n");
+    uart_puts("procdemo: both processes exited; back in shell.\n");
+    return 0;
+}
+
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -312,35 +424,50 @@ static int cmd_reboot(int argc, char **argv)
 static int cmd_ps(int argc, char **argv)
 {
     unsigned long mpidr, midr, current_el;
+    int i;
     (void)argc; (void)argv;
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
     __asm__ volatile ("mrs %0, midr_el1"  : "=r"(midr));
     __asm__ volatile ("mrs %0, currentel" : "=r"(current_el));
     current_el = (current_el >> 2) & 3;
 
-    uart_puts("PID  STATE      CORE  EL  MIDR_EL1            DESCRIPTION\n");
-
-    /* The single execution context that exists today: us. */
-    uart_puts("  0  RUN        ");
+    /* Top section: per-core CPU state.  boot.S parks cores 1-3 in
+     * WFE; only core 0 ever runs.  Phase S1 + GIC IPIs would change
+     * that. */
+    uart_puts("Cores:\n");
+    uart_puts(" CORE  STATE      EL  MIDR_EL1\n");
+    uart_puts("    ");
     uart_putc((char)('0' + (mpidr & 0xFF)));
-    uart_puts("     ");
+    uart_puts("  RUN        ");
     uart_putc((char)('0' + current_el));
-    uart_puts("   ");
-    puts_hex(midr);
-    uart_puts("  shell_main (kernel)\n");
-
-    /* boot.S parks every other core in WFE until phase S0/S1
-     * brings up the GIC + cross-core IPIs.  Quad-A76 is the only
-     * topology we target. */
-    int i;
+    uart_puts("   "); puts_hex(midr); uart_puts("\n");
     for (i = 1; i < 4; i++) {
-        uart_puts("  -  PARK(WFE)  ");
-        uart_putc((char)('0' + i));
-        uart_puts("     -   -                   (parked by boot.S)\n");
+        uart_puts("    "); uart_putc((char)('0' + i));
+        uart_puts("  PARK(WFE)  -   -\n");
     }
 
-    uart_puts("\n[scheduler not yet active — phase S0 will populate ");
-    uart_puts("this table]\n");
+    /* Bottom section: real proctab.  PR_FREE rows are skipped except
+     * for slot 0 which is always reserved for the null/shell context. */
+    uart_puts("\nProcess table:\n");
+    uart_puts(" PID  STATE  PRIO  STACK_BASE          NAME\n");
+    for (i = 0; i < NPROC; i++) {
+        const char *st;
+        if (proctab[i].state == PR_FREE && i != NULLPROC) continue;
+        switch (proctab[i].state) {
+            case PR_CURR:  st = "CURR "; break;
+            case PR_READY: st = "READY"; break;
+            case PR_FREE:  st = "FREE "; break;
+            case PR_TERM:  st = "TERM "; break;
+            default:       st = "?    "; break;
+        }
+        uart_puts("  "); uart_putc((char)('0' + i));
+        uart_puts("  "); uart_puts(st);
+        uart_puts("    "); puts_dec(proctab[i].prio);
+        uart_puts("     "); puts_hex((unsigned long)proctab[i].stkbase);
+        uart_puts("  "); uart_puts(proctab[i].name);
+        if (i == currpid) uart_puts("  <-- running");
+        uart_puts("\n");
+    }
     return 0;
 }
 
@@ -381,6 +508,7 @@ static const struct centry commandtab[] = {
     { "ps",       "core / EL status (no scheduler yet)",   cmd_ps       },
     { "halt",     "PSCI SYSTEM_OFF + WFE park",            cmd_halt     },
     { "pingpong", "2-actor cooperative PingPong [rounds]", cmd_pingpong },
+    { "procdemo", "real 2-process ctxsw demo [iters]",     cmd_procdemo },
     { "reboot",   "stub — spins until power-cycle",        cmd_reboot   },
     { "?",      "alias for help",                          cmd_help   },
     { 0, 0, 0 }
