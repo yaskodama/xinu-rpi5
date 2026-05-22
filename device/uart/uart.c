@@ -22,6 +22,7 @@
 // table yet.
 
 #include "uart.h"
+#include "video.h"
 
 /* BCM2712 high-memory MMIO base + PL011 UART0 offset.
  * (Pi 4's base was 0xFE000000 + 0x201000 — both moved on Pi 5.)
@@ -88,6 +89,13 @@ void uart_putc(char c)
         /* spin */
     }
     UART_DR = (unsigned int)(unsigned char)c;
+
+    /* Mirror to the HDMI console once video_init() has succeeded
+     * (after that point screen_putc is safe; before, it's a no-op).
+     * This is the whole point of the framebuffer driver — keeping
+     * a parallel log channel in case the UART cable is silent on
+     * this particular Pi 5 board. */
+    screen_putc(c);
 }
 
 void uart_puts(const char *s)

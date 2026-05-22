@@ -15,6 +15,7 @@
 #include "shell.h"
 #include "memory.h"
 #include "proc.h"
+#include "video.h"
 
 extern unsigned char _end[];   /* set by link.ld — top of static image */
 
@@ -39,8 +40,15 @@ static void puts_kb(unsigned long bytes)
 void kernel_main(void)
 {
     unsigned long heap_start;
+    int video_rc;
 
     uart_init();
+
+    /* Try to bring up the HDMI framebuffer before printing anything,
+     * so the banner appears on both UART and the monitor.  Failure
+     * is benign — on QEMU virt and on Pi 5 revisions where the VC
+     * mailbox is elsewhere this just leaves screen_putc() as a no-op. */
+    video_rc = video_init();
 
     uart_puts("\n");
     uart_puts("================================================\n");
@@ -49,6 +57,11 @@ void kernel_main(void)
     uart_puts("  bootstrap: leex-style stub + xinu-rpi5 main\n");
     uart_puts("================================================\n");
     uart_puts("\n");
+    if (video_rc == 0) {
+        uart_puts("video: HDMI framebuffer up (640x480x32, 8x8 font)\n");
+    } else {
+        uart_puts("video: no HDMI framebuffer (mailbox timed out)\n");
+    }
 
     /* M1 — bring up the first-fit kernel heap between _end and
      *      HEAP_END.  Everything after this point (proc stacks,

@@ -27,3 +27,13 @@ dtparam=uart0=on
 # messages on the same UART so kernel output is interleaved with
 # bootrom output for context.
 disable_overscan=1
+
+# HDMI framebuffer.  We ask the firmware to pre-allocate a screen
+# so that our video.c can find a working VC mailbox / framebuffer
+# and write text onto HDMI in parallel with the UART.  Useful as a
+# fallback when the USB-serial cable shows nothing.
+hdmi_force_hotplug=1
+framebuffer_width=640
+framebuffer_height=480
+framebuffer_depth=32
+framebuffer_ignore_alpha=1

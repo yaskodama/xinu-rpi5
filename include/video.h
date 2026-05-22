@@ -1,0 +1,41 @@
+// include/video.h — Pi 5 HDMI framebuffer console.
+//
+// Asks the firmware (via the VC mailbox property channel) for a
+// 32-bpp framebuffer at a fixed resolution, then renders text into
+// it using an embedded 8x8 ASCII font.  The shell `uart_putc` is
+// wired to call screen_putc() as well, so output appears on HDMI in
+// parallel with the (possibly silent) UART.
+//
+// Designed to fail gracefully: if the mailbox call times out (e.g.
+// running under QEMU virt, which has no VC mailbox), screen_ready()
+// stays false and screen_putc() becomes a no-op.
+
+#ifndef XINU_RPI5_VIDEO_H
+#define XINU_RPI5_VIDEO_H
+
+#define SCREEN_WIDTH    640
+#define SCREEN_HEIGHT   480
+#define SCREEN_DEPTH    32
+#define FONT_WIDTH      8
+#define FONT_HEIGHT     8
+
+/* Attempt to bring up the framebuffer.  Returns 0 on success.
+ * Caller can ignore failure and continue with UART-only logging. */
+int  video_init(void);
+
+/* True iff video_init() succeeded and screen_putc is live. */
+int  screen_ready(void);
+
+/* Push one character to the screen console.  Honours '\n' (new line
+ * + carriage return) and '\r' (column 0).  Wraps at right edge,
+ * scrolls one row at the bottom. */
+void screen_putc(char c);
+
+void screen_puts(const char *s);
+
+/* Glyph table — declared here so the font file is the only place
+ * that owns the bitmap data.  96 printable chars (ASCII 0x20..0x7F),
+ * 8 bytes each (one per row, MSB = leftmost pixel). */
+extern const unsigned char font8x8[96][8];
+
+#endif /* XINU_RPI5_VIDEO_H */
