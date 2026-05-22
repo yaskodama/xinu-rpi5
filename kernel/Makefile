@@ -18,12 +18,13 @@
 CFILES   = $(wildcard *.c)
 OFILES   = $(CFILES:.c=.o)
 
-# Toolchain — Homebrew installs aarch64-none-elf binaries on PATH;
-# leex's HOME/aarch64 layout still works if exported via GCCPATH.
+# Toolchain — Homebrew installs either `aarch64-elf-gcc` (gcc-aarch64-elf
+# formula) or `aarch64-none-elf-gcc` (arm-toolchain cask); auto-detect.
 GCCPATH ?= /opt/homebrew
-CC       = $(GCCPATH)/bin/aarch64-none-elf-gcc
-LD       = $(GCCPATH)/bin/aarch64-none-elf-ld
-OBJCOPY  = $(GCCPATH)/bin/aarch64-none-elf-objcopy
+CROSS   ?= $(shell test -x $(GCCPATH)/bin/aarch64-elf-gcc && echo aarch64-elf- || echo aarch64-none-elf-)
+CC       = $(GCCPATH)/bin/$(CROSS)gcc
+LD       = $(GCCPATH)/bin/$(CROSS)ld
+OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 
 CFLAGS = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
          -mcpu=cortex-a76 -mgeneral-regs-only
@@ -46,6 +47,41 @@ kernel_2712.img: boot.o $(OFILES) link.ld
 	$(OBJCOPY) -O binary kernel_2712.elf kernel_2712.img
 	@ls -la kernel_2712.img
 
+# ----- QEMU `virt` variant -----------------------------------------
+# Same sources, two compile-time overrides: PL011 base lives at
+# 0x09000000 on the virt machine, and the binary is loaded at the
+# RAM_base + 0x80000 = 0x40080000 offset that QEMU's -kernel uses.
+QEMU_CFLAGS = $(CFLAGS) -DUART0_BASE=0x09000000UL
+QEMU_OBJS   = $(CFILES:.c=.qemu.o) boot.qemu.o
+
+%.qemu.o: %.c
+	$(CC) $(QEMU_CFLAGS) -c $< -o $@
+
+boot.qemu.o: boot.S
+	$(CC) $(QEMU_CFLAGS) -c boot.S -o boot.qemu.o
+
+kernel_virt.img: $(QEMU_OBJS) link_virt.ld
+	$(LD) -nostdlib $(QEMU_OBJS) -T link_virt.ld -o kernel_virt.elf
+	$(OBJCOPY) -O binary kernel_virt.elf kernel_virt.img
+	@ls -la kernel_virt.img
+
+# Interactive run: Ctrl-A X to quit; Ctrl-A C for QEMU monitor.
+QEMU       ?= qemu-system-aarch64
+QEMU_FLAGS  = -M virt -cpu cortex-a76 -m 256M -nographic -kernel kernel_virt.img
+
+qemu: kernel_virt.img
+	@echo ">>> launching QEMU virt (Ctrl-A X to quit) <<<"
+	$(QEMU) $(QEMU_FLAGS)
+
+# Non-interactive smoke: pipe a few commands in.  The leading "\n\n"
+# is a sacrificial empty line that absorbs the LCRH-write FIFO reset
+# at boot (QEMU starts pumping stdin before our UART init finishes,
+# so the first byte after open() is consistently dropped).  The shell
+# silently re-prompts on empty input, so no harm done.
+qemu-smoke: kernel_virt.img
+	printf '\n\nhello\nmem\npeek 0x09000018\nuptime\nhelp\necho smoke ok\n' | \
+	  timeout 10 $(QEMU) $(QEMU_FLAGS) | tee qemu-smoke.log
+
 install: kernel_2712.img
 	sudo rm -f $(DEST)/kernel_*.img
 	sudo cp kernel_2712.img $(DEST)/
@@ -54,4 +90,4 @@ install: kernel_2712.img
 	sudo umount $(DEST) || true
 
 clean:
-	rm -f *.o *.elf *.img
+	rm -f *.o *.elf *.img *.qemu.o qemu-smoke.log

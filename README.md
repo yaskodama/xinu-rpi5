@@ -106,10 +106,43 @@ card with a stock Raspberry Pi OS image and then overwrite
 
 ## Run
 
+### Real Pi 5 hardware
+
 1. Wire a 3.3 V USB-serial adapter to header pins 8 (TXD → GPIO14),
    10 (RXD → GPIO15) and a GND pin (e.g. 6).
 2. On the host: `screen /dev/tty.usbserial-XXXX 115200`
 3. Power-cycle the Pi.  The banner above appears within ~5 seconds.
+
+### QEMU `virt` (no Pi 5 machine in upstream QEMU yet)
+
+QEMU 11 doesn't model BCM2712 / RP1, so we cross-build a tiny variant
+that swaps the PL011 base (`0x107D001000` → `0x09000000`) and the
+load address (`0x80000` → `0x40080000`).  Source is shared; only
+`-DUART0_BASE=...` and `link_virt.ld` differ.
+
+```sh
+cd kernel
+make qemu          # interactive  — Ctrl-A X to quit
+make qemu-smoke    # pipes a canned command list, writes qemu-smoke.log
+```
+
+Recorded `make qemu-smoke` output (`qemu-system-aarch64 11.0,
+-cpu cortex-a76`):
+
+```
+xinu-pi5$ hello
+hello from Xinu on Raspberry Pi 5 (BCM2712, AArch64)
+xinu-pi5$ mem
+__bss_start = 0x0000000040080db0
+__bss_end   = 0x0000000040080eb0
+_end        = 0x0000000040080eb0
+xinu-pi5$ peek 0x09000018          # PL011 FR
+[0x0000000009000018] = 0x00000000000000c0   # TXFE | RI
+xinu-pi5$ uptime
+cntpct_el0 = 0x0000000003bf91e7
+xinu-pi5$ echo smoke ok
+smoke ok
+```
 
 ## Layout
 
@@ -117,8 +150,9 @@ card with a stock Raspberry Pi OS image and then overwrite
 xinu-rpi5/
 ├── kernel/
 │   ├── boot.S          # AArch64 entry stub (leex pattern, Pi-5 tuned)
-│   ├── link.ld         # load address 0x80000
-│   ├── Makefile        # aarch64-none-elf → kernel_2712.img
+│   ├── link.ld         # load address 0x80000 (Pi 5 firmware)
+│   ├── link_virt.ld    # load address 0x40080000 (QEMU virt)
+│   ├── Makefile        # aarch64-elf → kernel_2712.img + kernel_virt.img
 │   ├── main.c          # banner + shell handoff
 │   ├── shell.c         # bare-metal REPL (davidxyz/xinuPi-style)
 │   ├── shell.h

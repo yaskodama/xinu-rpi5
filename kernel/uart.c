@@ -24,8 +24,16 @@
 #include "uart.h"
 
 /* BCM2712 high-memory MMIO base + PL011 UART0 offset.
- * (Pi 4's base was 0xFE000000 + 0x201000 — both moved on Pi 5.) */
+ * (Pi 4's base was 0xFE000000 + 0x201000 — both moved on Pi 5.)
+ *
+ * Overridable at compile time via -DUART0_BASE=0xNN so the same
+ * source builds for QEMU `virt` (PL011 at 0x09000000) without
+ * touching the real-hardware default.  Don't use this for actual
+ * Pi 4/Pi 3 — those need GPIO ALT muxing that the firmware does
+ * for us on Pi 5 + QEMU virt. */
+#ifndef UART0_BASE
 #define UART0_BASE   0x107D001000UL
+#endif
 
 #define UART_DR      (*(volatile unsigned int *)(UART0_BASE + 0x00))
 #define UART_FR      (*(volatile unsigned int *)(UART0_BASE + 0x18))
@@ -63,6 +71,14 @@ void uart_init(void)
 
     /* 4. Re-enable TX + RX. */
     UART_CR = CR_UARTEN | CR_TXE | CR_RXE;
+
+    /* Drain any bytes the firmware / QEMU stdio pumped in before we
+     * finished reprogramming — otherwise piped-stdin smoke tests
+     * (and the rare USB-serial chatter) lose their first byte to
+     * the LCRH-write FIFO reset.  Harmless on a real cable. */
+    while (!(UART_FR & FR_RXFE)) {
+        (void)UART_DR;
+    }
 }
 
 void uart_putc(char c)
