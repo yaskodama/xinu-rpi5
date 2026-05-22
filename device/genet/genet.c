@@ -52,22 +52,37 @@
 /* MDIO command register inside UMAC: UMAC_BASE + 0x614 = 0xE14 */
 #define UMAC_MDIO_CMD          (UMAC_BASE + 0x614)
 
-/* TX DMA block layout (GENET v4/v5 — Linux bcmgenet_dma_ring_regs_v4).
- *   GENET_BASE + 0x4000 (TDMA area, 8 KiB)
- *     17 per-ring blocks of 0x40 bytes each (rings 0..15 user, 16 default)
- *     followed by top-level DMA control registers
- *   Default ring 16 base = 0x4000 + 16 * 0x40 = 0x4400
- *   Top-level DMA registers at 0x4000 + 17 * 0x40 = 0x4440
+/* TX DMA block layout (GENET v5 / Pi 4) — from U-Boot bcmgenet.c.
+ *
+ *   GENET_BASE + 0x4000 ... 0x4BFF: TX descriptor SRAM (256 × 12 B)
+ *     descriptor[i] = three 32-bit words at offset 0x4000 + i*12:
+ *       +0x00  length_status
+ *       +0x04  address_lo
+ *       +0x08  address_hi
+ *   GENET_BASE + 0x4C00 ... 0x4FFF: per-ring TX control registers
+ *     ring base = 0x4C00 + ring * 0x40   (ring 0..15 user, 16 default)
+ *   GENET_BASE + 0x5040 ...        : TX top-level (RING_CFG, CTRL, ...)
+ *
+ *   Default queue 16 ring base = 0x4C00 + 16*0x40 = 0x5000
+ *   TX top control            = 0x4C00 + 17*0x40 = 0x5040
  */
 #define GENET_TX_OFF                0x4000
-#define DMA_RING_STRIDE             0x40
+#define TX_DESCS                    256
+#define DMA_DESC_SIZE               12       /* 3 × 32-bit words */
+#define GENET_TDMA_REG_OFF          (GENET_TX_OFF + TX_DESCS * DMA_DESC_SIZE)
+#define DMA_RING_SIZE               0x40
 #define TX_DEFAULT_RING             16
-#define TX_RING_BASE                (GENET_TX_OFF + DMA_RING_STRIDE * TX_DEFAULT_RING)
-#define TX_DMA_TOP                  (GENET_TX_OFF + DMA_RING_STRIDE * 17)
+#define TX_RING_BASE                (GENET_TDMA_REG_OFF + TX_DEFAULT_RING * DMA_RING_SIZE)
+#define TX_DMA_TOP                  (GENET_TDMA_REG_OFF + 17 * DMA_RING_SIZE)
 
-/* Per-ring TX register offsets — GENET v4/v5 layout from Linux. */
+/* Descriptor word offsets (within each 12-byte slot in MMIO) */
+#define DMA_DESC_LENGTH_STATUS      0x00
+#define DMA_DESC_ADDRESS_LO         0x04
+#define DMA_DESC_ADDRESS_HI         0x08
+
+/* Per-ring register offsets — U-Boot bcmgenet layout */
 #define TDMA_READ_PTR_LO            0x00
-#define TDMA_READ_PTR_HI            0x04
+#define TDMA_READ_PTR_HI            0x04   /* unused in U-Boot; kept for symmetry */
 #define TDMA_CONS_INDEX             0x08
 #define TDMA_PROD_INDEX             0x0C
 #define TDMA_RING_BUF_SIZE          0x10
@@ -97,24 +112,18 @@
 /* SYS_PORT_CTRL bits */
 #define SYS_PORT_MODE_EXT_GPHY      3        /* external 1G PHY */
 
-/* TX descriptor word 0 layout (BCM2711 GENET):
+/* TX descriptor word 0 layout (from U-Boot bcmgenet.h):
  *   bits 31:16 — length (bytes)
- *   bits 15:0  — status flags
- * Status flags (in low 16 bits):
- *   bit 15: SOP (start of packet)
- *   bit 14: EOP (end of packet)
- *   bit 13: WRAP
- *   bit 12: TX_OW (descriptor owned by hardware)
- *   bit 6 : TX_APPEND_CRC
- *   bits 5:0 — QTAG
+ *   bits 15:0  — status flags (positions below)
  */
 #define DMA_BUFLENGTH_SHIFT         16
-#define DMA_SOP                     (1u << 15)
-#define DMA_EOP                     (1u << 14)
-#define DMA_TX_OWN                  (1u << 12)
-#define DMA_TX_APPEND_CRC           (1u << 6)
-#define DMA_TX_QTAG_SHIFT           0
-#define DMA_TX_DEFAULT_QTAG         0x3F     /* 6 bits */
+#define DMA_OWN                     0x8000   /* bit 15 (RX uses) */
+#define DMA_EOP                     0x4000   /* bit 14 */
+#define DMA_SOP                     0x2000   /* bit 13 */
+#define DMA_WRAP                    0x1000   /* bit 12 */
+#define DMA_TX_APPEND_CRC           0x0040   /* bit 6 */
+#define DMA_TX_QTAG_SHIFT           7        /* bits 12:7 (6-bit QTAG) */
+#define DMA_TX_DEFAULT_QTAG         0x3F
 #define MDIO_START_BUSY        (1u << 29)
 #define MDIO_READ_FAIL         (1u << 28)
 #define MDIO_RD                (1u << 27)
@@ -400,13 +409,9 @@ void genet_init(void)
     genet_send_one_arp(mac);
 }
 
-/* TX descriptor (3 words = 12 bytes) lives in main memory and is
- * shared with the GENET DMA engine.  Compile-time-initialised so
- * we don't go through any runtime memset path that might depend
- * on libc.  Same for tx_buf — pre-built ARP request frame, src
- * MAC patched in place at call time. */
-static volatile unsigned int __attribute__((aligned(64))) tx_desc[3] = { 0, 0, 0 };
-
+/* TX buffer in DRAM — descriptor itself lives in GENET MMIO,
+ * but the packet payload is in main memory and its address is
+ * stored in the descriptor's ADDRESS_LO/HI words. */
 static unsigned char __attribute__((aligned(64))) tx_buf[64] = {
     /* Ethernet header */
     0xff,0xff,0xff,0xff,0xff,0xff,                  /* dst broadcast */
@@ -428,155 +433,99 @@ static unsigned char __attribute__((aligned(64))) tx_buf[64] = {
 
 static void genet_send_one_arp(const unsigned char src_mac[6])
 {
-    uart_puts("genet/tx: NET-C3 sending one broadcast ARP via ring 16\n");
-
-    /* Step 1 — skip src-MAC patch (tx_buf is hanging on writes).
-     * Use the all-zero src MAC baked in at compile time for now. */
-    (void)src_mac;
-    uart_puts("genet/tx: skipped src MAC patch (using compile-time zeros)\n");
+    uart_puts("genet/tx: NET-C3 sending one broadcast ARP (U-Boot path)\n");
     unsigned int len = 60;
-    uart_puts("genet/tx: frame length = ");
-    puts_hex32(len);
-    uart_puts("\n");
 
-    /* Step 2 — populate TX descriptor.  Word 0 carries length in
-     * the low 16 bits and SOP+EOP+QTAG+CRC in the upper bits. */
-    unsigned long buf_pa = (unsigned long)tx_buf;
-    tx_desc[0] = ((unsigned int)len << DMA_BUFLENGTH_SHIFT)
-               | DMA_SOP | DMA_EOP | DMA_TX_OWN | DMA_TX_APPEND_CRC
-               | (DMA_TX_DEFAULT_QTAG << DMA_TX_QTAG_SHIFT);
-    tx_desc[1] = (unsigned int)(buf_pa & 0xFFFFFFFFu);
-    tx_desc[2] = (unsigned int)((buf_pa >> 32) & 0xFFFFFFFFu);
-    __asm__ volatile ("dsb sy" ::: "memory");
-
-    uart_puts("genet/tx: desc[0] = "); puts_hex32(tx_desc[0]); uart_puts("\n");
-    uart_puts("genet/tx: desc[1] = "); puts_hex32(tx_desc[1]); uart_puts("\n");
-    uart_puts("genet/tx: desc[2] = "); puts_hex32(tx_desc[2]); uart_puts("\n");
-
-    /* Step 3 — configure TDMA ring 16.
-     *
-     * IMPORTANT: START_ADDR / END_ADDR / WRITE_PTR / READ_PTR are
-     * in 32-bit *word* units (Linux bcmgenet does `addr / 4`).
-     * Using byte addresses leaves the DMA engine confused and
-     * CONS_INDEX never advances. */
-    unsigned long desc_pa = (unsigned long)tx_desc;
-    unsigned long start_w = desc_pa / 4UL;
-    unsigned long end_w   = (desc_pa + 3UL * 4UL) / 4UL - 1UL;  /* 1 desc = 3 words */
-
-    GENET_REG(TX_RING_BASE + TDMA_RING_BUF_SIZE)     = (1u << 16) | 2048u;
-    GENET_REG(TX_RING_BASE + TDMA_START_ADDR_LO)     = (unsigned int)(start_w & 0xFFFFFFFFu);
-    GENET_REG(TX_RING_BASE + TDMA_START_ADDR_HI)     = (unsigned int)((start_w >> 32) & 0xFFFFFFFFu);
-    GENET_REG(TX_RING_BASE + TDMA_END_ADDR_LO)       = (unsigned int)(end_w & 0xFFFFFFFFu);
-    GENET_REG(TX_RING_BASE + TDMA_END_ADDR_HI)       = (unsigned int)((end_w >> 32) & 0xFFFFFFFFu);
-    GENET_REG(TX_RING_BASE + TDMA_MBUF_DONE_THRESH)  = 1;
-    GENET_REG(TX_RING_BASE + TDMA_FLOW_PERIOD)       = 0;
-    GENET_REG(TX_RING_BASE + TDMA_WRITE_PTR_LO)      = (unsigned int)(start_w & 0xFFFFFFFFu);
-    GENET_REG(TX_RING_BASE + TDMA_WRITE_PTR_HI)      = (unsigned int)((start_w >> 32) & 0xFFFFFFFFu);
-    GENET_REG(TX_RING_BASE + TDMA_READ_PTR_LO)       = (unsigned int)(start_w & 0xFFFFFFFFu);
-    GENET_REG(TX_RING_BASE + TDMA_READ_PTR_HI)       = (unsigned int)((start_w >> 32) & 0xFFFFFFFFu);
-    GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX)        = 0;
-    GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX)        = 0;
-    __asm__ volatile ("dsb sy" ::: "memory");
-    uart_puts("genet/tx: TDMA ring 16 configured (start_w=");
-    puts_hex32((unsigned)start_w);
-    uart_puts(", end_w=");
-    puts_hex32((unsigned)end_w);
-    uart_puts(")\n");
-
-    /* Step 4-pre: prerequisites that Linux bcmgenet does before
-     * enabling DMA / UMAC.  Without these the UMAC_CMD write
-     * silently goes to /dev/null on Pi 4 (firmware leaves GENET
-     * in flush state). */
-
-    uart_puts("genet/tx: SYS_PORT_CTRL  = ");
-    puts_hex32(GENET_REG(SYS_PORT_CTRL));
-    uart_puts("\n");
-    GENET_REG(SYS_PORT_CTRL) = SYS_PORT_MODE_EXT_GPHY;
-
-    /* Clear RBUF/TBUF flush so the UMAC sees a stable state. */
+    /* Stage 1 — common UMAC / RBUF / RGMII bring-up.
+     * Skipped UMAC reset because UMAC_MAC0 writes still stall.
+     * Pi 4 firmware left UMAC working enough to accept CMD writes. */
+    GENET_REG(SYS_PORT_CTRL)       = SYS_PORT_MODE_EXT_GPHY;
     GENET_REG(SYS_RBUF_FLUSH_CTRL) = 0;
     GENET_REG(SYS_TBUF_FLUSH_CTRL) = 0;
-
-    /* EXT block — enable RGMII mode, deassert OOB disable, set
-     * ID mode disable (RX internal delay handled by PHY). */
     unsigned int ext = GENET_REG(EXT_RGMII_OOB_CTRL);
-    uart_puts("genet/tx: EXT_RGMII_OOB before = "); puts_hex32(ext); uart_puts("\n");
     ext |= EXT_RGMII_MODE_EN | EXT_ID_MODE_DIS;
     ext &= ~EXT_OOB_DISABLE;
-    GENET_REG(EXT_RGMII_OOB_CTRL) = ext;
-    uart_puts("genet/tx: EXT_RGMII_OOB after  = ");
-    puts_hex32(GENET_REG(EXT_RGMII_OOB_CTRL));
+    GENET_REG(EXT_RGMII_OOB_CTRL)  = ext;
+    GENET_REG(UMAC_CMD)            = CMD_TX_EN | CMD_RX_EN;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    uart_puts("genet/tx: UMAC_CMD = "); puts_hex32(GENET_REG(UMAC_CMD)); uart_puts("\n");
+
+    /* Stage 2 — TX ring init, U-Boot style.
+     * - START_ADDR/READ_PTR/WRITE_PTR all 0 (descriptors live at
+     *   the *start* of the TX block at GENET_TX_OFF, the ring
+     *   register START_ADDR is an offset from there).
+     * - END_ADDR = TX_DESCS * DMA_DESC_SIZE / 4 - 1 in word units.
+     * - PROD_INDEX is initialised to the CURRENT CONS_INDEX
+     *   (which firmware may have set non-zero) so the ring starts
+     *   in "all sent" state.  Subsequent TX increments PROD only. */
+    GENET_REG(TX_DMA_TOP + 0x0C /*SCB_BURST_SIZE*/) = 8;
+    GENET_REG(TX_RING_BASE + TDMA_START_ADDR_LO) = 0;
+    GENET_REG(TX_RING_BASE + TDMA_READ_PTR_LO)   = 0;
+    GENET_REG(TX_RING_BASE + TDMA_WRITE_PTR_LO)  = 0;
+    GENET_REG(TX_RING_BASE + TDMA_END_ADDR_LO)   = TX_DESCS * DMA_DESC_SIZE / 4 - 1;
+    unsigned int cur_cons = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX);
+    GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX)        = cur_cons;
+    GENET_REG(TX_RING_BASE + TDMA_MBUF_DONE_THRESH)  = 1;
+    GENET_REG(TX_RING_BASE + TDMA_FLOW_PERIOD)       = 0;
+    GENET_REG(TX_RING_BASE + TDMA_RING_BUF_SIZE)     = (TX_DESCS << 16) | 2048;
+    GENET_REG(TX_DMA_TOP + 0x00 /*DMA_RING_CFG*/)    = 1u << TX_DEFAULT_RING;
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* Stage 3 — write TX descriptor #0 *into MMIO* (NOT DRAM).
+     * Descriptor area lives at GENET_TX_OFF .. + 256*12 bytes,
+     * each descriptor 12 bytes (3 words). */
+    unsigned int  tx_index = cur_cons & 0xFF;
+    unsigned int  desc_off = GENET_TX_OFF + tx_index * DMA_DESC_SIZE;
+    unsigned long buf_pa   = (unsigned long)tx_buf;
+    unsigned int  len_stat = ((unsigned int)len << DMA_BUFLENGTH_SHIFT)
+                           | (DMA_TX_DEFAULT_QTAG << DMA_TX_QTAG_SHIFT)
+                           | DMA_TX_APPEND_CRC | DMA_SOP | DMA_EOP;
+    GENET_REG(desc_off + DMA_DESC_ADDRESS_LO)     = (unsigned int)(buf_pa & 0xFFFFFFFFu);
+    GENET_REG(desc_off + DMA_DESC_ADDRESS_HI)     = (unsigned int)((buf_pa >> 32) & 0xFFFFFFFFu);
+    GENET_REG(desc_off + DMA_DESC_LENGTH_STATUS)  = len_stat;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    uart_puts("genet/tx: desc[0]@MMIO len_stat=");
+    puts_hex32(len_stat);
+    uart_puts(" buf_lo=");
+    puts_hex32((unsigned int)(buf_pa & 0xFFFFFFFFu));
     uart_puts("\n");
 
+    /* Stage 4 — enable DMA: bit (DEFAULT_Q + 1) per-ring + DMA_EN bit 0 */
+    GENET_REG(TX_DMA_TOP + 0x04 /*DMA_CTRL*/) = (1u << (TX_DEFAULT_RING + 1)) | 1u;
     __asm__ volatile ("dsb sy" ::: "memory");
-
-    /* Step 4a — DMA burst size.  Linux writes 8 (= 4 cache lines)
-     * here; without this the DMA engine sometimes won't even
-     * fetch descriptors. */
-    GENET_REG(TX_DMA_TOP + TDMA_SCB_BURST_SIZE) = 8u;
-    __asm__ volatile ("dsb sy" ::: "memory");
-
-    /* Step 4b — enable ring 16 in DMA_RING_CFG, then enable TDMA.
-     *
-     * DMA_CTRL has TWO classes of enable bits, not just bit 0:
-     *   bit 0     = global DMA enable
-     *   bits 1..17 = per-ring data-path enable (ring N at bit N+1)
-     * Linux's bcmgenet_enable_dma() sets both.  Without the per-
-     * ring bit the data path stays gated even with DMA_RING_CFG. */
-    GENET_REG(TX_DMA_TOP + TDMA_RING_CFG) = (1u << TX_DEFAULT_RING);
-    unsigned int dma_ctrl = 1u | (1u << (TX_DEFAULT_RING + 1));   /* global + ring16 = 0x20001 */
-    GENET_REG(TX_DMA_TOP + TDMA_CTRL) = dma_ctrl;
-    __asm__ volatile ("dsb sy" ::: "memory");
-    uart_puts("genet/tx: TDMA_RING_CFG = ");
-    puts_hex32(GENET_REG(TX_DMA_TOP + TDMA_RING_CFG));
-    uart_puts("\n");
-    uart_puts("genet/tx: TDMA_CTRL     = ");
-    puts_hex32(GENET_REG(TX_DMA_TOP + TDMA_CTRL));
+    uart_puts("genet/tx: TDMA_CTRL = ");
+    puts_hex32(GENET_REG(TX_DMA_TOP + 0x04));
     uart_puts("\n");
 
-    /* Step 5 — enable UMAC TX + RX path.  Direct overwrite (not
-     * RMW) so any leftover SW_RESET / LCL_LOOP bits get cleared.
-     * Print before+after so we can see whether the write stuck. */
-    unsigned int cmd_pre = GENET_REG(UMAC_CMD);
-    uart_puts("genet/tx: UMAC_CMD before = "); puts_hex32(cmd_pre); uart_puts("\n");
-    GENET_REG(UMAC_CMD) = CMD_TX_EN | CMD_RX_EN;
+    /* Stage 5 — bump PROD_INDEX to hand descriptor to DMA */
+    unsigned int new_prod = cur_cons + 1;
+    GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX) = new_prod;
     __asm__ volatile ("dsb sy" ::: "memory");
-    uart_puts("genet/tx: UMAC_CMD after  = ");
-    puts_hex32(GENET_REG(UMAC_CMD));
-    uart_puts("\n");
+    uart_puts("genet/tx: PROD now ");
+    puts_hex32(new_prod);
+    uart_puts(", waiting...\n");
 
-    /* Step 6 — bump PROD_INDEX to hand the descriptor to the
-     * DMA engine.  HW will fetch the descriptor, DMA the buffer,
-     * and emit the frame on the PHY.  CONS_INDEX will advance to
-     * 1 when transmission completes. */
-    GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX) = 1;
-    __asm__ volatile ("dsb sy" ::: "memory");
-    uart_puts("genet/tx: PROD_INDEX=1, waiting for CONS_INDEX...\n");
-
-    /* Step 7 — poll for completion with 200 ms timeout. */
+    /* Stage 6 — poll CONS_INDEX with 200 ms timeout */
     unsigned long freq;
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
     unsigned long target = (freq / 1000UL) * 200UL;
-    unsigned long start, now;
-    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
-    unsigned int cons = 0;
+    unsigned long t_start, t_now;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t_start));
+    unsigned int cons = cur_cons;
     while (1) {
-        cons = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX);
-        if (cons >= 1) break;
-        __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
-        if (now - start >= target) break;
+        cons = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX) & 0xFFFFu;
+        if (cons == (new_prod & 0xFFFFu)) break;
+        __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t_now));
+        if (t_now - t_start >= target) break;
     }
-    /* Re-print descriptor here so the value survives even after
-     * 18 lines of shell-window scroll. */
-    uart_puts("genet/tx: desc[0] re = "); puts_hex32(tx_desc[0]); uart_puts("\n");
-    uart_puts("genet/tx: CONS_INDEX = "); puts_hex32(cons);
-    uart_puts((cons >= 1) ? "  (sent OK)\n" : "  (TX timeout)\n");
-    /* compact diag */
-    if (cons < 1) {
-        uart_puts("genet/tx: DMA_S/CTRL = ");
-        puts_hex32(GENET_REG(TX_DMA_TOP + TDMA_STATUS));
+    uart_puts("genet/tx: CONS = ");
+    puts_hex32(cons);
+    uart_puts((cons == (new_prod & 0xFFFFu)) ? "  (sent OK)\n" : "  (TX timeout)\n");
+    if (cons != (new_prod & 0xFFFFu)) {
+        uart_puts("genet/tx: CTRL/RING_CFG = ");
+        puts_hex32(GENET_REG(TX_DMA_TOP + 0x04));
         uart_puts(" / ");
-        puts_hex32(GENET_REG(TX_DMA_TOP + TDMA_CTRL));
+        puts_hex32(GENET_REG(TX_DMA_TOP + 0x00));
         uart_puts("\n");
     }
 }
