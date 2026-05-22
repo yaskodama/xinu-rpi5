@@ -47,6 +47,7 @@
 #include "usb.h"
 #include "timer.h"
 #include "wm.h"
+#include "genet.h"
 
 /* Linker-script symbols (from kernel/link.ld). */
 extern unsigned long __bss_start;
@@ -474,6 +475,40 @@ static int cmd_ps(int argc, char **argv)
     return 0;
 }
 
+static int cmd_rxstat(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    /* Drain pending RX frames first, so packet count reflects HW
+     * state at the moment of the command rather than just what
+     * background polling collected. */
+    unsigned char *pkt;
+    int len;
+    int drained = 0;
+    while ((len = genet_rx_poll(&pkt)) > 0) {
+        genet_rx_release();
+        drained++;
+        if (drained >= 32) break;
+    }
+    uart_puts("rxstat: packets=");
+    {
+        unsigned long v = genet_rx_packet_count();
+        char buf[24]; int n = 0;
+        if (v == 0) uart_putc('0');
+        else { while (v) { buf[n++] = (char)('0' + (v % 10)); v /= 10; }
+               while (n--) uart_putc(buf[n]); }
+    }
+    uart_puts(" bytes=");
+    {
+        unsigned long v = genet_rx_byte_count();
+        char buf[24]; int n = 0;
+        if (v == 0) uart_putc('0');
+        else { while (v) { buf[n++] = (char)('0' + (v % 10)); v /= 10; }
+               while (n--) uart_putc(buf[n]); }
+    }
+    uart_puts("  drained="); puts_dec(drained); uart_puts("\n");
+    return 0;
+}
+
 static int cmd_pan(int argc, char **argv)
 {
     if (argc < 3) {
@@ -603,6 +638,7 @@ static const struct centry commandtab[] = {
     { "procdemo", "real 2-process ctxsw demo [iters]",     cmd_procdemo },
     { "usb",      "DWC2 USB HCD diagnostics (Pi 4 only)",  cmd_usb      },
     { "ticks",    "show 100 Hz timer tick counter",        cmd_ticks    },
+    { "rxstat",   "drain RX ring + show pkt/byte counters", cmd_rxstat  },
     { "pan",      "pan <dx> <dy>  scroll viewport",        cmd_pan      },
     { "view",     "show viewport / desktop sizes",         cmd_view     },
     { "autopan",  "autopan [on|off]  toggle demo scroll",  cmd_autopan  },

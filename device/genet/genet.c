@@ -67,13 +67,27 @@
  *   TX top control            = 0x4C00 + 17*0x40 = 0x5040
  */
 #define GENET_TX_OFF                0x4000
+#define GENET_RX_OFF                0x2000
 #define TX_DESCS                    256
+#define RX_DESCS                    256
 #define DMA_DESC_SIZE               12       /* 3 × 32-bit words */
 #define GENET_TDMA_REG_OFF          (GENET_TX_OFF + TX_DESCS * DMA_DESC_SIZE)
+#define GENET_RDMA_REG_OFF          (GENET_RX_OFF + RX_DESCS * DMA_DESC_SIZE)
 #define DMA_RING_SIZE               0x40
 #define TX_DEFAULT_RING             16
 #define TX_RING_BASE                (GENET_TDMA_REG_OFF + TX_DEFAULT_RING * DMA_RING_SIZE)
 #define TX_DMA_TOP                  (GENET_TDMA_REG_OFF + 17 * DMA_RING_SIZE)
+#define RX_RING_BASE                (GENET_RDMA_REG_OFF + TX_DEFAULT_RING * DMA_RING_SIZE)
+#define RX_DMA_TOP                  (GENET_RDMA_REG_OFF + 17 * DMA_RING_SIZE)
+
+#define RX_BUF_LENGTH               2048
+/* Per-ring RDMA register offsets (U-Boot bcmgenet) */
+#define RDMA_WRITE_PTR              0x00
+#define RDMA_PROD_INDEX             0x08
+#define RDMA_CONS_INDEX             0x0C
+#define RDMA_XON_XOFF_THRESH        0x28
+#define RDMA_READ_PTR               0x2C
+/* DMA_RING_BUF_SIZE / START_ADDR / END_ADDR / MBUF_DONE_THRESH share TX offsets */
 
 /* Descriptor word offsets (within each 12-byte slot in MMIO) */
 #define DMA_DESC_LENGTH_STATUS      0x00
@@ -270,8 +284,9 @@ static int mdio_read(unsigned phy_id, unsigned reg)
     }
 }
 
-/* forward decl */
+/* forward decls */
 static void genet_send_one_arp(const unsigned char src_mac[6]);
+static void genet_init_rx(void);
 
 static void umac_soft_reset(void)
 {
@@ -407,7 +422,30 @@ void genet_init(void)
      * NET-C3 — send one broadcast ARP frame via TDMA ring 16 *
      * ====================================================== */
     genet_send_one_arp(mac);
+
+    /* NET-D — initialise RX path so future broadcasts / ARP
+     * replies start landing in rx_bufs[]. */
+    genet_init_rx();
 }
+
+/* ---- RX path (NET-D) ----
+ *
+ * Use a small RX ring (16 descriptors) so we don't need 512 KB
+ * of buffer pool.  16 × 2048 bytes = 32 KB in BSS.  The HW puts
+ * incoming Ethernet frames into rx_bufs[i] and updates the
+ * descriptor's length_status; we poll PROD_INDEX to detect new
+ * arrivals.  After consumption we bump CONS_INDEX and re-arm the
+ * descriptor with DMA_OWN. */
+
+#define RX_RING_DESCS               16
+
+static unsigned char __attribute__((aligned(64)))
+    rx_bufs[RX_RING_DESCS][RX_BUF_LENGTH];
+
+static unsigned long g_rx_packets;
+static unsigned long g_rx_bytes;
+static unsigned int  g_rx_cons;       /* SW-side consumer index 0..RING-1 */
+static int           g_rx_inited;
 
 /* TX buffer in DRAM — descriptor itself lives in GENET MMIO,
  * but the packet payload is in main memory and its address is
@@ -529,5 +567,94 @@ static void genet_send_one_arp(const unsigned char src_mac[6])
         uart_puts("\n");
     }
 }
+
+static void genet_init_rx(void)
+{
+    uart_puts("genet/rx: trace A (entering init_rx)\n");
+    /* 1. Populate RX descriptors.  Each descriptor points to its
+     * own buffer in rx_bufs[].  RX descriptors need DMA_OWN set
+     * so HW knows they're available to receive into. */
+    for (int i = 0; i < RX_RING_DESCS; i++) {
+        unsigned int desc_off = GENET_RX_OFF + i * DMA_DESC_SIZE;
+        unsigned long buf_pa  = (unsigned long)rx_bufs[i];
+        GENET_REG(desc_off + DMA_DESC_ADDRESS_LO)
+            = (unsigned int)(buf_pa & 0xFFFFFFFFu);
+        GENET_REG(desc_off + DMA_DESC_ADDRESS_HI)
+            = (unsigned int)((buf_pa >> 32) & 0xFFFFFFFFu);
+        GENET_REG(desc_off + DMA_DESC_LENGTH_STATUS)
+            = (RX_BUF_LENGTH << DMA_BUFLENGTH_SHIFT) | DMA_OWN;
+    }
+
+    uart_puts("genet/rx: trace B (descriptors written)\n");
+
+    /* 2. SCB burst size */
+    GENET_REG(RX_DMA_TOP + 0x0C /*DMA_SCB_BURST_SIZE*/) = 8;
+
+    /* 3. Per-ring RX setup */
+    GENET_REG(RX_RING_BASE + TDMA_START_ADDR_LO) = 0;
+    GENET_REG(RX_RING_BASE + RDMA_WRITE_PTR)     = 0;
+    GENET_REG(RX_RING_BASE + RDMA_READ_PTR)      = 0;
+    GENET_REG(RX_RING_BASE + TDMA_END_ADDR_LO)
+        = RX_RING_DESCS * DMA_DESC_SIZE / 4 - 1;
+    unsigned int cur_prod = GENET_REG(RX_RING_BASE + RDMA_PROD_INDEX);
+    GENET_REG(RX_RING_BASE + RDMA_CONS_INDEX) = cur_prod;
+    g_rx_cons = cur_prod & 0xFF;
+    if (g_rx_cons >= RX_RING_DESCS) g_rx_cons %= RX_RING_DESCS;
+    GENET_REG(RX_RING_BASE + TDMA_MBUF_DONE_THRESH) = 1;
+    GENET_REG(RX_RING_BASE + TDMA_RING_BUF_SIZE)
+        = (RX_RING_DESCS << 16) | RX_BUF_LENGTH;
+    /* Flow-control threshold (XOFF<<16 | XON) — Linux default. */
+    GENET_REG(RX_RING_BASE + RDMA_XON_XOFF_THRESH) = (5u << 16) | (RX_RING_DESCS >> 4);
+
+    uart_puts("genet/rx: trace C (ring regs written)\n");
+
+    /* 4. Enable ring 16 + global DMA in RX top-level */
+    GENET_REG(RX_DMA_TOP + 0x00 /*DMA_RING_CFG*/) = 1u << TX_DEFAULT_RING;
+    GENET_REG(RX_DMA_TOP + 0x04 /*DMA_CTRL*/)
+        = (1u << (TX_DEFAULT_RING + 1)) | 1u;
+
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    g_rx_inited = 1;
+    uart_puts("genet/rx: NET-D RX ring armed (16 descs, 32 KB buffer pool)\n");
+}
+
+int genet_rx_poll(unsigned char **out_pkt)
+{
+    if (!g_rx_inited) return 0;
+    unsigned int prod = GENET_REG(RX_RING_BASE + RDMA_PROD_INDEX) & 0xFFFFu;
+    unsigned int cons = GENET_REG(RX_RING_BASE + RDMA_CONS_INDEX) & 0xFFFFu;
+    if (prod == cons) return 0;
+
+    /* Descriptor that HW just filled */
+    unsigned int idx       = g_rx_cons;
+    unsigned int desc_off  = GENET_RX_OFF + idx * DMA_DESC_SIZE;
+    unsigned int len_stat  = GENET_REG(desc_off + DMA_DESC_LENGTH_STATUS);
+    unsigned int length    = (len_stat >> DMA_BUFLENGTH_SHIFT) & 0x0FFF;
+
+    if (out_pkt) *out_pkt = rx_bufs[idx];
+    g_rx_packets++;
+    g_rx_bytes += length;
+    return (int)length;
+}
+
+void genet_rx_release(void)
+{
+    if (!g_rx_inited) return;
+    /* Re-arm descriptor with DMA_OWN so HW can refill it. */
+    unsigned int idx      = g_rx_cons;
+    unsigned int desc_off = GENET_RX_OFF + idx * DMA_DESC_SIZE;
+    GENET_REG(desc_off + DMA_DESC_LENGTH_STATUS)
+        = (RX_BUF_LENGTH << DMA_BUFLENGTH_SHIFT) | DMA_OWN;
+
+    /* Advance CONS_INDEX (HW-visible) and software index. */
+    unsigned int cons = GENET_REG(RX_RING_BASE + RDMA_CONS_INDEX);
+    GENET_REG(RX_RING_BASE + RDMA_CONS_INDEX) = cons + 1;
+    g_rx_cons = (g_rx_cons + 1) % RX_RING_DESCS;
+    __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+unsigned long genet_rx_packet_count(void) { return g_rx_packets; }
+unsigned long genet_rx_byte_count(void)   { return g_rx_bytes;   }
 
 #endif /* GENET_BASE */

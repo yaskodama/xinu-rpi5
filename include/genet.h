@@ -30,6 +30,18 @@ unsigned int genet_sys_port_ctrl(void);
  * has already populated from OTP / VC). */
 void genet_get_mac(unsigned char mac[6]);
 
+/* Phase NET-D — poll RX path for one frame.  Returns the byte
+ * length of the received frame and writes a pointer to the
+ * buffer into *out_pkt, or 0 if no frame is pending. */
+int  genet_rx_poll(unsigned char **out_pkt);
+
+/* Release the buffer returned by genet_rx_poll() so HW can reuse it. */
+void genet_rx_release(void);
+
+/* Statistics for the shell `rxstat` command. */
+unsigned long genet_rx_packet_count(void);
+unsigned long genet_rx_byte_count(void);
+
 #else  /* GENET_BASE not defined */
 
 static inline void         genet_init(void)            {}

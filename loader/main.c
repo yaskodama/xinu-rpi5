@@ -32,6 +32,52 @@
 #include "xhci.h"
 #include "genet.h"
 
+/* puts_kb is defined later in this file — declare it here so the
+ * RX-tick logger above can call it. */
+static void puts_kb(unsigned long bytes);
+
+/* Auto-poll RX once per wm frame.  Print a one-line summary of
+ * any received frame and release the descriptor so HW can reuse
+ * the buffer.  Rate-cap at 5 messages so broadcasts don't flood. */
+static int g_rx_log_left = 5;
+static void genet_rx_tick(void)
+{
+    unsigned char *pkt;
+    int len;
+    while ((len = genet_rx_poll(&pkt)) > 0) {
+        if (g_rx_log_left > 0) {
+            g_rx_log_left--;
+            uart_puts("rx: len=");
+            puts_kb((unsigned long)len);
+            uart_puts(" dst=");
+            for (int i = 0; i < 6; i++) {
+                unsigned char b = pkt[i];
+                char hi = (char)((b >> 4) & 0xF);
+                char lo = (char)(b & 0xF);
+                uart_putc((char)(hi < 10 ? '0' + hi : 'a' + hi - 10));
+                uart_putc((char)(lo < 10 ? '0' + lo : 'a' + lo - 10));
+                if (i < 5) uart_putc(':');
+            }
+            uart_puts(" src=");
+            for (int i = 6; i < 12; i++) {
+                unsigned char b = pkt[i];
+                char hi = (char)((b >> 4) & 0xF);
+                char lo = (char)(b & 0xF);
+                uart_putc((char)(hi < 10 ? '0' + hi : 'a' + hi - 10));
+                uart_putc((char)(lo < 10 ? '0' + lo : 'a' + lo - 10));
+                if (i < 11) uart_putc(':');
+            }
+            uart_puts(" type=");
+            uart_putc("0123456789abcdef"[(pkt[12] >> 4) & 0xF]);
+            uart_putc("0123456789abcdef"[ pkt[12]       & 0xF]);
+            uart_putc("0123456789abcdef"[(pkt[13] >> 4) & 0xF]);
+            uart_putc("0123456789abcdef"[ pkt[13]       & 0xF]);
+            uart_puts("\n");
+        }
+        genet_rx_release();
+    }
+}
+
 /* USPi is gone (DWC2 only — Pi 4 USB-A keyboards/mice need xHCI).
  * Keyboard input from the future xHCI HID driver will land here. */
 void xhci_keyboard_event(char c)
@@ -679,7 +725,7 @@ void kernel_main(void)
         shell_win.content_bg   = 0xFF000010U;
         shell_win.draw_content = shellwin_draw;
         wm_add(&shell_win);
-        wm_set_tick(shellwin_step);
+        wm_set_tick(genet_rx_tick);
 
         /* Soft keyboard window: bottom-left of the initial 640×480
          * viewport.  Half-size as the user requested. */
