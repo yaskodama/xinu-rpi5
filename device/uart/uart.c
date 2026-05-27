@@ -55,6 +55,31 @@
 
 void uart_init(void)
 {
+#ifdef GPIO_BASE
+    /* Pi 4 (BCM2711): route GPIO14 (TXD0) and GPIO15 (RXD0) to ALT0 so
+     * the PL011 we drive at UART0_BASE actually reaches header pins
+     * 8/10.  Relying on the firmware's enable_uart muxing is unreliable
+     * on Pi 4 — the PL011 is often tied to Bluetooth while the
+     * mini-UART (ttyS0) is what gets placed on the header, in which
+     * case our PL011 output would never appear on the cable.  Force it. */
+    {
+        volatile unsigned int *gpfsel1 =
+            (volatile unsigned int *)(GPIO_BASE + 0x04);   /* GPIO10..19 */
+        unsigned int v = *gpfsel1;
+        v &= ~((7u << 12) | (7u << 15));   /* clear FSEL14, FSEL15        */
+        v |=  ((4u << 12) | (4u << 15));   /* ALT0 (0b100) = TXD0/RXD0    */
+        *gpfsel1 = v;
+        /* Pull-none on 14/15 (BCM2711 PUP_PDN_CNTRL_REG0: 2 bits each,
+         * GPIO14 = bits 29:28, GPIO15 = bits 31:30). */
+        volatile unsigned int *pud0 =
+            (volatile unsigned int *)(GPIO_BASE + 0xE4);
+        unsigned int p = *pud0;
+        p &= ~((3u << 28) | (3u << 30));
+        *pud0 = p;
+        __asm__ volatile ("dsb sy" ::: "memory");
+    }
+#endif
+
     /* 1. Disable while we reprogram. */
     UART_CR = 0;
 

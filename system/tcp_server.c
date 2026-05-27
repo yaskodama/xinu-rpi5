@@ -84,6 +84,17 @@ static unsigned char g_my_ip[4]  = { 192, 168, 3, 100 };
 static unsigned short g_listen_port = 23;
 static unsigned long g_isn_seed = 0xDEADBEEF;
 
+/* Diagnostic counters — surfaced by the shell `tcpstat` command so we
+ * can see what happened without relying on scrolled-off boot output. */
+static unsigned long g_tcp_any;       /* TCP frames to our IP, any port      */
+static unsigned long g_seg_rx;        /* TCP segments addressed to our port */
+static unsigned long g_syn_seen;      /* SYNs that opened a connection       */
+static unsigned long g_synack_sent;   /* SYN+ACKs we transmitted             */
+static unsigned long g_estab;         /* transitions to ESTABLISHED          */
+static unsigned long g_txfail;        /* tcp_send() that hit a TX error       */
+static unsigned char  g_last_ip[4];   /* most recent peer (even if rejected) */
+static unsigned short g_last_port;
+
 /* Outgoing frame buffer — volatile + aligned(64), see net_responder
  * for the rationale (MMU off + Device-nGnRnE + GCC store merging). */
 static volatile unsigned char __attribute__((aligned(64))) tx_frame[1518];
@@ -192,7 +203,19 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
     th[16] = (unsigned char)(ucs >> 8);
     th[17] = (unsigned char)(ucs & 0xFF);
 
-    return genet_tx_frame((const unsigned char *)tx_frame, frame_len);
+    /* Pad to the 60-byte Ethernet minimum (the responder does the same
+     * for ARP/ICMP).  A header-only SYN+ACK / ACK / FIN is only 54
+     * bytes on the wire — a runt that the switch or the peer NIC will
+     * silently drop, which is why ping (always >= 60 B) worked but the
+     * TCP handshake never completed.  The extra bytes sit past the IP
+     * total-length field, so they are ignored as Ethernet padding. */
+    int send_len = frame_len;
+    if (send_len < 60) {
+        for (int i = frame_len; i < 60; i++) tx_frame[i] = 0;
+        send_len = 60;
+    }
+
+    return genet_tx_frame((const unsigned char *)tx_frame, send_len);
 }
 
 /* Handle one received Ethernet frame.  Returns 1 if it was TCP-for-us
@@ -201,7 +224,17 @@ int tcp_handle_packet(const unsigned char *frame, int len)
 {
     if (len < 14 + 20 + 20) return 0;
     if (frame[12] != 0x08 || frame[13] != 0x00) return 0;
-    const unsigned char *ip = frame + 14;
+    /* volatile is CRITICAL here.  The MMU is off, so all DRAM (incl. the
+     * GENET rx_bufs[] this points into) is Device-nGnRnE on AArch64.
+     * Without volatile, GCC -O2 recognises the big-endian byte-OR idiom
+     * below (seq/ack) and folds it into a single 32-bit LDR — an
+     * UNALIGNED word load (the TCP seq sits at frame offset 38, only
+     * 2-byte aligned), which data-aborts on Device memory and hard-hangs
+     * the box.  This is exactly why ICMP/ping (no unaligned wide reads)
+     * worked while the first TCP segment froze everything.  volatile
+     * forces strict per-byte loads.  Same hazard as the TX-frame stores
+     * in net_responder. */
+    const volatile unsigned char *ip = frame + 14;
     if ((ip[0] >> 4) != 4) return 0;
     int ihl = (ip[0] & 0x0F) * 4;
     if (ip[9] != 6) return 0;                       /* not TCP */
@@ -209,10 +242,21 @@ int tcp_handle_packet(const unsigned char *frame, int len)
     if (ip[16] != g_my_ip[0] || ip[17] != g_my_ip[1] ||
         ip[18] != g_my_ip[2] || ip[19] != g_my_ip[3]) return 0;
 
-    const unsigned char *tcp = ip + ihl;
+    const volatile unsigned char *tcp = ip + ihl;
     unsigned short sport = ((unsigned short)tcp[0] << 8) | tcp[1];
     unsigned short dport = ((unsigned short)tcp[2] << 8) | tcp[3];
+
+    /* TCP addressed to *our IP* on ANY port — proves a TCP frame
+     * physically reached us (vs. being blocked/lost on the path).
+     * Capture the peer here too, even on a port mismatch.  If `any`
+     * stays 0 while ICMP works, the SYN never arrived (path/firewall);
+     * if `any` climbs but `seg` stays 0, it hit the wrong port. */
+    g_tcp_any++;
+    for (int i = 0; i < 4; i++) g_last_ip[i] = ip[12 + i];
+    g_last_port = sport;
+
     if (dport != g_listen_port) return 0;
+    g_seg_rx++;            /* ...and specifically to our listen port */
 
     unsigned long seq = ((unsigned long)tcp[4]  << 24) |
                         ((unsigned long)tcp[5]  << 16) |
@@ -226,7 +270,7 @@ int tcp_handle_packet(const unsigned char *frame, int len)
     unsigned char flags    = tcp[13] & 0x3F;
     int total_len = ((unsigned short)ip[2] << 8) | ip[3];
     int data_len  = total_len - ihl - data_off;
-    const unsigned char *data = tcp + data_off;
+    const volatile unsigned char *data = tcp + data_off;
 
     /* LISTEN: only SYN starts a connection.  Anything else gets RST. */
     if (g_conn.state == TCP_CLOSED || g_conn.state == TCP_LISTEN) {
@@ -242,9 +286,15 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         g_conn.greeted   = 0;
 
         uart_puts("tcp: SYN from "); puts_ip(g_conn.peer_ip);
-        uart_puts(":"); puts_u32_dec(sport);
-        uart_puts(" (no SYN+ACK sent — isolating TX-ring impact)\n");
-        /* tcp_send(TCP_FLAG_SYN | TCP_FLAG_ACK, 0, 0); */
+        uart_puts(":"); puts_u32_dec(sport); uart_puts(" -> SYN+ACK\n");
+
+        /* Send SYN+ACK.  SYN occupies one sequence number, so the
+         * next byte we send (the greeting) starts at my_seq + 1. */
+        g_syn_seen++;
+        if (tcp_send(TCP_FLAG_SYN | TCP_FLAG_ACK, 0, 0) < 0) g_txfail++;
+        else                                                 g_synack_sent++;
+        g_conn.my_seq += 1;
+        g_conn.state   = TCP_SYN_RCVD;
         return 1;
     }
 
@@ -257,6 +307,7 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         if (flags & TCP_FLAG_RST) { g_conn.state = TCP_LISTEN; return 1; }
         if ((flags & TCP_FLAG_ACK) && ack == g_conn.my_seq) {
             g_conn.state = TCP_ESTABLISHED;
+            g_estab++;
             uart_puts("tcp: ESTABLISHED\n");
             if (!g_conn.greeted) {
                 static const char hello[] =
@@ -332,4 +383,59 @@ int tcp_handle_packet(const unsigned char *frame, int len)
     }
 
     return 1;
+}
+
+/* On-demand state dump for the shell `tcpstat` command — reads cleanly
+ * even after the boot log has scrolled away.  Run `nc <ip> 23` then
+ * `tcpstat`:
+ *   seg_rx=0  -> the SYN never reached us (routing / dispatch / RX)
+ *   seg_rx>0, syn>0, synack>0, estab=0 -> SYN+ACK left but the client's
+ *              ACK never matched (bad checksum/seq, or reply dropped)
+ *   txfail>0  -> the SYN+ACK could not be transmitted (TX wedge) */
+void tcp_dump_state(void)
+{
+    const char *st;
+    switch (g_conn.state) {
+        case TCP_CLOSED:      st = "CLOSED";      break;
+        case TCP_LISTEN:      st = "LISTEN";      break;
+        case TCP_SYN_RCVD:    st = "SYN_RCVD";    break;
+        case TCP_ESTABLISHED: st = "ESTABLISHED"; break;
+        case TCP_FIN_WAIT_1:  st = "FIN_WAIT_1";  break;
+        case TCP_LAST_ACK:    st = "LAST_ACK";    break;
+        default:              st = "?";           break;
+    }
+    uart_puts("tcp: state="); uart_puts(st);
+    uart_puts(" listen_port="); puts_u32_dec(g_listen_port);
+    uart_puts("\n     any=");    puts_u32_dec(g_tcp_any);
+    uart_puts(" seg_rx=");        puts_u32_dec(g_seg_rx);
+    uart_puts(" syn=");          puts_u32_dec(g_syn_seen);
+    uart_puts(" synack=");       puts_u32_dec(g_synack_sent);
+    uart_puts(" estab=");        puts_u32_dec(g_estab);
+    uart_puts(" txfail=");       puts_u32_dec(g_txfail);
+    uart_puts("\n     last_peer=");
+    if (g_last_port) { puts_ip(g_last_ip); uart_puts(":"); puts_u32_dec(g_last_port); }
+    else             { uart_puts("(none)"); }
+    uart_puts("\n");
+}
+
+/* Numeric getters for the live HDMI status window (no keyboard needed
+ * to run `tcpstat`, so these drive the on-screen Network panel). */
+unsigned long tcp_any_count(void)     { return g_tcp_any;     }
+unsigned long tcp_seg_rx_count(void)  { return g_seg_rx;      }
+unsigned long tcp_syn_count(void)     { return g_syn_seen;    }
+unsigned long tcp_synack_count(void)  { return g_synack_sent; }
+unsigned long tcp_estab_count(void)   { return g_estab;       }
+unsigned long tcp_txfail_count(void)  { return g_txfail;      }
+
+const char *tcp_state_str(void)
+{
+    switch (g_conn.state) {
+        case TCP_CLOSED:      return "CLOSED";
+        case TCP_LISTEN:      return "LISTEN";
+        case TCP_SYN_RCVD:    return "SYN_RCVD";
+        case TCP_ESTABLISHED: return "ESTAB";
+        case TCP_FIN_WAIT_1:  return "FINWAIT1";
+        case TCP_LAST_ACK:    return "LASTACK";
+        default:              return "?";
+    }
 }

@@ -95,6 +95,7 @@ PI4_CFLAGS  = $(COMMON) -mcpu=cortex-a72 \
               -DGIC_BASE=0xFF840000UL \
               -DPCIE_BASE=0xFD500000UL \
               -DGENET_BASE=0xFD580000UL \
+              -DGPIO_BASE=0xFE200000UL \
               -DHEAP_END=0x40000000UL \
               -DBOARD_NAME=\"Pi4\" \
               -DSOC_NAME=\"BCM2711\" \

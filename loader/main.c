@@ -51,6 +51,15 @@ extern unsigned long dhcp_ack_count(void);
 extern int  tcp_handle_packet(const unsigned char *frame, int len);
 extern void tcp_set_mac(const unsigned char mac[6]);
 extern void tcp_listen(unsigned short port);
+/* TCP listener live counters for the on-screen Network panel (the Pi
+ * has no USB keyboard yet, so the shell `tcpstat` is unreachable). */
+extern unsigned long tcp_any_count(void);
+extern unsigned long tcp_seg_rx_count(void);
+extern unsigned long tcp_syn_count(void);
+extern unsigned long tcp_synack_count(void);
+extern unsigned long tcp_estab_count(void);
+extern unsigned long tcp_txfail_count(void);
+extern const char   *tcp_state_str(void);
 
 static int g_rx_log_left = 2;
 static unsigned long g_rx_tick_count = 0;
@@ -63,7 +72,14 @@ static void genet_rx_tick(void)
 
     unsigned char *pkt;
     int len;
-    while ((len = genet_rx_poll(&pkt)) > 0) {
+    /* Bound the drain to a fixed budget per tick.  The window manager
+     * calls this once per frame and must always return so it can
+     * repaint and stay responsive; an unbounded `while (poll > 0)` can
+     * spin forever if the hardware keeps PROD ahead of CONS (which is
+     * what froze the whole box — display, RX and ping — the instant a
+     * TCP client connected).  Leftover frames are picked up next tick. */
+    int budget = 64;
+    while (budget-- > 0 && (len = genet_rx_poll(&pkt)) > 0) {
         if (g_rx_log_left > 0) {
             /* Show buffer address + 64-byte hex dump in 16-byte rows.
              * This lets us see if real Ethernet header is hiding past
@@ -103,46 +119,21 @@ static void genet_rx_tick(void)
             }
             g_rx_log_left--;
         }
-        /* Try DHCP first (UDP src=67 dst=68 must reach us before
-         * BOUND, since net_responder ignores UDP).  Then TCP, then
-         * ARP/ICMP. */
-        if (dhcp_handle_packet(pkt, len)) {
-            genet_rx_release();
-            continue;
-        }
-        /* NET-G TCP listener — code in system/tcp_server.c, but
-         * dispatch from rx_tick is OFF until we figure out why
-         * even a minimal receive-only handler appears to interfere
-         * with the ICMP responder reply path on this Pi 4. */
-        (void)tcp_handle_packet;
-        if (!net_responder_handle(pkt, len) && 0) {  /* old path disabled */
-            g_rx_log_left--;
-            uart_puts("rx: len=");
-            puts_kb((unsigned long)len);
-            uart_puts(" dst=");
-            for (int i = 0; i < 6; i++) {
-                unsigned char b = pkt[i];
-                char hi = (char)((b >> 4) & 0xF);
-                char lo = (char)(b & 0xF);
-                uart_putc((char)(hi < 10 ? '0' + hi : 'a' + hi - 10));
-                uart_putc((char)(lo < 10 ? '0' + lo : 'a' + lo - 10));
-                if (i < 5) uart_putc(':');
-            }
-            uart_puts(" src=");
-            for (int i = 6; i < 12; i++) {
-                unsigned char b = pkt[i];
-                char hi = (char)((b >> 4) & 0xF);
-                char lo = (char)(b & 0xF);
-                uart_putc((char)(hi < 10 ? '0' + hi : 'a' + hi - 10));
-                uart_putc((char)(lo < 10 ? '0' + lo : 'a' + lo - 10));
-                if (i < 11) uart_putc(':');
-            }
-            uart_puts(" type=");
-            uart_putc("0123456789abcdef"[(pkt[12] >> 4) & 0xF]);
-            uart_putc("0123456789abcdef"[ pkt[12]       & 0xF]);
-            uart_putc("0123456789abcdef"[(pkt[13] >> 4) & 0xF]);
-            uart_putc("0123456789abcdef"[ pkt[13]       & 0xF]);
-            uart_puts("\n");
+        /* Dispatch in protocol order, each handler returning non-zero
+         * if it consumed the frame:
+         *   1. DHCP   (UDP 67->68; must reach us before BOUND, the
+         *              ARP/ICMP responder ignores UDP)
+         *   2. TCP    (NET-G listener — now LIVE; the RX ring is large
+         *              enough and the hot path log-free so a SYN burst
+         *              no longer overruns the ring and wedges RX)
+         *   3. ARP / ICMP responder (ping)
+         *
+         * IMPORTANT: keep this loop free of per-packet uart_puts() —
+         * the framebuffer console is slow and printing here is what
+         * historically let the ring back up to overflow. */
+        if (!dhcp_handle_packet(pkt, len) &&
+            !tcp_handle_packet(pkt, len)) {
+            net_responder_handle(pkt, len);
         }
         genet_rx_release();
     }
@@ -241,6 +232,22 @@ static void win_banner(window_t *self, unsigned int frame)
         0xFF888888U, self->content_bg);
 }
 
+/* Link state sampled once at boot (see the rationale where it is set):
+ * the per-frame status panel reads this cached value instead of poking
+ * the PHY over MDIO, which could stall the GENET AXI bus under TX. */
+static int g_net_link;
+
+/* Append "<label><decimal> " to buf[*pos] (no libc; for the NET panel). */
+static void kv_append(char *buf, int *pos, const char *label, unsigned long v)
+{
+    while (*label) buf[(*pos)++] = *label++;
+    char t[24];
+    char *d = u_to_dec(v, t, sizeof t);
+    while (*d) buf[(*pos)++] = *d++;
+    buf[(*pos)++] = ' ';
+    buf[*pos] = 0;
+}
+
 static void win_status(window_t *self, unsigned int frame)
 {
     char buf[64];
@@ -318,6 +325,47 @@ static void win_status(window_t *self, unsigned int frame)
         p = u_to_dec((unsigned long)frame, tmp, sizeof tmp);
         draw_string_at(xb, yb + line*12, "Frame:", fg, bg);
         draw_string_at(xb + 80, yb + line*12, p, fg, bg);
+        line++;
+    }
+
+    /* ---- Network (LIVE) ----
+     * Repainted every frame, so running `nc 192.168.3.100 23` from the
+     * Mac makes the counters move here even though there is no USB
+     * keyboard to run the `tcpstat` shell command.  Read it as:
+     *   tcp.seg=0                  -> SYN never reached us (path/RX)
+     *   seg>0 sak>0 est=0          -> SYN+ACK sent, peer ACK didn't match
+     *   txf>0                      -> SYN+ACK could not be transmitted
+     *   rx.ov / rc / txt climbing  -> RX ring overrun / recovery / TX wedge */
+    {
+        char l[64]; int n;
+        unsigned int nfg = 0xFF80E0FFU;   /* light blue */
+
+        line++;   /* blank separator */
+        draw_string_at(xb, yb + line*12, "Network", 0xFF80FF80U, bg); line++;
+
+        draw_string_at(xb, yb + line*12, "link:", nfg, bg);
+        draw_string_at(xb + 48, yb + line*12, g_net_link ? "UP" : "DOWN", nfg, bg);
+        line++;
+
+        n = 0;
+        kv_append(l, &n, "rx",  genet_rx_packet_count());
+        kv_append(l, &n, "ov",  genet_rx_overrun_count());
+        kv_append(l, &n, "rc",  genet_rx_recover_count());
+        kv_append(l, &n, "txt", genet_tx_timeout_count());
+        draw_string_at(xb, yb + line*12, l, nfg, bg); line++;
+
+        n = 0;
+        kv_append(l, &n, "any", tcp_any_count());
+        kv_append(l, &n, "seg", tcp_seg_rx_count());
+        kv_append(l, &n, "syn", tcp_syn_count());
+        draw_string_at(xb, yb + line*12, l, nfg, bg); line++;
+
+        n = 0;
+        kv_append(l, &n, "sak", tcp_synack_count());
+        kv_append(l, &n, "est", tcp_estab_count());
+        kv_append(l, &n, "txf", tcp_txfail_count());
+        draw_string_at(xb, yb + line*12, l, nfg, bg);
+        draw_string_at(xb + 184, yb + line*12, tcp_state_str(), nfg, bg);
         line++;
     }
 }
@@ -718,7 +766,14 @@ void kernel_main(void)
             unsigned int n = (b >> (i * 4)) & 0xF;
             uart_putc((char)(n < 10 ? '0' + n : 'a' + n - 10));
         }
-        uart_puts(genet_link_up() ? "  link=UP\n" : "  link=DOWN\n");
+        /* Cache the link state ONCE here.  The status panel must NOT
+         * call genet_link_up()/mdio_read() every frame: an MDIO MMIO
+         * access concurrent with GENET TX DMA can stall the AXI bus
+         * indefinitely on this Pi 4 (same hazard as the UMAC_MAC0
+         * write), which froze the whole window-manager loop — and thus
+         * RX/ICMP — the moment a TCP connection drove a TX. */
+        g_net_link = genet_link_up();
+        uart_puts(g_net_link ? "  link=UP\n" : "  link=DOWN\n");
     }
 
     /* Send a single gratuitous ARP (5-shot loop hung earlier;
@@ -737,12 +792,18 @@ void kernel_main(void)
      * remains wired into genet_rx_tick so an unsolicited reply would
      * still bind us, but no DISCOVER is ever sent right now. */
 
-    /* NET-G TCP listener init is deferred — the actual SYN/ACK
-     * machinery in system/tcp_server.c is staged but not driven
-     * from rx_tick yet (see comment there).  Once we figure out
-     * the ICMP-responder interaction we'll wire it in here.     */
-    (void)tcp_set_mac;
-    (void)tcp_listen;
+    /* NET-G TCP listener — now LIVE.  Give the TCP server our MAC
+     * (it builds its own Ethernet headers, like the responder) and
+     * open a passive listen on port 23 (telnet).  Connect with
+     * `nc 192.168.3.100 23` from the Mac; it completes the 3-way
+     * handshake, prints a greeting, echoes keystrokes, and closes on
+     * the first newline.  Dispatch is wired in genet_rx_tick(). */
+    {
+        unsigned char mymac[6] = { 0xd8, 0x3a, 0xdd, 0xa7, 0xfd, 0xbf };
+        tcp_set_mac(mymac);
+        tcp_listen(8023);   /* high port — telnet/23 is often firewalled */
+    }
+    uart_puts("net: TCP listener on port 8023 — `nc 192.168.3.100 8023`\n");
 
     uart_puts("\n");
     uart_puts("Round 1: B/U/M1/S0/X0 done.\n");

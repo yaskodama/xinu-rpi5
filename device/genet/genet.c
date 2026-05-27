@@ -306,6 +306,7 @@ static int mdio_read(unsigned phy_id, unsigned reg)
 /* forward decls */
 static void genet_send_one_arp(const unsigned char src_mac[6]);
 static void genet_init_rx(void);
+void genet_rx_recover(void);
 
 static void umac_soft_reset(void)
 {
@@ -477,16 +478,24 @@ void genet_init(void)
     genet_init_rx();
 }
 
-/* ---- RX path (NET-D) ----
+/* ---- RX path (NET-D / NET-G hardening) ----
  *
- * Use a small RX ring (16 descriptors) so we don't need 512 KB
- * of buffer pool.  16 × 2048 bytes = 32 KB in BSS.  The HW puts
- * incoming Ethernet frames into rx_bufs[i] and updates the
- * descriptor's length_status; we poll PROD_INDEX to detect new
+ * The RX ring is now the full hardware descriptor count (256).  The
+ * earlier 16-deep ring (32 KB) could not survive a TCP burst: the
+ * dispatcher only drains once per window-manager frame (~50 ms at
+ * 20 fps), so when `nc` opened a connection the ring backed up, the
+ * on-chip RBUF FIFO overflowed, and the RX path wedged — which looked
+ * like "the ICMP responder stopped" because we could no longer even
+ * receive the echo requests.  256 × 2048 B = 512 KB in BSS (NOLOAD,
+ * so it costs nothing in the image, only a one-time boot zero).
+ *
+ * The HW puts incoming Ethernet frames into rx_bufs[i] and updates
+ * the descriptor's length_status; we poll PROD_INDEX to detect new
  * arrivals.  After consumption we bump CONS_INDEX and re-arm the
- * descriptor with DMA_OWN. */
+ * descriptor with DMA_OWN.  genet_rx_recover() resynchronises the
+ * ring if HW ever outruns the software consumer. */
 
-#define RX_RING_DESCS               16
+#define RX_RING_DESCS               256
 
 static unsigned char __attribute__((aligned(64)))
     rx_bufs[RX_RING_DESCS][RX_BUF_LENGTH];
@@ -495,6 +504,9 @@ static unsigned long g_rx_packets;
 static unsigned long g_rx_bytes;
 static unsigned int  g_rx_cons;       /* SW-side consumer index 0..RING-1 */
 static int           g_rx_inited;
+static unsigned long g_rx_overruns;   /* times HW outran us (ring resync) */
+static unsigned long g_rx_recoveries; /* RBUF flush + ring re-arm count */
+static unsigned long g_tx_timeouts;   /* TX completions that never landed */
 
 /* TX buffer in DRAM — descriptor itself lives in GENET MMIO,
  * but the packet payload is in main memory and its address is
@@ -734,6 +746,39 @@ static void genet_init_rx(void)
     }
 }
 
+/* Recover a wedged / overrun RX path: flush the on-chip RBUF FIFO,
+ * re-arm every descriptor with DMA_OWN, and snap the software consumer
+ * index back to the hardware producer index.  Invoked when an overrun
+ * is detected (see genet_rx_poll) so a transient burst — e.g. the SYN
+ * storm when a TCP client connects — can never permanently stall RX.
+ * This is the RX-side analogue of the TX MMU reset used on smc91c111. */
+void genet_rx_recover(void)
+{
+    if (!g_rx_inited) return;
+
+    /* Pulse the RX SRAM flush so a backed-up FIFO is cleared. */
+    GENET_REG(SYS_RBUF_FLUSH_CTRL) = 1;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    GENET_REG(SYS_RBUF_FLUSH_CTRL) = 0;
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* Re-arm all descriptors so HW owns the whole ring again. */
+    for (int i = 0; i < RX_RING_DESCS; i++) {
+        unsigned int desc_off = GENET_RX_OFF + i * DMA_DESC_SIZE;
+        GENET_REG(desc_off + DMA_DESC_LENGTH_STATUS)
+            = (RX_BUF_LENGTH << DMA_BUFLENGTH_SHIFT) | DMA_OWN;
+    }
+
+    /* Snap CONS up to PROD (ring now empty) and re-derive the SW index
+     * so rx_bufs[g_rx_cons] tracks the next descriptor HW will fill. */
+    unsigned int prod = GENET_REG(RX_RING_BASE + RDMA_PROD_INDEX);
+    GENET_REG(RX_RING_BASE + RDMA_CONS_INDEX) = prod;
+    g_rx_cons = prod % RX_RING_DESCS;
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    g_rx_recoveries++;
+}
+
 int genet_rx_poll(unsigned char **out_pkt)
 {
     if (!g_rx_inited) return 0;
@@ -741,39 +786,30 @@ int genet_rx_poll(unsigned char **out_pkt)
     unsigned int cons = GENET_REG(RX_RING_BASE + RDMA_CONS_INDEX) & 0xFFFFu;
     if (prod == cons) return 0;
 
-    /* Descriptor that HW just filled */
+    /* Overrun guard.  If HW has advanced PROD more than a full ring
+     * past our CONS, the descriptor we are about to read was already
+     * recycled by HW and rx_bufs[idx] no longer matches the frame the
+     * hardware thinks it delivered.  Resynchronise instead of handing
+     * back a stale/garbled buffer — this silent desync was exactly
+     * what wedged the responder after a TCP burst. */
+    unsigned int avail = (prod - cons) & 0xFFFFu;
+    if (avail > RX_RING_DESCS) {
+        g_rx_overruns++;
+        genet_rx_recover();
+        return 0;
+    }
+
+    /* Descriptor that HW just filled. */
     unsigned int idx       = g_rx_cons;
     unsigned int desc_off  = GENET_RX_OFF + idx * DMA_DESC_SIZE;
     unsigned int len_stat  = GENET_REG(desc_off + DMA_DESC_LENGTH_STATUS);
     unsigned int length    = (len_stat >> DMA_BUFLENGTH_SHIFT) & 0x0FFF;
 
-    /* (Diagnostic freeze block was here during NET-E debug — kept
-     * removed so ping keeps working.  The bit pattern previously
-     * mistaken for "CRC|RXER|NO|LG" errors was actually the normal
-     * RX checksum status + MULT/BRDCAST flags.) */
+    /* Deliberately NO logging in this hot loop: uart_puts() drives the
+     * slow framebuffer console, and any printing here lengthens the
+     * drain so much that the ring overflows under load.  Use the
+     * counter accessors (genet_rx_overrun_count, …) for diagnosis. */
 
-    /* Diagnostic: log full descriptor state so we can verify HW
-     * is updating it.  Throttle so we don't flood. */
-    static int diag_left = 2;
-    if (diag_left > 0) {
-        unsigned int alo = GENET_REG(desc_off + DMA_DESC_ADDRESS_LO);
-        unsigned int ahi = GENET_REG(desc_off + DMA_DESC_ADDRESS_HI);
-        uart_puts("rxd[");
-        uart_putc("0123456789abcdef"[idx >> 4]);
-        uart_putc("0123456789abcdef"[idx & 0xF]);
-        uart_puts("] ls=");
-        puts_hex32(len_stat);
-        uart_puts(" prod=");
-        puts_hex32(prod);
-        uart_puts(" addr=");
-        puts_hex32(ahi); puts_hex32(alo);
-        uart_puts("\n");
-        diag_left--;
-    }
-
-    /* Pass through raw RX buffer pointer; offset (RBUF_ALIGN_2B
-     * vs BRCM tag) is unclear, so let the caller see all 0..N
-     * bytes for hex-dump diagnosis. */
     if (out_pkt) *out_pkt = rx_bufs[idx];
     g_rx_packets++;
     g_rx_bytes += length;
@@ -796,8 +832,11 @@ void genet_rx_release(void)
     __asm__ volatile ("dsb sy" ::: "memory");
 }
 
-unsigned long genet_rx_packet_count(void) { return g_rx_packets; }
-unsigned long genet_rx_byte_count(void)   { return g_rx_bytes;   }
+unsigned long genet_rx_packet_count(void)  { return g_rx_packets;    }
+unsigned long genet_rx_byte_count(void)    { return g_rx_bytes;      }
+unsigned long genet_rx_overrun_count(void) { return g_rx_overruns;   }
+unsigned long genet_rx_recover_count(void) { return g_rx_recoveries; }
+unsigned long genet_tx_timeout_count(void) { return g_tx_timeouts;   }
 
 unsigned int genet_phy_bmsr(void)
 {
@@ -856,9 +895,14 @@ int genet_tx_frame(const unsigned char *frame, int length)
         if (cons == (prod & 0xFFFF)) return 0;
         __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(tn));
         if (tn - t0 >= target) {
-            uart_puts("tx_frame: TIMEOUT CONS=");
-            puts_hex32(cons); uart_puts(" PROD="); puts_hex32(prod);
-            uart_puts("\n");
+            /* TX did not complete in time.  Just report failure — do
+             * NOT poke the GENET DMA control/PROD registers to "recover"
+             * here: writing those while the controller is in a bad state
+             * can stall the AXI bus indefinitely on this Pi 4 (the same
+             * hazard as the UMAC_MAC0 write), which hard-hangs the whole
+             * box.  Earlier ICMP-only traffic never timed out, so the
+             * hang only appeared once a TCP SYN+ACK drove this path. */
+            g_tx_timeouts++;
             return -1;
         }
     }

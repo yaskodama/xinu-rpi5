@@ -153,8 +153,16 @@ int net_responder_handle(const unsigned char *frame, int len)
         if (tpa[0] != g_my_ip[0] || tpa[1] != g_my_ip[1] ||
             tpa[2] != g_my_ip[2] || tpa[3] != g_my_ip[3]) return 0;
 
-        uart_puts("net: ARP request for "); puts_ip(g_my_ip);
-        uart_puts(" from "); puts_ip(arp + 14); uart_puts("\n");
+        /* Throttle logging: the framebuffer console is slow, and a
+         * uart_puts() per packet lengthens the RX drain enough to back
+         * the ring up under load.  Show the first few, then go quiet
+         * (use the `rxstat` counters for ongoing volume). */
+        static int arp_log = 8;
+        if (arp_log > 0) {
+            uart_puts("net: ARP request for "); puts_ip(g_my_ip);
+            uart_puts(" from "); puts_ip(arp + 14); uart_puts("\n");
+            arp_log--;
+        }
 
         /* Build ARP reply (42 bytes, padded to 60) */
         for (int i = 0; i < 60; i++) tx_reply[i] = 0;
@@ -204,14 +212,21 @@ int net_responder_handle(const unsigned char *frame, int len)
             int icmp_len = total_len - ihl;
             if (icmp_len < 8 || total_len + 14 > 1518) return 0;
 
-            uart_puts("net: ICMP echo from "); puts_ip(src_ip);
-            uart_puts(" len="); {
-                char b[8]; int n = 0; int v = icmp_len;
-                if (v == 0) uart_putc('0');
-                else { while (v) { b[n++] = (char)('0' + v%10); v /= 10; }
-                       while (n--) uart_putc(b[n]); }
+            /* Throttle (see ARP path): print the first few echoes so
+             * the operator can confirm ping reached us, then stay
+             * silent so the hot RX path is fast under sustained load. */
+            static int icmp_log = 8;
+            if (icmp_log > 0) {
+                uart_puts("net: ICMP echo from "); puts_ip(src_ip);
+                uart_puts(" len="); {
+                    char b[8]; int n = 0; int v = icmp_len;
+                    if (v == 0) uart_putc('0');
+                    else { while (v) { b[n++] = (char)('0' + v%10); v /= 10; }
+                           while (n--) uart_putc(b[n]); }
+                }
+                uart_puts("\n");
+                icmp_log--;
             }
-            uart_puts("\n");
 
             /* Build ICMP echo reply: copy entire request, swap MACs,
              * swap IPs, set type=0, recompute checksums. */

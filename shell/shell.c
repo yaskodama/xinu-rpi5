@@ -49,10 +49,12 @@
 #include "wm.h"
 #include "genet.h"
 
-/* Linker-script symbols (from kernel/link.ld). */
+/* Linker-script symbols (from kernel/link.ld).  `_end` is already
+ * declared (as `unsigned char _end[]`) by memory.h, which we include
+ * above — redeclaring it here as `unsigned long` is a type conflict
+ * that breaks a clean build, so we rely on memory.h's declaration. */
 extern unsigned long __bss_start;
 extern unsigned long __bss_end;
-extern unsigned long _end;
 
 /* ---------- helpers (no libc available) ---------- */
 
@@ -506,6 +508,24 @@ static int cmd_rxstat(int argc, char **argv)
                while (n--) uart_putc(buf[n]); }
     }
     uart_puts("  drained="); puts_dec(drained); uart_puts("\n");
+    /* NET-G health counters: overruns/recoveries should stay 0 in
+     * steady state.  A climbing tx_timeout means the TX ring is
+     * degrading (and self-recovering) — useful when bisecting the
+     * old "ICMP responder stopped" symptom under TCP load. */
+    uart_puts("        overruns="); puts_dec((int)genet_rx_overrun_count());
+    uart_puts(" recoveries=");      puts_dec((int)genet_rx_recover_count());
+    uart_puts(" tx_timeouts=");     puts_dec((int)genet_tx_timeout_count());
+    uart_puts("\n");
+    return 0;
+}
+
+/* NET-G: show the TCP listener state + handshake counters on demand,
+ * so a failed `nc` can be diagnosed without watching the boot log. */
+extern void tcp_dump_state(void);
+static int cmd_tcpstat(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    tcp_dump_state();
     return 0;
 }
 
@@ -639,6 +659,7 @@ static const struct centry commandtab[] = {
     { "usb",      "DWC2 USB HCD diagnostics (Pi 4 only)",  cmd_usb      },
     { "ticks",    "show 100 Hz timer tick counter",        cmd_ticks    },
     { "rxstat",   "drain RX ring + show pkt/byte counters", cmd_rxstat  },
+    { "tcpstat",  "show TCP listener state + handshake ctrs", cmd_tcpstat },
     { "pan",      "pan <dx> <dy>  scroll viewport",        cmd_pan      },
     { "view",     "show viewport / desktop sizes",         cmd_view     },
     { "autopan",  "autopan [on|off]  toggle demo scroll",  cmd_autopan  },

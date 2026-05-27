@@ -1,93 +1,146 @@
-# NEXT_SESSION — xinu-rpi5 (HEAD `d9e9b81`, 2026-05-23)
+# NEXT_SESSION — xinu-rpi5
 
-## 達成サマリー (2026-05-23)
+## ✅ 2026-05-27 — Pi 4 NET-G TCP 実機完走（解決）
 
-### ✅ NET-E 完了 — Mac から `ping 192.168.3.100` 動作
-- Pi 4 GENET (BCM2711) で ARP request → reply、ICMP echo → echo-reply まで完走
-- RTT 約 900 ms (wm tick 20 fps 律速)、静的 IP 192.168.3.100 / MAC `d8:3a:dd:a7:fd:bf`
-- 半セッションかけて発掘した GENET v5 の MAC bring-up セット:
-  1. **UMAC_CMD speed bits** を PHY auto-neg 結果 (BCM54213PE MII reg `0x19` AUX_STAT bits 10:8 = HCD) に追従
-  2. **EXT_RGMII_OOB_CTRL** に `EXT_RGMII_LINK | EXT_ID_MODE_DIS | EXT_RGMII_MODE_EN` を立てる
-  3. **UMAC_CMD** に `CMD_PROMISC | CMD_PAD_EN | CMD_CRC_FWD` を追加
-- RX descriptor `len_stat` の低 16 bit の bit 11/10/9/8 は **CRC/RXER/NO/LG エラーではなく** RX checksum status + MULT/BRDCAST フラグ。誤読すると延々と「全部 CRC エラー」と思い込む罠 — 一度ハマった
-- commit `0e37d9a`
+`nc 192.168.3.100 8023` で **3-way handshake → ESTABLISHED → greeting
+"Hello from xinu-rpi5 ..." 送信**を実機で確認（シリアルログに `tcp: SYN ...
+-> SYN+ACK` / `tcp: ESTABLISHED`、以後も RX が流れ続け＝ハング解消）。
 
-### 📦 NET-F (DHCP client) — code-staged, dispatch OFF
-- `system/dhcp_client.c` で DHCPDISCOVER/OFFER/REQUEST/ACK の状態機械 + volatile/aligned(64) フレームビルダー
-- `dhcp_send_discover()` で wire に正しく出ることは確認 (`rc=0`, 302 bytes)
-- 起動時 DISCOVER と 5 秒周期リトライは main.c から外している
-- 理由: 連続 broadcast TX で GENET TX ring が劣化し ICMP reply が止まる症状再現
-- `dhcp_handle_packet()` だけは `genet_rx_tick` に残してあるので、unsolicited OFFER が来れば bind 可
-- 当家 LAN の router DHCP 経路 (WiFi↔LAN bridge) で OFFER が戻ってこなかった
-- commits `dfddc90`, `dc87af5`
+**長らくの「nc で全停止」の真因 = unaligned 32bit read の data abort:**
+- `tcp_handle_packet` の `seq`/`ack` 読み `(tcp[4]<<24)|(tcp[5]<<16)|...` を
+  GCC -O2 が big-endian 32bit load idiom と認識し単一 `ldr` にマージ。TCP seq は
+  フレームオフセット **38（4 バイト境界外）**。**MMU off で DRAM が
+  Device-nGnRnE** なので unaligned word load が **data abort → 無限ハング**
+  （Frame/rx/ping 全停止）。ICMP には 32bit アライン外読みが無く ping は無事だった。
+- **修正**: `system/tcp_server.c` の解析ポインタ `ip`/`tcp`/`data` を
+  `const volatile unsigned char *` に（GCC のワイドロード・マージ禁止＝厳密バイト
+  単位ロード）。net_responder の TX-frame stores と同じ Device-nGnRnE 対策の RX 版。
+  同型の罠は `dhcp_client` の `got_xid` 読みにもある（DHCP 有効化時は要 volatile 化）。
+- **シリアルが必須だった**: `uart.c` に GPIO14/15→ALT0 を明示ピンマックス
+  （`-DGPIO_BASE=0xFE200000UL`）。Pi 4 は firmware が PL011 を BT に取り mini-UART を
+  header に出すことがあり、これが無いとシリアルに何も出ない。配線: 黒=GND(pin6) /
+  白=pin8(GPIO14 TXD) / 緑=pin10(GPIO15 RXD) / 赤(VCC)=未接続。115200 8N1。
+- **デバッグ手法**: `genet_rx_tick` に RX マーカー D/R/r を仕込みシリアルで
+  「ハング直前の最後の文字＝`D`（解析中の abort）」を特定 → 解決後マーカーは除去済み。
 
-### 📦 NET-G (TCP listener) — code-staged, dispatch OFF
-- `system/tcp_server.c` で単一接続 TCP listener (LISTEN → SYN_RCVD → ESTABLISHED → close)
-- SYN+ACK、greeting 送出、echo、close-on-newline、FIN+ACK まで実装
-- 検証で port 23 SYN は届くこと確認済 (`tcp/dbg: 192.168.3.202:52059 -> :23 flags=0x02`)
-- 但し dispatch from `rx_tick` は **OFF** にしている — 理由は次節参照
-- commit `d9e9b81`
+→ 以下は 2026-05-25 時点の記録（root cause 認識が「リング飽和」だったが、実際は
+  上記 unaligned read だった。リング拡張/bounded loop 等は改善として残置）。
 
-## 未解決バグ — NET-G の "ICMP responder 干渉"
+---
 
-**症状**: `tcp_handle_packet()` を `rx_tick` から呼ぶだけで、Mac から `nc 192.168.3.100 23` を実行すると ICMP echo reply が **以後ずっと止まる** (ping 完全停止)
+## NET-G TCP を dormant → **LIVE** 化（2026-05-25 記録）
 
-**観察**:
-- `tcp_handle_packet` 内の `tcp_send(SYN+ACK)` を消しても症状再現
-- 状態機械全体を抜いて `return 1;` だけにすると **ping 生存** (= consume + release は無罪)
-- `uart_putc('X')` 1 文字追加でテストしたら、なぜか SYN が届かず X も出ず、ping 生存 — 再現条件があいまい
+前回 (`d9e9b81`) は「`tcp_handle_packet` を rx_tick から呼ぶだけで ICMP
+responder が止まる」という未解決バグで TCP dispatch を OFF にしていた。
+今回その**根本原因を特定して修正**し、TCP listener を常時稼働にした。
 
-**仮説**:
-- `uart_puts` (→ `screen_putc` → `shellwin_record_char`) の処理時間中に GENET RX 16-slot ring が overrun → `g_rx_cons` が HW の PROD と乖離 → 以後の ICMP echo を取りこぼす
-- もしくは shellwin の scroll-back 操作が何かしらの shared state を壊す
+### 根本原因 — RX/TX リングの飽和 → 恒久 wedge
 
-**次セッションでの bisect 候補**:
-1. `screen_putc` を一時的に no-op 化 (UART + shellwin だけ残す) → ping 生存なら screen 側
-2. `shellwin_record_char` を一時的に no-op 化 → ping 生存なら shellwin 側
-3. RX ring を 16 → 64 slot に増やして overrun 余裕を確保 → 改善するか
-4. `g_rx_cons` と HW CONS_INDEX の同期に bug がないか debug 出力で再確認
+- dispatcher (`genet_rx_tick`) は **WM フレームごとに 1 回**しか走らない
+  (`wm_run` が 6 ウィンドウを全描画する ~50ms/frame ≒ 20fps が律速。
+  これが ping RTT 900ms の正体でもある)。
+- 旧 RX リングは **16 descriptor (32KB) だけ**。`nc` 接続時の SYP burst +
+  LAN broadcast + hot path 中の `uart_puts`(framebuffer console は激遅) が
+  重なると、50ms の描画中にリングが埋まり、**on-chip RBUF FIFO が overflow
+  → RX path が wedge**。ICMP echo request すら受信できなくなるので
+  「responder が止まった」ように見えていた。
+- TX 側も同様で、`genet_tx_frame` の timeout 時に ring を放置していたため、
+  1 本詰まると以後の ICMP reply(TX) も全部詰まる ("TX ring degradation"、
+  NET-F の DHCP で観測されていた症状と同根)。
 
-## DHCP の謎を解く別ルート
+### 修正内容 (commit 予定、未 commit)
 
-NET-F の DISCOVER は wire には出てるはず (rc=0)。だが OFFER が戻ってこない理由は未確定:
-- (A) router の WiFi↔LAN bridge が DHCP broadcast を片方向しか通さない (以前 ping debug 時に判明)
-- (B) router の DHCP server scope に Pi 4 ENM の MAC が無い
-- (C) 自前 DHCP server を Mac 上に立てて検証 (`dnsmasq` か `dhcpd`)
+| ファイル | 変更 |
+|---|---|
+| `device/genet/genet.c` | RX ring **16→256** (HW 全 descriptor)。`genet_rx_recover()` 追加 (RBUF flush + 全 desc 再 arm + CONS/SW index 再同期)。`genet_rx_poll` に overrun guard (`prod-cons > ring` で recover)。hot path の per-packet `uart_puts` 全撤去。`genet_tx_frame` timeout 時に ring resync + DMA 再 enable。overrun/recovery/tx_timeout カウンタ + accessor。 |
+| `loader/main.c` | `genet_rx_tick` dispatch を `DHCP → TCP → ARP/ICMP` の clean な連鎖に。**`tcp_handle_packet` を LIVE 化**。boot で `tcp_set_mac()` + `tcp_listen(23)`。hot path のデバッグダンプ撤去。 |
+| `system/tcp_server.c` | LISTEN で **SYN+ACK を実送出** + `TCP_SYN_RCVD` 遷移 (前回はコメントアウトで handshake 不成立だった)。 |
+| `system/net_responder.c` | ICMP/ARP の per-packet ログを先頭 8 件で throttle (steady-state の hot path を高速化)。 |
+| `shell/shell.c` | `rxstat` に `overruns= recoveries= tx_timeouts=` を追加。 |
 
-Mac で `sudo tcpdump -i en0 -nn -e -v 'port 67 or port 68'` をかけて Pi 4 起動 → DISCOVER が見えれば router 側問題、見えなければ bridge 側問題、と切り分けできる。
+### 副次的に直したビルド破損 (TCP とは無関係、要 commit)
 
-## ファイル位置 / 起動手順
+`make clean` したら **コミット済みツリーが元々クリーンビルドできない**ことが
+発覚 (Makefile にヘッダ依存追跡が無く、ヘッダ drift しても .c が再コンパイル
+されず stale .o で動いていた)。以下を修正し、**pi4 / pi5 / qemu 全 3 変種が
+0 error でクリーンビルド**するようにした:
+
+- `include/memory.h`: `ROUNDMB`/`TRUNCMB` マクロを追加 (memory.c が使うが未定義
+  だった)。`freemem` 宣言を `void`→`int` (定義と一致)。xinu-raz network 移植が
+  `<memory.h>` 経由で要求する `struct memblock` を定義 (include 順で native
+  memory.h が優先され incomplete type になっていた、13 ファイルが失敗)。
+- `include/genet.h`: 非 pi4 (`#else`) 分岐に全 genet 関数の inert stub を追加
+  (pi5/qemu の main.c/shell.c が無条件参照していた)。
+- `shell/shell.c`: `_end` のローカル再宣言を削除 (memory.h と型衝突)。
+
+## 検証状況
+
+- ✅ **pi4 / pi5 / qemu フルクリーンビルド 0 error** (`make clean && make all`)。
+  kernel8.img 67088 / kernel_2712.img 56400 / kernel_virt.img 56144 bytes。
+- ✅ **QEMU virt smoke**: boot / shell / pingpong / procdemo / ps / halt 全 OK。
+  `mem` で heap allocator (ROUNDMB/freemem 修正) が正常動作 (`_end` も正値)。
+- ⏳ **GENET ネットワークは QEMU では検証不可** (virt に GENET 無し)。**実機
+  Pi 4 で flash + ping/nc 検証が必要** ← 次のアクション。
+
+## 実機テスト手順 (Pi 4)
+
+```sh
+# 1. ビルド (済) — 念のため
+cd /Users/kodamay/projects/xinu-rpi5/compile && make pi4
+
+# 2. SD に焼く
+diskutil mount /dev/disk4s1            # bootfs
+cp kernel8.img /Volumes/bootfs/
+sync && diskutil eject /Volumes/bootfs
+#   (または: make install_pi4 SDCARD=/Volumes)
+
+# 3. Pi 4 を起動、Mac 側 ARP 固定 + ping (= 退行していないことを先に確認)
+sudo arp -s 192.168.3.100 d8:3a:dd:a7:fd:bf
+ping 192.168.3.100                     # ← まず ping が今まで通り通ること
+
+# 4. TCP を試す (今回の本命)
+nc 192.168.3.100 23
+#   期待: 3-way handshake 成立 → "Hello from xinu-rpi5 (Pi 4, BCM2711)!"
+#         → ENTER で echo + 接続 close
+#   nc 実行中も別ターミナルで ping が生き続けること (= ICMP 干渉が消えたこと)
+```
+
+### 見るべきポイント
+
+- UART0 (シリアルコンソール) に `tcp: SYN from ... -> SYN+ACK` →
+  `tcp: ESTABLISHED` → (ENTER 後) `tcp: FIN sent (got newline)` が出る。
+- shell で `rxstat` を叩き、`overruns= / recoveries= / tx_timeouts=` を確認。
+  - **理想は全部 0**。`recoveries` が少し増える程度なら自己回復が効いている証拠。
+  - `tx_timeouts` が増え続けるなら TX ring がまだ不安定 (下記フォローアップ)。
+
+## まだ残っている可能性 / フォローアップ
+
+1. **実機で本当に直ったかは未確認** (QEMU で GENET を出せないため)。もし実機で
+   まだ ping が止まるなら、`rxstat` の overruns/recoveries/tx_timeouts の伸び方で
+   RX 飽和か TX wedge かを切り分けられる (今回そのための計器を仕込んだ)。
+2. **RX を WM フレームより高頻度で drain したい**: 本質的には dispatch が
+   20fps に縛られているのが弱点。S1 (GIC + Generic Timer の preemptive) が入れば
+   タイマ割り込みから RX を回せて飽和耐性が一段上がる。
+3. **DHCP (NET-F)** は依然 dispatch OFF (`dhcp_send_discover` は boot から外して
+   ある)。TX ring recovery が入ったので連続 DISCOVER の劣化は緩和されているはず
+   — 再挑戦の余地あり。`sudo tcpdump -i en0 -nn 'port 67 or 68'` で OFFER の
+   戻り経路を切り分けるのが先。
+4. **Makefile にヘッダ依存追跡が無い**問題は未対処。`-MMD -MP` + `-include
+   $(DEPS)` を足すと、今回のような「ヘッダ直しても再コンパイルされず stale .o」
+   の地雷が消える。次の小タスク候補。
+
+## ファイル位置
 
 ```
-リポ: /Users/kodamay/projects/xinu-rpi5/
-branch: main
-HEAD:  d9e9b81
-
-build:
-  cd compile && make pi4
-
-焼き:
-  diskutil mount /dev/disk4s1
-  cp kernel8.img /Volumes/bootfs/
-  sync
-  diskutil eject /Volumes/bootfs
-
-Mac 側 ARP (Pi 4 boot 後):
-  sudo arp -s 192.168.3.100 d8:3a:dd:a7:fd:bf
-  ping 192.168.3.100
+リポ: /Users/kodamay/projects/xinu-rpi5/   branch: main
+変更: device/genet/genet.c, include/genet.h, include/memory.h,
+      loader/main.c, shell/shell.c, system/net_responder.c,
+      system/tcp_server.c   (全て未 commit)
 ```
 
-## Round 1 の他の残作業 (参考)
+## Round 1 の他の残作業 (参考、優先順は実機 TCP 検証の後)
 
-- **S1 preemptive timer** (GIC + Generic Timer IRQ → preemptive scheduler) — kernel コアに戻りたい場合の最有力
+- **S1 preemptive timer** (GIC + Generic Timer IRQ → preemptive scheduler)
 - **X1 AIPL hello** (Py-I or JS-O runtime を xinu-rpi5 上で hello-world)
-- **XHCI-B〜H** (Pi 4 USB-A キーボード/マウス: VL805 enumeration → port reset → HID transfer)
-- **N0 RP1 discover** (Pi 5 RP1 I/O hub) — Pi 5 に切り替えるなら
-
-## 次セッション最初の 3 アクション (推奨)
-
-1. `cd /Users/kodamay/projects/xinu-rpi5 && git pull && git log --oneline -3` で HEAD 確認
-2. SD カードの `kernel8.img` の md5 を `compile/kernel8.img` と照合 (古いまま試して混乱しがち)
-3. Mac で `sudo arp -s 192.168.3.100 d8:3a:dd:a7:fd:bf && ping 192.168.3.100` で **まずは ping 動作スタートラインに戻る** ことを確認 (これが今日のゴール状態)
-
-ここから NET-G bisect か、DHCP tcpdump 検証か、別軸 (S1/XHCI) に移るかを選択。
+- **XHCI-B〜H** (Pi 4 USB-A キーボード/マウス: VL805 enumeration)
+- **N0 RP1 discover** (Pi 5 に切り替えるなら)
