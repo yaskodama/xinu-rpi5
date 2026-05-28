@@ -1,5 +1,27 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ⏸️ 2026-05-29 — アクターへのプリエンプション拡張（vheap ロック）★保留・実機 wedge
+
+AIPL アクターを安全にプリエンプト可能にすべく vheap spin-yield ミューテックス（Option A）を試作したが、
+実機固有の wedge を解消できず**保留**。コードは branch **`wip/actor-preempt-vheap-lock`** に退避。本線は
+**32a020f**（プリエンプティブ・ネットワーキング）に戻して区切り。
+
+- 実装: `aipl_lock/unlock`＋`aipl_unlock_all/relock`(ap_select のブロック前後)、cc.c エントリ＋`actor_proc_main`
+  ＋/llm にロック。診断計器 `/fault`(例外捕捉＋生存スピン)・`/lockstat`(ロック watchdog)も追加。
+- **検証OK(QEMU)**: ネイティブ selectdemo/actordemo/pingpong、AIPL の select+vheap(SelMin, llm 無し)＝
+  `cmd_repro`。ロジック自体は健全。
+- **実機 wedge**: MultiAgent(select+**llm**, app ワーカー駆動)が**シーケンス/タイミング依存でハング**。
+  app ワーカーが固着し ICMP は生存だが**全 HTTP(/fault 含む)が死ぬ**→HTTP 診断は app ワーカー自身が
+  固着点なので無力。ロック watchdog 不発＝aipl_lock spin ではない。**QEMU では再現不能**(app ワーカー/
+  GENET・タイマ IRQ 無し、llm も QEMU では誤動作)。
+- **仮説**: GENET RX IRQ で起こされた net プロセスが、app ワーカーの cc/`ap_run`(actor を proc_yield で
+  pump)の最中に proc_yield 経由で割り込み、actor pump とスケジューリングが絡む。実機＋app ワーカー固有。
+- **将来やるなら**: ①HTTP に依存しない実機生存型診断(進捗 watchdog→**HDMI フレームバッファ**へ状態ダンプ、
+  or GPIO/LED コード)で固着点を可視化、②or cc を app ワーカー外で実行(専用 AIPL ランタイムプロセス＋
+  ワークキュー)して net/IRQ と分離、③or アクター毎 vheap(Option C)。`wip/...` ブランチに試作と知見一式。
+- ⚠️ 教訓: **app ワーカーが HTTP サーバ兼 vheap ユーザ**なので、そこが固まると診断チャネルごと死ぬ。
+  実機専用機能の計器は「固着し得る経路の外」に置くこと。
+
 ## ✅ 2026-05-29 — ★プリエンプティブ・ネットワーキング（app 層分離 + preempt）★実機検証済
 
 bottom-half の積み残し「真のプリエンプティブ・ネットワーキング」を達成。app 層(HTTP→cc/llm)を net
