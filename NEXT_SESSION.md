@@ -1,5 +1,21 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-28 — AIPL `saga {}`（補償トランザクション）を xinu-jit に対応
+
+AIPL には既に `saga { step {body} compensate {undo} ... }` 構文(lexer/parser/AST/フルCバックエンド/
+インタプリタ)が存在。これを **int-only --xinu-jit バックエンドに配線**し実機で動かせるように:
+- 失敗シグナル: フルランタイムは例外/longjmp だが int-only は不可 → ステップ body が **`fail()`**
+  (普通の CallStmt、構文変更不要)を呼ぶ → `cc_saga_fail()` が flag を立てる。cc.c に
+  `cc_saga_reset/fail/failed`(flag 1つ、saga 毎に reset)を追加し extern 登録。
+- driver codegen: **goto/do-while 不使用**(オンデバイス cc は非対応)。各 step を `if(!cc_saga_failed())`
+  でガード、`__sc` が完了数 → 失敗時は逆順(LIFO)に `if(__sc>i)` で完了済みのみ補償。
+- method-id 収集を saga step/compensate にも降下。`Saga.abcl`(予約 saga: payment 拒否→flight,hotel
+  を逆順 cancel、refund は未完了でスキップ)。
+- QEMU 検証: rollback / commit(補償なし) / **resident 後の saga(クラッシュ無し=スケジューラ修正堅牢)**。
+  commit xinu **f5fb207** / abclcp **3129679**。
+- **未 flash**: 現在の実機カーネル(a891395)は `cc_saga_*` 未搭載 → saga を送ると JIT が addr 0 を呼び
+  クラッシュする。saga を実機で動かすには**再フラッシュ必須**(現実機に saga を送らないこと)。
+
 ## ✅ 2026-05-28 — select-after-resident クラッシュ修正（スケジューラ）
 
 **症状**: `/actor/load`(resident) の後に `/compile` でアクタープロセス内 dispatch を
