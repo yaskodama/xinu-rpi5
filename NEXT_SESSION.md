@@ -1,6 +1,6 @@
 # NEXT_SESSION — xinu-rpi4
 
-## ✅ 2026-05-28 — KV キャッシュでチャット高速化 + select 複数 LLM アクター
+## ✅ 2026-05-28 — KV キャッシュでチャット高速化 + select 複数 LLM アクター ★実機検証済
 
 オススメ順 #1+#2。両方 QEMU 検証済、**未 flash**。
 - **#1 KV キャッシュ会話**: 毎回履歴を再エンコードしてターン毎に遅くなる問題(4.9→26秒)を解消。
@@ -16,7 +16,8 @@
   - 修正B: LLM 呼び出しを含むループが 100ms 暴走ガードで中断される→`cc_llm`/`cc_chat` 完了時に
     `cc_set_deadline()` で締切リセット(LLM 非使用の真の暴走は依然 100ms 検出)。
 - commit xinu **4dd55ea**(KV)/**7761bd7**(deadline) / abclcp **faea02d**(chat)/**5ac14d7**(multiagent+self)。
-  実機手順: Chat を /actor/load→/chat 反復(ターン毎ほぼ一定速度のはず)、MultiAgent は `cc`/HTTP /compile。
+  **実機検証済(flash 535a759b)**: KV Chat 4ターン= **4.8/5.1/5.8/6.3秒(ほぼ一定)** ← 旧 4.9/11.5/26.3秒の
+  悪化を解消、文脈("Max")維持。MultiAgent /compile= 両 agent 断片+select 収集(12.8秒)。全て Pi 生存。
 
 ## ✅ 2026-05-28 — LLM と会話するアクター（llm() 組込み + /chat）★実機検証済
 
