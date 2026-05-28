@@ -346,6 +346,32 @@ static void v_print(long w)
 /* v_truthy is also exported (raw 0/1) for if/while conditions. */
 static long v_truthy_x(long w)    { return v_truthy(w); }
 
+/* Higher-order list ops.  A "function value" is a small int id; the JIT
+ * emits an apply(id, x) dispatcher (like the actor `dispatch`) whose address
+ * the runtime registers here, so map/filter can call back into compiled AIPL
+ * functions without the on-device compiler needing function pointers. */
+static long (*g_apply)(long id, long x);
+static void cc_set_apply(void *fn) { g_apply = (long (*)(long, long))fn; }
+static long v_list_map(long w, long idv)
+{
+    if (!v_is_list(w) || !g_apply) return v_list_new();
+    long *src = v_list_ptr(w); long n = src[0]; long id = v_int_of(idv);
+    long out = v_list_new();
+    for (long i = 0; i < n; i++) out = v_list_push(out, g_apply(id, v_list_ptr(w)[1 + i]));
+    return out;
+}
+static long v_list_filter(long w, long idv)
+{
+    if (!v_is_list(w) || !g_apply) return v_list_new();
+    long *src = v_list_ptr(w); long n = src[0]; long id = v_int_of(idv);
+    long out = v_list_new();
+    for (long i = 0; i < n; i++) {
+        long e = v_list_ptr(w)[1 + i];
+        if (v_truthy(g_apply(id, e))) out = v_list_push(out, e);
+    }
+    return out;
+}
+
 /* ---------- asynchronous mailbox (cooperative message pump) ----------
  * `send obj.m(args)` in AIPL is fire-and-forget: it enqueues a message
  * and returns immediately.  After main() (and after each /actor/send) we
@@ -444,10 +470,12 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_saga_failed", (void *)&cc_saga_failed },
         { "cc_crash",         (void *)&cc_crash         },
         { "cc_crashed_value", (void *)&cc_crashed_value },
-        { "v_list_new",  (void *)&v_list_new  },
-        { "v_list_push", (void *)&v_list_push },
-        { "v_list_get",  (void *)&v_list_get  },
-        { "v_list_len",  (void *)&v_list_len  },
+        { "v_list_new",    (void *)&v_list_new    },
+        { "v_list_push",   (void *)&v_list_push   },
+        { "v_list_get",    (void *)&v_list_get    },
+        { "v_list_len",    (void *)&v_list_len    },
+        { "v_list_map",    (void *)&v_list_map    },
+        { "v_list_filter", (void *)&v_list_filter },
         { 0, 0 }
     };
     for (int i = 0; tab[i].n; i++) {
@@ -502,6 +530,7 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     if (cc_failed() || len < 0) { if (code) kfree(code); arena_free(); return -1; }
 
     int doff = cc_func_offset("dispatch");
+    int aoff = cc_func_offset("apply");          /* map/filter callback dispatcher */
     cc_sync_icache(code, (unsigned long)len);
     cc_set_deadline();
     vheap_reset();              /* fresh string-concat heap for this run */
@@ -509,6 +538,7 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     ap_reset();                 /* fresh actor set */
     g_active_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
     ap_set_dispatch(g_active_dispatch);
+    cc_set_apply((aoff >= 0) ? (void *)(code + aoff) : 0);
     long (*entryfn)(void) = (long (*)(void))(code + entry);
     long rc = entryfn();        /* main(): spawn actor processes + send */
     ap_run();                   /* drive actor processes until quiescent */
@@ -630,6 +660,7 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     int doff = cc_func_offset("dispatch");
     int moff = cc_func_offset("__method_id");
     int noff = cc_func_offset("__nobj");
+    int aoff = cc_func_offset("apply");
 
     cc_sync_icache(code, (unsigned long)len);
 
@@ -641,6 +672,7 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     ap_reset();
     g_active_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
     ap_set_dispatch(g_active_dispatch);
+    cc_set_apply((aoff >= 0) ? (void *)(code + aoff) : 0);
     g_cap = out; g_capcap = outcap; g_caplen = 0; if (outcap > 0) out[0] = 0;
     long (*mainfn)(void) = (long (*)(void))(code + entry);
     mainfn();                   /* spawn actor processes + initial sends */
