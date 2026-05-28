@@ -682,9 +682,9 @@ void kernel_main(void)
      * misconfiguration is reported rather than hanging silently.  The map
      * is identity, so every pointer below stays valid — we just gain
      * caching and the attributes later VM stages build on. */
-    uart_puts("mmu: enabling translation + caches...\n");
+    uart_puts("mmu: enabling translation (identity map, W^X, I-cache)...\n");
     mmu_init();
-    uart_puts("mmu: on (identity-mapped, caches enabled)\n");
+    uart_puts("mmu: on (D-cache off for DMA coherency)\n");
 
     /* Try to bring up the HDMI framebuffer before printing anything,
      * so the banner appears on both UART and the monitor.  Failure

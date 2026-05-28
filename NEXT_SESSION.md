@@ -13,12 +13,16 @@ virt 98576)。**全段階 QEMU で検証済 (boot/shell/vfs/net/`cc` fib=55・ac
   `_etext`+ページ整列追加。コード上書き不可・データ実行不可で起動&JIT 正常。
 - **Stage3 VA→PA 変換実証**: `mmu_map_window()` が 32GiB の仮想窓 `VMAP_VA=0x800000000` を kmalloc
   したページにマップ。`vmtest` コマンド: VA に書いて PA から読む(逆も)→一致を確認 (translation works)。
-- ⚠️ **実機未フラッシュ**。★実機ではキャッシュ ON が **GENET DMA / mailbox FB を壊す**恐れ
-  (現状 uncached バスエイリアス前提)。実機投入前に DMA バッファを非キャッシュ領域へマップ
-  or キャッシュメンテ(clean/invalidate)が必要。QEMU は実 DMA 無しで安全。
-- 残/次: (a) 実機 DMA コヒーレンシ対応 → 実機フラッシュ、(b) 保護違反を捕捉する recoverable 例外
-  (現状ハンドラは halt 系)、(c) ファイル: `system/mmu.c` `include/mmu.h` `loader/main.c` `shell/shell.c`
-  `compile/link.ld` `compile/link_virt.ld`。**value_t/文字列対応 (task13/14) も保留中**。
+- ★**DMA コヒーレンシ解決 = D-cache OFF / I-cache ON で運用** (`mmu.c`): D-cache を切ると
+  データアクセスは RAM 直行 = 旧 MMU-off と同じく **GENET DMA / mailbox FB はコヒーレント**(壊さない)。
+  I-cache は ON で命令フェッチ高速化(JIT の主因を改善)。TCR walk も Non-cacheable に。ページ表は
+  RAM を Normal-cacheable のままにしてあるので、将来 DMA コヒーレント設計が出来たら C=1 に上げるだけ。
+  → **実機フラッシュ可能な構成**(QEMU で D-cache off でも全機能 OK 確認済)。
+- 残/次: (a) **実機フラッシュ + 検証**(MMU 下で GENET/`/compile` 生存=DMA コヒーレンシ確認)、
+  (b) 将来 DMA コヒーレント設計で D-cache も有効化(非キャッシュ DMA セクション or cache maintenance)、
+  (c) 保護違反を捕捉する recoverable 例外 (現ハンドラは halt 系で vmtest 以外の保護デモ不可)。
+  ファイル: `system/mmu.c` `include/mmu.h` `loader/main.c` `shell/shell.c` `compile/link.ld`
+  `compile/link_virt.ld`。**value_t/文字列対応 (task13/14) も保留中**。
 
 ## ✅ 2026-05-28 — JIT 暴走ループ保護 (★実時間ベース。反復予算版は実機ウェッジで失敗)
 

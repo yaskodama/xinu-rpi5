@@ -114,10 +114,12 @@ void mmu_init(void)
     }
 
     unsigned long mair = (0x00UL << (8 * ATTR_DEVICE)) | (0xFFUL << (8 * ATTR_NORMAL));
+    /* Non-cacheable table walks (IRGN0=ORGN0=00) to match D-cache being
+     * left OFF below — see the SCTLR comment for why. */
     unsigned long tcr =
           (25UL << 0)     /* T0SZ = 39-bit VA              */
-        | (1UL  << 8)     /* IRGN0 = WB                    */
-        | (1UL  << 10)    /* ORGN0 = WB                    */
+        | (0UL  << 8)     /* IRGN0 = Non-cacheable         */
+        | (0UL  << 10)    /* ORGN0 = Non-cacheable         */
         | (3UL  << 12)    /* SH0   = inner shareable       */
         | (0UL  << 14)    /* TG0   = 4 KiB                 */
         | (1UL  << 23)    /* EPD1  = disable TTBR1 walks   */
@@ -140,9 +142,17 @@ void mmu_init(void)
         "dsb sy\n"
         "isb\n"
         "mrs %0, sctlr_el1\n" : "=r"(sctlr));
-    sctlr |= (1UL << 0);    /* M — MMU enable     */
-    sctlr |= (1UL << 2);    /* C — D-cache enable */
-    sctlr |= (1UL << 12);   /* I — I-cache enable */
+    sctlr |= (1UL << 0);    /* M — MMU enable                              */
+    sctlr |= (1UL << 12);   /* I — I-cache enable (speeds instruction fetch,
+                             *     incl. JIT'd code; no DMA hazard)        */
+    /* D-cache (C, bit 2) is intentionally left OFF.  The GENET RX/TX rings
+     * and the VideoCore mailbox/framebuffer are DMA'd by hardware straight
+     * to RAM and the drivers assume uncached access; enabling the D-cache
+     * would make them incoherent.  With C=0 every data access goes to RAM
+     * directly — identical coherency to the old MMU-off world — so the MMU
+     * (translation + W^X) is safe to run on real hardware.  The page table
+     * already marks RAM Normal-cacheable, so a future DMA-coherent design
+     * can flip C on without re-tabling. */
     __asm__ volatile (
         "msr sctlr_el1, %0\n"
         "isb\n"
