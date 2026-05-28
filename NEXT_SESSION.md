@@ -1,6 +1,18 @@
 # NEXT_SESSION — xinu-rpi4
 
-## 🚧 2026-05-28 — actors-as-Xinu-processes + blocking receive + select (機構のみ)
+## ✅ 2026-05-28 — AIPL `select` 統合 (actors as Xinu processes)
+
+--xinu-jit を actorproc 機構に配線完了: `g_spawn`→`cc_actor_new()`→`ap_spawn`(各 AIPL アクター=
+Xinu プロセス+メールボックス)、`send`→`ap_send`、main()/各 /actor/send 後に `ap_run`(quiescent まで)、
+one-shot /compile は `ap_killall`(proc_kill でスタック解放)・resident は保持。**`select{case m(v):}`→
+`cc_select(self,n,m0..m3)`**(ブロッキング選択受信→matched method id、`cc_sel_arg` で引数、case 本体は
+pattern var バインド)。翻訳器は send/now/select 参照の全メッセージ名にも id 割当。proc.c に proc_kill。
+QEMU: Worker.run() の `select{add/stop}`→add 10/add 20/stopping、async(Ping/PingPong/MapReduce 4並行
+→sum 14)回帰 OK。commit xinu 84fb673 / abclcp b36e351。examples_xinujit/Select.abcl。
+★翻訳器変更後は **.c を再生成**(古い .c は g_spawn が cc_actor_new 未呼で無反応)。max 7 アクター(NPROC-1)。
+`now` は同期 dispatch のまま。**未 flash**(実機最新 0d8f2140)。
+
+## 🚧 2026-05-28 — actors-as-Xinu-processes 機構 (基盤)
 
 `system/actorproc.c`: 各アクターを協調 Xinu プロセス(proc.c)化、アクター毎メールボックス +
 ブロッキング受信。`ap_send`(enqueue+proc_ready)/`ap_recv`(空なら proc_block)/**`ap_select`(選択的
