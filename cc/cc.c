@@ -416,3 +416,159 @@ int cmd_cc(int argc, char **argv)
     else         { uart_puts("\n"); }
     return rc == 0 ? 0 : -1;
 }
+
+/* ============================================================
+ *  Resident actor program: load an AIPL-generated C program and keep
+ *  it (and its spawned actors) alive, then exchange messages with the
+ *  actors.  Backs the /actor/load and /actor/send HTTP endpoints.
+ * ============================================================ */
+
+static char          *g_res_arena;     /* kept alive: holds g_obj + literals */
+static unsigned char *g_res_code;      /* kept alive: the JIT'd code          */
+static long (*g_res_dispatch)(long, long, long, long, long, long);
+static long (*g_res_methodid)(long);
+static long (*g_res_nobj)(void);
+
+static void res_free(void)
+{
+    if (g_res_code)  kfree(g_res_code);
+    if (g_res_arena) kfree(g_res_arena);
+    g_res_code = 0; g_res_arena = 0;
+    g_res_dispatch = 0; g_res_methodid = 0; g_res_nobj = 0;
+}
+
+int cc_actor_load(const char *src, int srclen, char *out, int outcap)
+{
+    res_free();                          /* drop any previous resident program */
+
+    if (!arena_init(CC_ARENA)) {
+        const char *m = "cc: out of memory"; int p = 0;
+        while (m[p] && p < outcap - 1) { out[p] = m[p]; p++; } if (outcap) out[p] = 0;
+        return -1;
+    }
+    g_err = 0; g_errbuf[0] = 0;
+
+    unsigned long n = (unsigned long)(srclen < 0 ? 0 : srclen);
+    char *s = (char *)cc_alloc(n + 1);
+    for (unsigned long i = 0; i < n; i++) s[i] = src[i];
+    s[n] = 0;
+
+    token_t *toks = cc_lex(s);
+    func_t  *fns  = cc_failed() ? 0 : cc_parse(toks);
+
+    unsigned char *code = 0;
+    int entry = 0, len = -1;
+    if (!cc_failed()) {
+        code = (unsigned char *)kmalloc(CC_CODECAP);
+        if (!code) { arena_free(); return -1; }
+        len = cc_codegen(fns, code, CC_CODECAP, &entry);
+    }
+    if (cc_failed() || len < 0) {
+        int p = 0; const char *pfx = "cc: ";
+        while (*pfx && p < outcap - 1) out[p++] = *pfx++;
+        const char *e = g_errbuf[0] ? g_errbuf : "compile error";
+        while (*e && p < outcap - 1) out[p++] = *e++;
+        if (outcap) out[p] = 0;
+        if (code) kfree(code);
+        arena_free();
+        return -1;
+    }
+
+    int doff = cc_func_offset("dispatch");
+    int moff = cc_func_offset("__method_id");
+    int noff = cc_func_offset("__nobj");
+
+    cc_sync_icache(code, (unsigned long)len);
+
+    /* Run main() once to spawn/init the actors; capture its output. */
+    cc_set_deadline();
+    vheap_reset();
+    g_cap = out; g_capcap = outcap; g_caplen = 0; if (outcap > 0) out[0] = 0;
+    long (*mainfn)(void) = (long (*)(void))(code + entry);
+    mainfn();
+    if (g_cap) g_cap[(g_caplen < g_capcap) ? g_caplen : (g_capcap - 1)] = 0;
+    g_cap = 0;
+
+    /* Keep the code + arena resident (do NOT free): g_obj and the string
+     * literals live in the arena, so the actors persist for later sends. */
+    g_res_arena    = g_arena; g_arena = 0;       /* detach from the allocator */
+    g_res_code     = code;
+    g_res_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
+    g_res_methodid = (moff >= 0) ? (void *)(code + moff) : 0;
+    g_res_nobj     = (noff >= 0) ? (void *)(code + noff) : 0;
+
+    /* Append the actor count. */
+    long nobj = g_res_nobj ? v_int_of(g_res_nobj()) : 0;
+    int p = 0; while (out[p] && p < outcap - 1) p++;
+    const char *tag = "[resident: ";
+    while (*tag && p < outcap - 1) out[p++] = *tag++;
+    char nb[24]; const char *ns = v_render(v_int(nobj), nb, sizeof nb);
+    while (*ns && p < outcap - 1) out[p++] = *ns++;
+    const char *tail = " actor(s) live]\n";
+    while (*tail && p < outcap - 1) out[p++] = *tail++;
+    if (outcap) out[p] = 0;
+    return 0;
+}
+
+int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int outcap)
+{
+    if (!g_res_dispatch || !g_res_methodid) {
+        const char *m = "no resident actor program (POST /actor/load first)\n";
+        int p = 0; while (m[p] && p < outcap - 1) { out[p] = m[p]; p++; } if (outcap) out[p] = 0;
+        return -1;
+    }
+
+    cc_set_deadline();                   /* runaway guard; keep vheap (persistent fields) */
+
+    /* Copy the method name into an 8-aligned buffer: a value_t string must
+     * have its low bit clear (else it is misread as an immediate int). */
+    static char methbuf[64] __attribute__((aligned(16)));
+    int mi = 0; while (method[mi] && mi < (int)sizeof(methbuf) - 1) { methbuf[mi] = method[mi]; mi++; }
+    methbuf[mi] = 0;
+
+    long mid = v_int_of(g_res_methodid(v_str(methbuf)));
+    if (mid < 0) {
+        const char *m = "unknown method\n";
+        int p = 0; while (m[p] && p < outcap - 1) { out[p] = m[p]; p++; } if (outcap) out[p] = 0;
+        return -1;
+    }
+
+    long res = g_res_dispatch((long)actor, mid, v_int(arg), v_int(0), v_int(0), v_int(0));
+
+    char tmp[64];
+    const char *r = v_render(res, tmp, sizeof tmp);
+    int p = 0; while (r[p] && p < outcap - 1) { out[p] = r[p]; p++; } if (outcap) out[p] = 0;
+    return 0;
+}
+
+/* ---- shell front-ends (also let the HTTP-only feature be tested on QEMU) ---- */
+
+static int cc_atoi(const char *s)
+{
+    int n = 0, neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    while (*s >= '0' && *s <= '9') { n = n * 10 + (*s - '0'); s++; }
+    return neg ? -n : n;
+}
+
+int cmd_aload(int argc, char **argv)
+{
+    if (argc < 2) { uart_puts("usage: aload <file.c>  (load a resident actor program)\n"); return -1; }
+    vfs_node_t *f = vfs_resolve(argv[1]);
+    if (!f || f->kind != VFS_FILE) { uart_puts("aload: no such file\n"); return -1; }
+    static char out[4096];
+    int rc = cc_actor_load((const char *)f->data, (int)f->size, out, sizeof out);
+    uart_puts(out);
+    return rc;
+}
+
+int cmd_amsg(int argc, char **argv)
+{
+    if (argc < 3) { uart_puts("usage: amsg <actor> <method> [arg]\n"); return -1; }
+    int  actor = cc_atoi(argv[1]);
+    long arg   = (argc >= 4) ? cc_atoi(argv[3]) : 0;
+    static char out[256];
+    cc_actor_send_msg(actor, argv[2], arg, out, sizeof out);
+    uart_puts(out); uart_puts("\n");
+    return 0;
+}

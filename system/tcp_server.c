@@ -392,6 +392,39 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, prog);
         if (rc == 0) { bl = s_put(body, bl, "=> "); bl = s_putdec(body, bl, rv); bl = s_put(body, bl, "\n"); }
         else         { bl = s_put(body, bl, "\n"); }
+    } else if (starts_with(req, "POST /actor/load") || starts_with(req, "GET /actor/load")) {
+        /* Load an AIPL-generated C program as RESIDENT actors: the body is
+         * the C source; main() spawns the actors and they stay alive for
+         * later /actor/send messages. */
+        ctype = "text/plain";
+        static char asrc[2048];
+        int aslen = 0;
+        if (req[0] == 'P') {
+            int he = find_header_end(req);
+            if (he >= 0) {
+                const char *b = req + he;
+                while (b[aslen] && aslen < (int)sizeof(asrc) - 1) { asrc[aslen] = b[aslen]; aslen++; }
+                asrc[aslen] = 0;
+            }
+        } else {
+            static char aenc[2048];
+            if (q_param(req, "src", aenc, sizeof aenc)) aslen = url_decode(aenc, asrc, sizeof asrc);
+        }
+        static char ares[1100];
+        cc_actor_load(asrc, aslen, ares, sizeof ares);
+        bl = s_put(body, bl, ares);
+    } else if (path_eq(req, "/actor/send")) {
+        /* Exchange a message with a resident actor:
+         *   GET /actor/send?to=<id>&m=<method>&arg=<n> */
+        ctype = "text/plain";
+        int  to  = q_int(req, "to", 0);
+        int  arg = q_int(req, "arg", 0);
+        char method[32];
+        if (!q_param(req, "m", method, sizeof method)) method[0] = 0;
+        static char mres[256];
+        cc_actor_send_msg(to, method, arg, mres, sizeof mres);
+        bl = s_put(body, bl, mres);
+        bl = s_put(body, bl, "\n");
     } else if (path_eq(req, "/send")) {
         int  to  = q_int(req, "to", -1);
         int  arg = q_int(req, "arg", 0);
@@ -429,7 +462,9 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "xinu-rpi5 (Pi 4) actor HTTP gateway\n"
                              "GET  /api/actors\n"
                              "GET  /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n"
-                             "POST /compile   (body = C source; JIT-run, returns output + => retval)\n");
+                             "POST /compile      (body = C source; JIT-run, output + => retval)\n"
+                             "POST /actor/load   (body = AIPL-generated C; spawns resident actors)\n"
+                             "GET  /actor/send?to=<id>&m=<method>&arg=<n>  (message a resident actor)\n");
     } else {
         ctype = "text/plain";
         bl = s_put(body, bl, "404 not found\n");

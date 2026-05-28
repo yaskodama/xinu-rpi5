@@ -128,6 +128,10 @@ func_t *cc_parse(token_t *toks);
  * *entry_off to the byte offset of `main` within the buffer. */
 int cc_codegen(func_t *funcs, unsigned char *buf, int cap, int *entry_off);
 
+/* Byte offset of function `name` in the buffer last codegen'd, or -1.
+ * Valid until the next cc_codegen call. */
+int cc_func_offset(const char *name);
+
 /* Resolve a builtin/external name to a kernel function address (0 if
  * unknown).  Defined in cc.c; the table is how compiled code reaches
  * print/putchar/puts/actor_send and, later, the AIPL runtime. */

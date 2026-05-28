@@ -501,3 +501,9 @@ int cc_codegen(func_t *funcs, unsigned char *buf, int cap, int *entry_off)
     *entry_off = mainf->code_off;
     return g_pos;
 }
+
+int cc_func_offset(const char *name)
+{
+    func_t *f = find_func(name);
+    return f ? f->code_off : -1;
+}

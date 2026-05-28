@@ -14,4 +14,17 @@ int cmd_cc(int argc, char **argv);
  * into `out`.  Returns -2 on out-of-memory. */
 int cc_run_source(const char *src, int srclen, char *out, int outcap, long *retval);
 
+/* ---- resident actor program (backs /actor/load and /actor/send) ---- */
+
+/* Compile AIPL-generated C and keep it resident: runs main() (which
+ * spawns the actors) and keeps the code + actor state alive.  `out` gets
+ * main()'s output plus a "[resident: N actor(s) live]" line.  Returns 0
+ * on success, -1 on compile error (out = message). */
+int cc_actor_load(const char *src, int srclen, char *out, int outcap);
+
+/* Send a message to a resident actor: apply `method` (by name) with
+ * integer `arg` to actor `actor`, rendering the result into `out`.
+ * Returns 0, or -1 if no program is loaded / the method is unknown. */
+int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int outcap);
+
 #endif /* XINU_RPI5_CC_H */
