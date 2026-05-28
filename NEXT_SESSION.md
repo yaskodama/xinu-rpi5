@@ -1,5 +1,21 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-29 — ★プリエンプティブ・スケジューラ（タイマ駆動 RR）★実機検証済
+
+タイマ IRQ 復活を土台にプリエンプティブ・マルチタスクを実装。100Hz tick で ISR が resched 要求→IRQ
+EOI 後に `proc_preempt()` が ready プロセスを round-robin。
+- proc.c: scheduler/ready 操作(resched/block/ready/kill/exit)を **IRQ マスク臨界区間**(`include/critical.h`
+  の `irq_save/restore`)で保護。`g_preempt_on` ゲート + `proc_resched_request`(ISR) + `proc_preempt`(EOI後、
+  非 NULLPROC のみ preempt)。timer.c が request、irq_dispatch.c が proc_preempt。
+- **重要バグ&修正**: 新規プロセスは ctxsw でスケジューラのマスク済み DAIF を継承→(1)タイマが鳴らず preempt
+  不可 (2)IRQ マスクのまま長時間走り genet 飢餓で wedge。→ `actor_proc_main`/`compute_proc_main` 入口で
+  `irq_enable_all()`(これは私の臨界区間追加で生じたアクターのマスク状態も是正)。
+- デモ `cmd_preempt`/`GET /preempt`: 自発 yield しない CPU 拘束プロセス2つ。協調なら "AAAA...BBBB"、
+  preempt なら交錯。**実機: log "ABBAABABAB..."(切替13回)＝時分割成功、Pi 生存(wedge なし)**。commit **516f0da**。
+- ⚠️ **スコープ限定**: preempt はこの隔離された純整数デモでのみ ON。AIPL/actor/LLM ランタイムは協調維持
+  (preempt off)＝共有非リエントラント状態(vheap/LLM/genet)があるため。全面 preempt 化には genet の IRQ
+  駆動化 or NULLPROC スケジュール化が必要(将来課題)。QEMU はタイマ不発でこの機能はテスト不可→実機のみ。
+
 ## ✅ 2026-05-29 — ★100Hz タイマ IRQ 復活（EL2→EL1 + GIC group1）★実機検証済
 
 プリエンプション着手→**前提のタイマ IRQ が一度も発火していない**ことが発覚(tick_count=0)。診断用 `/ticks`
