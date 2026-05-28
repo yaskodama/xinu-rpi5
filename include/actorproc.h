@@ -3,7 +3,7 @@
 #ifndef XINU_RPI4_ACTORPROC_H
 #define XINU_RPI4_ACTORPROC_H
 
-struct ap_msg { long method, a0, a1, a2, a3; };
+struct ap_msg { long method, a0, a1, a2, a3, reply_to; };
 
 /* Behaviour callback: invoked by each actor process for every received
  * message.  (The AIPL JIT `dispatch` has exactly this shape; its return
@@ -14,6 +14,9 @@ void ap_reset(void);                 /* drop all actors (no free)        */
 void ap_killall(void);               /* reap all actor processes + stacks */
 int  ap_spawn(void);                 /* new actor process; returns id/-1  */
 void ap_send(long to, long method, long a0, long a1, long a2, long a3);
+/* Synchronous call: deliver to `to`, block `self` until `to` replies with
+ * its method's return value, and return that value.  (AIPL `now`.) */
+long ap_call(long self, long to, long method, long a0, long a1, long a2, long a3);
 void ap_run(void);                   /* drive actors until quiescent      */
 
 /* Selective receive used by AIPL `select`: block until a message whose

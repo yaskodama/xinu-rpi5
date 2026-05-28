@@ -46,17 +46,34 @@ void ap_killall(void)
     g_nact = 0;
 }
 
+#define AP_REPLY (-2)                /* method id of a `now` reply        */
+
 static int q_empty(int i) { return g_act[i].head == g_act[i].tail; }
 
-void ap_send(long to, long method, long a0, long a1, long a2, long a3)
+static void ap_post(long to, long method, long reply_to, long a0, long a1, long a2, long a3)
 {
     if (to < 0 || to >= g_nact) return;
     int nxt = (g_act[to].tail + 1) % AP_QLEN;
     if (nxt == g_act[to].head) return;            /* full: drop */
     struct ap_msg *m = &g_act[to].q[g_act[to].tail];
     m->method = method; m->a0 = a0; m->a1 = a1; m->a2 = a2; m->a3 = a3;
+    m->reply_to = reply_to;
     g_act[to].tail = nxt;
     if (g_act[to].waiting) { g_act[to].waiting = 0; proc_ready(g_act[to].pid); }
+}
+
+void ap_send(long to, long method, long a0, long a1, long a2, long a3)
+{
+    ap_post(to, method, -1, a0, a1, a2, a3);
+}
+
+long ap_call(long self, long to, long method, long a0, long a1, long a2, long a3)
+{
+    ap_post(to, method, self, a0, a1, a2, a3);    /* deliver, asking for a reply */
+    long want[1] = { AP_REPLY };
+    struct ap_msg rm;
+    ap_select(self, 1, want, &rm);                /* block until the reply lands */
+    return rm.a0;
 }
 
 static void ap_recv(int self, struct ap_msg *out)
@@ -96,7 +113,9 @@ static void actor_proc_main(void)
     struct ap_msg m;
     for (;;) {
         ap_recv(self, &m);
-        if (g_actor_dispatch) (void)g_actor_dispatch((long)self, m.method, m.a0, m.a1, m.a2, m.a3);
+        long r = g_actor_dispatch ? g_actor_dispatch((long)self, m.method, m.a0, m.a1, m.a2, m.a3) : 0;
+        if (m.reply_to >= 0)            /* `now` caller is blocked for our return */
+            ap_post(m.reply_to, AP_REPLY, -1, r, 0, 0, 0);
     }
 }
 

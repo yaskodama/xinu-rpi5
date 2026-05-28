@@ -301,6 +301,13 @@ static void cc_enqueue(long to, long mid, long a0, long a1, long a2, long a3)
 /* `new C()` -> spawn an actor process; returns its id (== g_obj index). */
 static long cc_actor_new(void) { return (long)ap_spawn(); }
 
+/* `now obj.m(args)` inside a method -> synchronous call: block this actor
+ * until the target replies with its return value. */
+static long cc_call(long self, long to, long method, long a0, long a1, long a2, long a3)
+{
+    return ap_call(self, to, method, a0, a1, a2, a3);
+}
+
 /* `select { case m(v): ... }` runtime: block until one of m0..m{n-1}
  * arrives, stash its args for cc_sel_arg, and return the matched method. */
 static long g_sel[4];
@@ -343,6 +350,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "v_int_of",   (void *)&v_int_of     },
         { "enqueue",    (void *)&cc_enqueue   },
         { "cc_actor_new",(void *)&cc_actor_new},
+        { "cc_call",    (void *)&cc_call      },
         { "cc_select",  (void *)&cc_select    },
         { "cc_sel_arg", (void *)&cc_sel_arg   },
         { 0, 0 }
