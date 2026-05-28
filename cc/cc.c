@@ -277,6 +277,43 @@ static void v_print(long w)       { char b[32]; emit_str(v_render(w, b, sizeof b
 /* v_truthy is also exported (raw 0/1) for if/while conditions. */
 static long v_truthy_x(long w)    { return v_truthy(w); }
 
+/* ---------- asynchronous mailbox (cooperative message pump) ----------
+ * `send obj.m(args)` in AIPL is fire-and-forget: it enqueues a message
+ * and returns immediately.  After main() (and after each /actor/send) we
+ * run cc_pump(), which dequeues in FIFO order and dispatches each — a
+ * handler's own `send`s are enqueued and processed in turn.  This gives
+ * real concurrent-actor behaviour without threads.  `now` stays a direct
+ * synchronous dispatch (it needs the reply).  The pump is time-bounded
+ * (shares the runaway deadline) so an endless send cascade can't hang. */
+
+#define MSGQ_MAX 512
+static struct { long to, mid, a0, a1, a2, a3; } g_msgq[MSGQ_MAX];
+static int g_msgq_head, g_msgq_tail;
+static long (*g_active_dispatch)(long, long, long, long, long, long);
+
+static void msgq_reset(void) { g_msgq_head = g_msgq_tail = 0; }
+
+static void cc_enqueue(long to, long mid, long a0, long a1, long a2, long a3)
+{
+    int nxt = (g_msgq_tail + 1) % MSGQ_MAX;
+    if (nxt == g_msgq_head) return;          /* full: drop (bounded) */
+    g_msgq[g_msgq_tail].to = to; g_msgq[g_msgq_tail].mid = mid;
+    g_msgq[g_msgq_tail].a0 = a0; g_msgq[g_msgq_tail].a1 = a1;
+    g_msgq[g_msgq_tail].a2 = a2; g_msgq[g_msgq_tail].a3 = a3;
+    g_msgq_tail = nxt;
+}
+
+static void cc_pump(void)
+{
+    if (!g_active_dispatch) return;
+    while (g_msgq_head != g_msgq_tail) {
+        if (cc_now() >= g_deadline) { g_aborted = 1; break; }
+        int h = g_msgq_head; g_msgq_head = (g_msgq_head + 1) % MSGQ_MAX;
+        g_active_dispatch(g_msgq[h].to, g_msgq[h].mid,
+                          g_msgq[h].a0, g_msgq[h].a1, g_msgq[h].a2, g_msgq[h].a3);
+    }
+}
+
 unsigned long cc_resolve_extern(const char *name)
 {
     struct { const char *n; void *f; } tab[] = {
@@ -304,6 +341,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "v_print",    (void *)&v_print      },
         { "v_truthy",   (void *)&v_truthy_x   },
         { "v_int_of",   (void *)&v_int_of     },
+        { "enqueue",    (void *)&cc_enqueue   },
         { 0, 0 }
     };
     for (int i = 0; tab[i].n; i++) {
@@ -357,11 +395,16 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     }
     if (cc_failed() || len < 0) { if (code) kfree(code); arena_free(); return -1; }
 
+    int doff = cc_func_offset("dispatch");
     cc_sync_icache(code, (unsigned long)len);
     cc_set_deadline();
     vheap_reset();              /* fresh string-concat heap for this run */
+    msgq_reset();
+    g_active_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
     long (*entryfn)(void) = (long (*)(void))(code + entry);
     long rc = entryfn();
+    cc_pump();                  /* drain asynchronous `send` messages */
+    g_active_dispatch = 0;
     if (retval) *retval = rc;
 
     kfree(code);
@@ -480,12 +523,16 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
 
     cc_sync_icache(code, (unsigned long)len);
 
-    /* Run main() once to spawn/init the actors; capture its output. */
+    /* Run main() once to spawn/init the actors; capture its output, then
+     * drain any asynchronous `send` cascade it kicked off. */
     cc_set_deadline();
     vheap_reset();
+    msgq_reset();
+    g_active_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
     g_cap = out; g_capcap = outcap; g_caplen = 0; if (outcap > 0) out[0] = 0;
     long (*mainfn)(void) = (long (*)(void))(code + entry);
     mainfn();
+    cc_pump();
     if (g_cap) g_cap[(g_caplen < g_capcap) ? g_caplen : (g_capcap - 1)] = 0;
     g_cap = 0;
 
@@ -534,6 +581,10 @@ int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int ou
     }
 
     long res = g_res_dispatch((long)actor, mid, v_int(arg), v_int(0), v_int(0), v_int(0));
+
+    /* Drain any asynchronous `send`s the handler triggered. */
+    g_active_dispatch = g_res_dispatch;
+    cc_pump();
 
     char tmp[64];
     const char *r = v_render(res, tmp, sizeof tmp);
