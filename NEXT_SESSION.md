@@ -1,5 +1,14 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-28 — `now` = プロセス間同期 RPC
+
+メソッド内 `now obj.m(args)` を `cc_call(self,to,mid,args)`→`ap_call` に: 呼出元アクターを
+`ap_select(AP_REPLY=-2)` でブロック→相手プロセスが処理し戻り値を AP_REPLY で返信→再開し値取得。
+`ap_msg.reply_to`+`ap_post`、actor_proc_main が reply_to>=0 で dispatch 戻り値を返信。トップレベル
+`now` はインライン dispatch のまま(main はアクタープロセスでない)。QEMU で Client.go の
+`now srv.query(5)`→ブロック→`got 50`、Counter top-level now(5/42/42)回帰 OK。
+commit xinu 1242109 / abclcp e289923。examples_xinujit/Rpc.abcl。**未 flash**(実機最新 50d6ad13)。
+
 ## ✅ 2026-05-28 — AIPL `select` 統合 (actors as Xinu processes)
 
 --xinu-jit を actorproc 機構に配線完了: `g_spawn`→`cc_actor_new()`→`ap_spawn`(各 AIPL アクター=
