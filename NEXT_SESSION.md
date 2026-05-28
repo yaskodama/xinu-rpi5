@@ -1,5 +1,18 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-28 — リスト / コレクション型 (value_t)
+
+AIPL の式レベルのリスト構文は最小限(リテラル `[..]` の式規則無し、添字は定数のみ)。共有 parser 拡張は
+広範・高リスクなので避け、**value_t の第4種(int/string/float に続く list)+ 普通の関数呼び出し**で実装。
+- cc.c: `V_LIST_TAG`(bit 61)。list heap `g_lheap[2048]`(bump、run毎 `lheap_reset`、vheap と並走)。
+  レイアウト `[len][item..]`、**イミュータブル**(push はコピー+追加で新リスト、文字列連結と同じ)。
+  `v_is_list`/`v_is_str` 更新、`v_truthy`/`v_render`/`v_print` がリスト対応(`[a, b, c]` 表示・文字列連結)。
+  `v_list_new/push/get/len` を extern 登録。
+- translator: `list()`/`push(l,x)`/`get(l,i)`/`len(l)` を Call で対応(構文変更なし)。
+- `examples_xinujit/Lists.abcl`(ループで構築→index→sum→filter で新リスト)。QEMU: `[10,20,30,40]`/len4/
+  l[2]=30/sum100/filtered=[30,40]、rpc・select・saga・supervised 回帰 OK。
+  commit xinu **186fc64** / abclcp **b4356f0**。**未 flash**(現実機 47a7703b は list 未搭載。要再フラッシュ)。
+
 ## ✅ 2026-05-28 — let-it-crash / アクター監視
 
 アクターのハンドラが `crash()` で**自分を中断**してもシステムを落とさない。各アクタープロセスが
