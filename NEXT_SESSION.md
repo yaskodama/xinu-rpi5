@@ -1,5 +1,25 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-28 — select-after-resident クラッシュ修正（スケジューラ）
+
+**症状**: `/actor/load`(resident) の後に `/compile` でアクタープロセス内 dispatch を
+行う(例: AIPL `select`)と PC アライメント例外(`ret` 先=1=`v_int(0)`)→実機ではコア停止=
+ネット wedge。now-RPC や Counter(top-level now) は通るが select だけ落ちる、が手掛かり。
+
+**根因(協調する2バグ)**:
+1. `proc_kill` がスロット解放するが **ready リストから外さない**。`ap_run` はメールボックス
+   空のアクター(top-level `now` のレジデント等)を pop しないので PR_READY のまま残留。後続
+   `/compile` がその PROC スロットを再利用すると `ready_push` が `node->next=node` の自己ループ
+   →`ready_pop` が走行中プロセス自身を返し `proc_block` が**自分の上書き済み初期フレームに ctxsw**
+   →戻り番地がメッセージ引数(1)に。**修正**: `proc_kill` が `ready_remove` で先に ready リストから除去。
+2. `ap_reset` がレジデントを kill せず参照だけ落とし PROC スロットをリーク→NPROC枯渇→
+   `ap_spawn`が-1→JITが`g_obj[-1]`破壊。**修正**: `ap_reset` が生存アクターを `proc_kill`。
+   `g_spawn` も `cc_actor_new()<0` をガード(abclcp 34a3cfd)。
+
+QEMU 検証: aload→cc(rpc/sel/cnt 反復)＋amsg、全て fault 無し。commit xinu **a891395** /
+abclcp **34a3cfd**。デバッグは QEMU `-d int,cpu` ログ + nm/objdump で ctxsw の `ret 1` を特定。
+**未 flash**(実機最新 50d6ad13、now-RPC すら未反映)。要再フラッシュ。
+
 ## ✅ 2026-05-28 — `now` = プロセス間同期 RPC
 
 メソッド内 `now obj.m(args)` を `cc_call(self,to,mid,args)`→`ap_call` に: 呼出元アクターを
