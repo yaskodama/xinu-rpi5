@@ -1,5 +1,22 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-29 — ★100Hz タイマ IRQ 復活（EL2→EL1 + GIC group1）★実機検証済
+
+プリエンプション着手→**前提のタイマ IRQ が一度も発火していない**ことが発覚(tick_count=0)。診断用 `/ticks`
+(ticks/cntpct/EL/cntp_ctl/daif)を追加して原因特定:
+- **カーネルが EL2 で動作していた**(Pi4 64bit ファームは EL1 でなく EL2 に落とす。boot.S は EL1 前提だった)。
+  タイマは ISTATUS=1 で発火、DAIF.I=0 で unmask 済みなのに、EL1 向け(VBAR_EL1/CNTP PPI30)なので EL2 では取れない。
+- 加えて GIC が全 IRQ を group0(=非セキュア EL1 では FIQ 経路でマスク)に置いていた。
+- **修正**: ①boot.S で標準的 EL2→EL1 ドロップ(HCR_EL2.RW=1, CNTHCTL_EL2 で EL1 タイマ許可, CNTVOFF=0,
+  SPSR_EL2=EL1h, eret)。QEMU は EL1 起動なので skip。②gic.c で IRQ を group1 化+Grp1 enable、GICD/GICC
+  オフセット可変化。③/ticks 拡張。
+- **実機検証**: EL=1、ticks ~100/秒で進行＝**タイマ IRQ 復活**。EL1 化で MMU/W^X が初めて真に有効化されたが
+  JIT(/compile got 50)/LLM(coherent)/list-map 全て無破壊＝heap RW+X・device マップ正しい。commit **5c09b1e**。
+- ⚠️ **QEMU では依然タイマ不発**(GIC が QEMU ビルドで未定義/未対応)→ プリエンプションは**実機でのみテスト可**
+  (build→flash→curl、低速・要注意)。次: プリエンプティブ round-robin。共有グローバル状態(vheap/LLM R/genet)は
+  非リエントラントなので、**プリエンプトはアクターのみ・NULLPROC(網/wm)は協調維持**、FP は irq_entry で退避、
+  ready/ap 操作は IRQ マスク臨界区間、で安全にスコープする設計(本セッションで設計済・未実装)。
+
 ## ✅ 2026-05-28 — KV キャッシュでチャット高速化 + select 複数 LLM アクター ★実機検証済
 
 オススメ順 #1+#2。両方 QEMU 検証済、**未 flash**。
