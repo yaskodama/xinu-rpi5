@@ -28,8 +28,16 @@
 
 #ifdef GIC_BASE
 
-#define GICD_BASE   (GIC_BASE + 0x1000UL)
-#define GICC_BASE   (GIC_BASE + 0x2000UL)
+/* GIC-400 (Pi 4): GICD at +0x1000, GICC at +0x2000.  QEMU virt GICv2:
+ * GICD at +0x0, GICC at +0x10000.  Overridable per target. */
+#ifndef GICD_OFFSET
+#define GICD_OFFSET 0x1000UL
+#endif
+#ifndef GICC_OFFSET
+#define GICC_OFFSET 0x2000UL
+#endif
+#define GICD_BASE   (GIC_BASE + GICD_OFFSET)
+#define GICC_BASE   (GIC_BASE + GICC_OFFSET)
 
 #define GICD_CTLR        (*(volatile unsigned int *)(GICD_BASE + 0x000))
 #define GICD_IGROUPR(n)  (*(volatile unsigned int *)(GICD_BASE + 0x080 + 4 * (n)))
@@ -64,14 +72,18 @@ void gic_init(void)
      * — but writing the low banks is harmless on GIC-400. */
     for (int n = 8; n < 256; n++) GICD_ITARGETSR(n) = 0x01010101U;
 
-    /* All IRQs in group 0 for now (Pi 4 boots EL1 non-secure so
-     * group 0 maps to the CPU interface we read from). */
-    for (int n = 0; n < 32; n++) GICD_IGROUPR(n) = 0;
+    /* Put every IRQ in GROUP 1.  At non-secure EL1 (where Pi 4 boots), only
+     * group-1 interrupts are signalled as IRQ; group-0 would be routed as a
+     * (secure) FIQ, which we keep masked — so a group-0 timer IRQ never
+     * arrives.  This was why the 100 Hz tick never fired. */
+    for (int n = 0; n < 32; n++) GICD_IGROUPR(n) = 0xFFFFFFFFU;
 
-    /* Enable distributor. */
-    GICD_CTLR = 1;
+    /* Enable the distributor.  In the (banked) NS view bit0 = EnableGrp1;
+     * set bit1 too so it also works if we are presented the single-view
+     * (DS=1) layout where bit1 = EnableGrp1. */
+    GICD_CTLR = 3;
 
-    /* CPU interface: priority mask wide open, then enable. */
+    /* CPU interface: priority mask wide open, enable group 1 forwarding. */
     GICC_PMR  = 0xF0;
     GICC_CTLR = 1;
 }

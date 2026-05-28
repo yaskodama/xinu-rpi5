@@ -431,11 +431,16 @@ static int http_build(const char *req, char *out, int max)
          * counter (always advances).  If ticks stays 0 across calls while
          * cntpct grows, the timer IRQ is not being delivered. */
         ctype = "text/plain";
-        unsigned long ct; __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
-        bl = s_put(body, bl, "ticks=");
-        bl = s_putdec(body, bl, (long)timer_ticks());
-        bl = s_put(body, bl, " cntpct=");
-        bl = s_putdec(body, bl, (long)ct);
+        unsigned long ct, el, ctl, daif;
+        __asm__ volatile ("mrs %0, cntpct_el0"  : "=r"(ct));
+        __asm__ volatile ("mrs %0, currentel"   : "=r"(el));
+        __asm__ volatile ("mrs %0, cntp_ctl_el0": "=r"(ctl));
+        __asm__ volatile ("mrs %0, daif"        : "=r"(daif));
+        bl = s_put(body, bl, "ticks=");      bl = s_putdec(body, bl, (long)timer_ticks());
+        bl = s_put(body, bl, " cntpct=");    bl = s_putdec(body, bl, (long)ct);
+        bl = s_put(body, bl, " EL=");        bl = s_putdec(body, bl, (long)((el >> 2) & 3));
+        bl = s_put(body, bl, " cntp_ctl=");  bl = s_putdec(body, bl, (long)ctl);   /* bit0=EN bit1=IMASK bit2=ISTATUS */
+        bl = s_put(body, bl, " daif=");      bl = s_putdec(body, bl, (long)((daif >> 6) & 0xf));
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "POST /chat") || starts_with(req, "GET /chat")) {
         /* Converse with a resident actor: deliver the message (POST body or

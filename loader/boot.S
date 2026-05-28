@@ -64,13 +64,46 @@ _real_start:
 1:  wfe
     b       1b
 
-    // ---- (2) primary core: set up stack -------------------------
+    // ---- (1b) drop EL2 -> EL1 if firmware left us at EL2 --------
     //
-    // Stash x0 (firmware-provided DTB phys addr) on the stack
-    // across BSS clear, then write it back into the .data global
-    // `dtb_addr` so kernel_main can use it to find the
-    // simple-framebuffer node etc.
-2:  ldr     x1, =_start
+    // Pi 4 64-bit firmware actually drops to EL2 (confirmed: /ticks
+    // reported EL=2), but the rest of the kernel (VBAR_EL1, the EL1
+    // physical timer, the GIC config) assumes EL1 — so the 100 Hz
+    // timer IRQ asserted (CNTP ISTATUS=1) but was never taken.  Do
+    // the standard EL2->EL1 transition.  QEMU virt boots at EL1, so
+    // this is skipped there (no behaviour change).
+2:  mov     x19, x0                  // preserve firmware DTB ptr across the drop
+    mrs     x0, CurrentEL
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    b.ne    el1_entry                // already EL1 -> nothing to do
+
+    mrs     x0, hcr_el2
+    orr     x0, x0, #(1 << 31)       // HCR_EL2.RW = 1: EL1 is AArch64
+    msr     hcr_el2, x0
+
+    mrs     x0, cnthctl_el2
+    orr     x0, x0, #3               // EL1PCTEN|EL1PCEN: EL1 may use phys timer/counter
+    msr     cnthctl_el2, x0
+    msr     cntvoff_el2, xzr
+
+    mov     x0, #0x0800              // SCTLR_EL1 sane reset (MMU/caches off; mmu_init enables later)
+    movk    x0, #0x30d0, lsl #16
+    msr     sctlr_el1, x0
+
+    mov     x0, #0x3c5               // SPSR_EL2: EL1h, DAIF all masked (kernel unmasks I later)
+    msr     spsr_el2, x0
+    adr     x0, el1_entry
+    msr     elr_el2, x0
+    eret
+
+    // ---- (2) primary core (now at EL1): set up stack ------------
+    //
+    // x19 holds the firmware DTB phys addr; stash it across BSS clear,
+    // then write it into the .data global `dtb_addr`.
+el1_entry:
+    mov     x0, x19                  // restore DTB ptr
+    ldr     x1, =_start
     mov     sp, x1
     stp     x0, xzr, [sp, #-16]!     // preserve x0 across bss clear
 
