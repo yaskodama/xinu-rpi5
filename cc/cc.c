@@ -162,13 +162,15 @@ static char *vheap_alloc(int n)
  * pointer is tagged with bit 60 — our identity-mapped addresses fit in
  * the low 48 bits, so the tag is free and is masked off before deref. */
 #define V_FLOAT_TAG  (1UL << 60)
+#define V_LIST_TAG   (1UL << 61)        /* tags a pointer into the list heap */
 #define V_PTR_MASK   ((1UL << 48) - 1)
 
 static long   v_int(long n)        { return (n << 1) | 1L; }
 static long   v_str(const char *p) { return (long)p; }
 static int    v_is_int(long w)     { return (w & 1L) != 0; }
 static int    v_is_float(long w)   { return !(w & 1L) && (((unsigned long)w >> 60) & 1UL); }
-static int    v_is_str(long w)     { return !(w & 1L) && w != 0 && !v_is_float(w); }
+static int    v_is_list(long w)    { return !(w & 1L) && (((unsigned long)w >> 61) & 1UL); }
+static int    v_is_str(long w)     { return !(w & 1L) && w != 0 && !v_is_float(w) && !v_is_list(w); }
 static long   v_int_of(long w)     { return v_is_int(w) ? (w >> 1) : 0; }
 static double v_to_float(long w)
 {
@@ -188,16 +190,69 @@ static long v_floatlit(long bits)
     union { long i; double d; } u; u.i = bits;
     return v_floatval(u.d);
 }
+
+/* ---- lists / collections ----
+ * A list is a pointer (tagged V_LIST_TAG) to a block in the list heap laid
+ * out as [len][item0]..[item_{len-1}], each a value_t.  Like string concat,
+ * lists are immutable and bump-allocated: push() copies + appends, returning
+ * a new list.  Reset per run alongside the string heap. */
+static long  g_lheap[2048];
+static int   g_lheaplen;
+static void  lheap_reset(void) { g_lheaplen = 0; }
+static long *lheap_alloc(int ncells)
+{
+    if (ncells < 0 || g_lheaplen + ncells > (int)(sizeof(g_lheap)/sizeof(g_lheap[0]))) return 0;
+    long *p = &g_lheap[g_lheaplen]; g_lheaplen += ncells; return p;
+}
+static long *v_list_ptr(long w) { return (long *)((unsigned long)w & V_PTR_MASK); }
+static long  v_list_new(void)
+{
+    long *b = lheap_alloc(1); if (!b) return v_int(0);
+    b[0] = 0;
+    return (long)((unsigned long)b | V_LIST_TAG);
+}
+static long v_list_len(long w) { return v_int(v_is_list(w) ? v_list_ptr(w)[0] : 0); }
+static long v_list_get(long w, long iv)
+{
+    if (!v_is_list(w)) return v_int(0);
+    long *b = v_list_ptr(w); long n = b[0]; long i = v_int_of(iv);
+    return (i >= 0 && i < n) ? b[1 + i] : v_int(0);
+}
+static long v_list_push(long w, long x)
+{
+    long *src = v_is_list(w) ? v_list_ptr(w) : 0;
+    long n = src ? src[0] : 0;
+    long *b = lheap_alloc((int)(n + 2)); if (!b) return w;   /* heap full: keep old */
+    b[0] = n + 1;
+    for (long i = 0; i < n; i++) b[1 + i] = src[1 + i];
+    b[1 + n] = x;
+    return (long)((unsigned long)b | V_LIST_TAG);
+}
 static int v_truthy(long w)
 {
     if (w == 0) return 0;
     if (v_is_int(w))   return (w >> 1) != 0;
     if (v_is_float(w)) return v_to_float(w) != 0.0;
+    if (v_is_list(w))  return v_list_ptr(w)[0] != 0;   /* non-empty */
     return ((const char *)w)[0] != 0;
 }
 /* Render a value to text into `buf`: strings as-is, ints/floats as decimal. */
 static const char *v_render(long w, char *buf, int cap)
 {
+    if (v_is_list(w)) {
+        long *b = v_list_ptr(w); long n = b[0];
+        int i = 0;
+        if (i < cap - 1) buf[i++] = '[';
+        for (long k = 0; k < n && i < cap - 2; k++) {
+            if (k) { if (i < cap - 1) buf[i++] = ','; if (i < cap - 1) buf[i++] = ' '; }
+            char t[24];
+            const char *es = v_render(b[1 + k], t, sizeof t);
+            while (*es && i < cap - 2) buf[i++] = *es++;
+        }
+        if (i < cap - 1) buf[i++] = ']';
+        buf[i] = 0;
+        return buf;
+    }
     if (v_is_str(w)) return (const char *)w;
     if (v_is_float(w)) {
         double d = v_to_float(w);
@@ -274,7 +329,20 @@ static long v_ne(long a, long b)  { return v_int(!v_int_of(v_eq(a, b))); }
 static long v_and(long a, long b) { return v_int(v_truthy(a) && v_truthy(b)); }
 static long v_or(long a, long b)  { return v_int(v_truthy(a) || v_truthy(b)); }
 static long v_not(long a)         { return v_int(!v_truthy(a)); }
-static void v_print(long w)       { char b[32]; emit_str(v_render(w, b, sizeof b)); emit_ch('\n'); }
+static void v_print(long w)
+{
+    if (v_is_list(w)) {                 /* print arbitrarily long lists directly */
+        long *p = v_list_ptr(w); long n = p[0];
+        emit_ch('[');
+        for (long i = 0; i < n; i++) {
+            if (i) { emit_ch(','); emit_ch(' '); }
+            char t[32]; emit_str(v_render(p[1 + i], t, sizeof t));
+        }
+        emit_ch(']'); emit_ch('\n');
+        return;
+    }
+    char b[32]; emit_str(v_render(w, b, sizeof b)); emit_ch('\n');
+}
 /* v_truthy is also exported (raw 0/1) for if/while conditions. */
 static long v_truthy_x(long w)    { return v_truthy(w); }
 
@@ -376,6 +444,10 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_saga_failed", (void *)&cc_saga_failed },
         { "cc_crash",         (void *)&cc_crash         },
         { "cc_crashed_value", (void *)&cc_crashed_value },
+        { "v_list_new",  (void *)&v_list_new  },
+        { "v_list_push", (void *)&v_list_push },
+        { "v_list_get",  (void *)&v_list_get  },
+        { "v_list_len",  (void *)&v_list_len  },
         { 0, 0 }
     };
     for (int i = 0; tab[i].n; i++) {
@@ -433,6 +505,7 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     cc_sync_icache(code, (unsigned long)len);
     cc_set_deadline();
     vheap_reset();              /* fresh string-concat heap for this run */
+    lheap_reset();              /* and a fresh list heap */
     ap_reset();                 /* fresh actor set */
     g_active_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
     ap_set_dispatch(g_active_dispatch);
@@ -564,6 +637,7 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
      * drain any asynchronous `send` cascade it kicked off. */
     cc_set_deadline();
     vheap_reset();
+    lheap_reset();
     ap_reset();
     g_active_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
     ap_set_dispatch(g_active_dispatch);
