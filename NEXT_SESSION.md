@@ -1,5 +1,20 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-28 — LLM と会話するアクター（llm() 組込み + /chat）
+
+LLM をアクターモデルに統合: AIPL に **`llm(prompt)` 組込み**を追加し、メッセージ送信で会話できる
+**Chat アクター**を作成。stories260K は物語継続モデルなので「会話」＝文脈付き協調ストーリー継続。
+- cc.c: `cc_llm(prompt value_t文字列)` → 生成テキストを value_t 文字列(vheap)で返す。`cc_actor_send_str`
+  (resident アクターのメソッドに**文字列引数**を渡し、長い文字列返答を out へ)。vheap を 8KB→**32KB**
+  (会話履歴+返答用、v_add は古い文字列を解放しないので会話長に上限あり)。
+- llm.c: `llm_generate`/`llm_run` に `(max_new, echo)`: プロンプト消費後に **max_new 個の新規トークン
+  だけ生成**、echo で復唱有無。Chat は echo=0(継続のみ返す、履歴が文脈)、/llm と serial は echo=1。
+- tcp_server.c: **`/chat`** ルート(POST body or ?m= を文字列として resident アクター0の `say` に渡し返答)。
+- translator: `Call("llm",[p])` → `cc_llm`。`examples_xinujit/Chat.abcl`(story 蓄積→llm→継続)。
+- QEMU 検証(`cc` 経由 llm() 組込み): `llm("Once upon a time")` → ", there was a little girl named Lily..."。
+  /chat は resident+HTTP なので実機必須。commit xinu **aa28530** / abclcp **a0fe7fa**。**未 flash**。
+  ※この build は space fix(e1dd96d) も含む。実機手順: `/actor/load` Chat.c → `POST /chat "メッセージ"` 反復。
+
 ## ✅ 2026-05-28 — ネットワーク越し LLM（HTTP /llm）★実機検証済
 
 `POST /llm`（body=プロンプト、`?n=`=トークン数 既定32/上限96）でプロンプトを送り生成テキストを
