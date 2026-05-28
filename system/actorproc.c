@@ -27,6 +27,12 @@ static struct {
 static int g_nact;
 static long (*g_actor_dispatch)(long, long, long, long, long, long);
 
+/* let-it-crash: a per-actor non-local-jump buffer back to its receive loop,
+ * armed only while a handler is running.  crash() (ap_crash) longjmps here. */
+static void *g_actor_jmp[AP_NACT][5];   /* __builtin_setjmp frame: FP, SP, PC */
+static int   g_jmp_armed[AP_NACT];
+static long  g_cur_reply[AP_NACT];      /* reply_to of the handler in flight */
+
 void ap_set_dispatch(long (*fn)(long, long, long, long, long, long)) { g_actor_dispatch = fn; }
 
 void ap_reset(void)
@@ -44,6 +50,7 @@ void ap_reset(void)
         g_act[i].head = g_act[i].tail = 0;
         g_act[i].pid = -1;
         g_act[i].waiting = 0;
+        g_jmp_armed[i] = 0;
     }
     g_nact = 0;
 }
@@ -122,10 +129,37 @@ static void actor_proc_main(void)
     struct ap_msg m;
     for (;;) {
         ap_recv(self, &m);
-        long r = g_actor_dispatch ? g_actor_dispatch((long)self, m.method, m.a0, m.a1, m.a2, m.a3) : 0;
-        if (m.reply_to >= 0)            /* `now` caller is blocked for our return */
-            ap_post(m.reply_to, AP_REPLY, -1, r, 0, 0, 0);
+        g_cur_reply[self] = m.reply_to;     /* read in the crash path (m may be clobbered) */
+        /* Arm a non-local return so a crash() inside the handler comes back
+         * here instead of taking down the process.  __builtin_setjmp returns
+         * 0 on the direct path, 1 when ap_crash() longjmps. */
+        g_jmp_armed[self] = 1;
+        if (__builtin_setjmp(g_actor_jmp[self]) == 0) {
+            long r = g_actor_dispatch ? g_actor_dispatch((long)self, m.method, m.a0, m.a1, m.a2, m.a3) : 0;
+            g_jmp_armed[self] = 0;
+            if (m.reply_to >= 0)            /* `now` caller is blocked for our return */
+                ap_post(m.reply_to, AP_REPLY, -1, r, 0, 0, 0);
+        } else {
+            /* handler crashed: it was abandoned mid-flight.  Unblock a
+             * synchronous caller with the crash sentinel so its supervisor
+             * can retry; the process loops on to the next message. */
+            int s = (int)(long)proctab[currpid].arg;
+            g_jmp_armed[s] = 0;
+            if (g_cur_reply[s] >= 0)
+                ap_post((int)g_cur_reply[s], AP_REPLY, -1, AP_CRASH_REPLY, 0, 0, 0);
+        }
     }
+}
+
+/* Abandon the current actor's in-flight handler (let-it-crash).  Finds the
+ * actor whose process is current and, if it has an armed receive-loop frame,
+ * longjmps back to it.  Called from JIT'd code via cc_crash(). */
+void ap_crash(void)
+{
+    for (int i = 0; i < g_nact; i++)
+        if (g_act[i].pid == currpid && g_jmp_armed[i])
+            __builtin_longjmp(g_actor_jmp[i], 1);
+    /* not inside a live actor handler — nothing to crash */
 }
 
 int ap_spawn(void)
@@ -134,6 +168,7 @@ int ap_spawn(void)
     int id = g_nact;
     g_act[id].head = g_act[id].tail = 0;
     g_act[id].waiting = 0;
+    g_jmp_armed[id] = 0;
     int pid = proc_create_arg(actor_proc_main, 8192, "actor", (void *)(long)id);
     if (pid < 0) return -1;
     g_act[id].pid = pid;

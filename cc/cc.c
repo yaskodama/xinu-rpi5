@@ -332,6 +332,13 @@ static void cc_saga_reset(void)  { g_saga_failed = 0; }
 static long cc_saga_fail(void)   { g_saga_failed = 1; return v_int(0); }
 static long cc_saga_failed(void) { return g_saga_failed; }   /* plain 0/1 for raw C */
 
+/* let-it-crash: an actor handler calls crash() to abandon itself; ap_crash
+ * longjmps it back to its receive loop (does not return).  A supervisor's
+ * synchronous `now` then returns the crash sentinel, which crashed() yields
+ * so the AIPL code can compare `r == crashed()`. */
+static long cc_crash(void)         { ap_crash(); return v_int(0); }
+static long cc_crashed_value(void) { return AP_CRASH_REPLY; }
+
 unsigned long cc_resolve_extern(const char *name)
 {
     struct { const char *n; void *f; } tab[] = {
@@ -367,6 +374,8 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_saga_reset",  (void *)&cc_saga_reset  },
         { "cc_saga_fail",   (void *)&cc_saga_fail   },
         { "cc_saga_failed", (void *)&cc_saga_failed },
+        { "cc_crash",         (void *)&cc_crash         },
+        { "cc_crashed_value", (void *)&cc_crashed_value },
         { 0, 0 }
     };
     for (int i = 0; tab[i].n; i++) {

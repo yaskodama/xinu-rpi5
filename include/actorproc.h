@@ -23,4 +23,11 @@ void ap_run(void);                   /* drive actors until quiescent      */
  * method is one of meths[0..n); returns the matched method, *out gets it. */
 long ap_select(long self, int n, const long *meths, struct ap_msg *out);
 
+/* let-it-crash: abandon the current actor's in-flight handler and return to
+ * its receive loop (the process stays alive).  A synchronous `now` caller is
+ * unblocked with AP_CRASH_REPLY so a supervisor can detect + retry.  No-op if
+ * not called from inside an actor handler. */
+void ap_crash(void);
+#define AP_CRASH_REPLY 0x80000001L   /* == v_int(0x40000000): supervisor sentinel */
+
 #endif /* XINU_RPI4_ACTORPROC_H */
