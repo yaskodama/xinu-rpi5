@@ -57,6 +57,9 @@ void proc_exit(void);
 /* Block the current process (removes it from CURR; resched won't re-ready
  * it) until proc_ready() puts it back.  Used by mailbox receive. */
 void proc_block(void);
+/* Free a blocked/ready process's slot + stack (used to reap actor
+ * processes after a one-shot run).  Must not be the current process. */
+void proc_kill(int pid);
 
 /* AArch64 callee-saved (x19-x30) save / restore.  Implemented in
  * ctxsw.S.  *old_sp receives the SP value to resume `old` later;

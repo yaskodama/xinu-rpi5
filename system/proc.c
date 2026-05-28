@@ -170,6 +170,19 @@ void proc_yield(void)
     proc_resched();
 }
 
+/* Reap a process that is blocked (PR_WAIT) — not on the ready list and
+ * not running.  Frees its stack.  Used to clean up actor processes after
+ * a one-shot run so the NPROC slots aren't exhausted. */
+void proc_kill(int pid)
+{
+    if (pid <= 0 || pid >= NPROC || pid == currpid) return;
+    struct procent *p = &proctab[pid];
+    if (p->state == PR_FREE) return;
+    if (p->stkbase) freemem(p->stkbase, p->stklen);
+    p->stkbase = 0;
+    p->state   = PR_FREE;
+}
+
 /* Block the current process: it leaves PR_CURR for PR_WAIT (so resched
  * will not re-ready it) and we switch to the next ready process, or back
  * to NULLPROC if none is ready.  Returns once proc_ready() re-readies us

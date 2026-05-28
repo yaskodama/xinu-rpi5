@@ -13,6 +13,7 @@
 #include "uart.h"
 #include "kmalloc.h"
 #include "actor.h"
+#include "actorproc.h"
 
 /* ---------- arena allocator (whole-program lifetime) ---------- */
 
@@ -286,33 +287,32 @@ static long v_truthy_x(long w)    { return v_truthy(w); }
  * synchronous dispatch (it needs the reply).  The pump is time-bounded
  * (shares the runaway deadline) so an endless send cascade can't hang. */
 
-#define MSGQ_MAX 512
-static struct { long to, mid, a0, a1, a2, a3; } g_msgq[MSGQ_MAX];
-static int g_msgq_head, g_msgq_tail;
+/* The current program's dispatch (set before running main / a message);
+ * the actor processes invoke it for each delivered message. */
 static long (*g_active_dispatch)(long, long, long, long, long, long);
 
-static void msgq_reset(void) { g_msgq_head = g_msgq_tail = 0; }
-
+/* `send obj.m(args)` -> enqueue on the target actor's mailbox (a Xinu
+ * process); the cooperative scheduler delivers it. */
 static void cc_enqueue(long to, long mid, long a0, long a1, long a2, long a3)
 {
-    int nxt = (g_msgq_tail + 1) % MSGQ_MAX;
-    if (nxt == g_msgq_head) return;          /* full: drop (bounded) */
-    g_msgq[g_msgq_tail].to = to; g_msgq[g_msgq_tail].mid = mid;
-    g_msgq[g_msgq_tail].a0 = a0; g_msgq[g_msgq_tail].a1 = a1;
-    g_msgq[g_msgq_tail].a2 = a2; g_msgq[g_msgq_tail].a3 = a3;
-    g_msgq_tail = nxt;
+    ap_send(to, mid, a0, a1, a2, a3);
 }
 
-static void cc_pump(void)
+/* `new C()` -> spawn an actor process; returns its id (== g_obj index). */
+static long cc_actor_new(void) { return (long)ap_spawn(); }
+
+/* `select { case m(v): ... }` runtime: block until one of m0..m{n-1}
+ * arrives, stash its args for cc_sel_arg, and return the matched method. */
+static long g_sel[4];
+static long cc_select(long self, long n, long m0, long m1, long m2, long m3)
 {
-    if (!g_active_dispatch) return;
-    while (g_msgq_head != g_msgq_tail) {
-        if (cc_now() >= g_deadline) { g_aborted = 1; break; }
-        int h = g_msgq_head; g_msgq_head = (g_msgq_head + 1) % MSGQ_MAX;
-        g_active_dispatch(g_msgq[h].to, g_msgq[h].mid,
-                          g_msgq[h].a0, g_msgq[h].a1, g_msgq[h].a2, g_msgq[h].a3);
-    }
+    long meths[4] = { m0, m1, m2, m3 };
+    struct ap_msg m;
+    long meth = ap_select(self, (int)n, meths, &m);
+    g_sel[0] = m.a0; g_sel[1] = m.a1; g_sel[2] = m.a2; g_sel[3] = m.a3;
+    return meth;
 }
+static long cc_sel_arg(long i) { return (i >= 0 && i < 4) ? g_sel[i] : v_int(0); }
 
 unsigned long cc_resolve_extern(const char *name)
 {
@@ -342,6 +342,9 @@ unsigned long cc_resolve_extern(const char *name)
         { "v_truthy",   (void *)&v_truthy_x   },
         { "v_int_of",   (void *)&v_int_of     },
         { "enqueue",    (void *)&cc_enqueue   },
+        { "cc_actor_new",(void *)&cc_actor_new},
+        { "cc_select",  (void *)&cc_select    },
+        { "cc_sel_arg", (void *)&cc_sel_arg   },
         { 0, 0 }
     };
     for (int i = 0; tab[i].n; i++) {
@@ -399,11 +402,13 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     cc_sync_icache(code, (unsigned long)len);
     cc_set_deadline();
     vheap_reset();              /* fresh string-concat heap for this run */
-    msgq_reset();
+    ap_reset();                 /* fresh actor set */
     g_active_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
+    ap_set_dispatch(g_active_dispatch);
     long (*entryfn)(void) = (long (*)(void))(code + entry);
-    long rc = entryfn();
-    cc_pump();                  /* drain asynchronous `send` messages */
+    long rc = entryfn();        /* main(): spawn actor processes + send */
+    ap_run();                   /* drive actor processes until quiescent */
+    ap_killall();               /* one-shot: reap the actor processes */
     g_active_dispatch = 0;
     if (retval) *retval = rc;
 
@@ -474,6 +479,7 @@ static long (*g_res_nobj)(void);
 
 static void res_free(void)
 {
+    ap_killall();                        /* reap the previous resident's actor processes */
     if (g_res_code)  kfree(g_res_code);
     if (g_res_arena) kfree(g_res_arena);
     g_res_code = 0; g_res_arena = 0;
@@ -527,12 +533,13 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
      * drain any asynchronous `send` cascade it kicked off. */
     cc_set_deadline();
     vheap_reset();
-    msgq_reset();
+    ap_reset();
     g_active_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
+    ap_set_dispatch(g_active_dispatch);
     g_cap = out; g_capcap = outcap; g_caplen = 0; if (outcap > 0) out[0] = 0;
     long (*mainfn)(void) = (long (*)(void))(code + entry);
-    mainfn();
-    cc_pump();
+    mainfn();                   /* spawn actor processes + initial sends */
+    ap_run();                   /* drive them; actors persist (blocked) for /actor/send */
     if (g_cap) g_cap[(g_caplen < g_capcap) ? g_caplen : (g_capcap - 1)] = 0;
     g_cap = 0;
 
@@ -582,9 +589,11 @@ int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int ou
 
     long res = g_res_dispatch((long)actor, mid, v_int(arg), v_int(0), v_int(0), v_int(0));
 
-    /* Drain any asynchronous `send`s the handler triggered. */
+    /* Drain any asynchronous `send`s the handler triggered (delivered to
+     * the resident actor processes). */
     g_active_dispatch = g_res_dispatch;
-    cc_pump();
+    ap_set_dispatch(g_res_dispatch);
+    ap_run();
 
     char tmp[64];
     const char *r = v_render(res, tmp, sizeof tmp);
