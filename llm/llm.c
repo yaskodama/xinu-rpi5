@@ -301,7 +301,7 @@ int llm_generate(const char *prompt, int steps, void (*sink)(char), int drain)
     }
 
     if (steps > C.seq_len) steps = C.seq_len;
-    int prev = 0, token = toks[0], pos = 0, produced = 0;
+    int token = toks[0], pos = 0, produced = 0;
     while (pos < steps) {
         float *logits = forward(token, pos);
         int next;
@@ -309,8 +309,8 @@ int llm_generate(const char *prompt, int steps, void (*sink)(char), int drain)
         else next = argmax(logits, C.vocab_size);     /* generate */
         pos++;
         if (next == 1 || next == 2) break;            /* BOS/EOS -> stop */
-        emit_piece(prev, next);
-        prev = token; token = next; produced++;
+        emit_piece(token, next);                      /* `token` precedes `next` */
+        token = next; produced++;
         if (g_drain) net_drain();                     /* keep the RX ring from overflowing */
     }
     return produced;
