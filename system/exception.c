@@ -66,6 +66,40 @@ static void recover_spin(void)
     for (;;) __asm__ volatile ("wfi");             /* timer preempts us -> other procs run */
 }
 
+/* Fault-resilient MMIO probe (USB/xHCI bring-up: we don't know which register
+ * writes will fault on a gated PCIe controller, and each box-lockout costs a
+ * power cycle).  safe_mmio_*() arms a setjmp around the access; on a sync
+ * fault, sync_handler_default longjmps back here with a non-zero return so the
+ * caller sees -1 instead of the worker getting stuck in recover_spin.  IRQs
+ * are re-enabled before longjmp so the scheduler doesn't stall. */
+volatile int  g_probe_active;
+void *g_probe_jmp[5];                              /* __builtin_jmp_buf storage */
+
+int safe_mmio_read32(unsigned long addr, unsigned int *out)
+{
+    if (__builtin_setjmp(g_probe_jmp) == 0) {
+        g_probe_active = 1;
+        unsigned int v = *(volatile unsigned int *)addr;
+        g_probe_active = 0;
+        *out = v;
+        return 0;
+    }
+    g_probe_active = 0;
+    return -1;
+}
+
+int safe_mmio_write32(unsigned long addr, unsigned int val)
+{
+    if (__builtin_setjmp(g_probe_jmp) == 0) {
+        g_probe_active = 1;
+        *(volatile unsigned int *)addr = val;
+        g_probe_active = 0;
+        return 0;
+    }
+    g_probe_active = 0;
+    return -1;
+}
+
 static void dump_and_halt(const char *kind)
 {
     capture(kind);
@@ -77,6 +111,14 @@ __attribute__((used))
 void sync_handler_default(void)
 {
     capture("sync exception");
+    if (g_probe_active) {
+        /* A safe_mmio_*() probe armed the trap.  Unmask IRQs (entry masked
+         * them) and longjmp back so the caller sees -1, instead of being
+         * stranded in recover_spin and wedging the app worker. */
+        g_probe_active = 0;
+        __asm__ volatile ("msr daifclr, #2" ::: "memory");
+        __builtin_longjmp(g_probe_jmp, 1);    /* never returns */
+    }
     uart_puts("Recovering (box stays up; read /fault).\n");
     recover_spin();
 }

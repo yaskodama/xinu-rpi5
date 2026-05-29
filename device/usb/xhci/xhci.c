@@ -117,6 +117,9 @@ static int s_puthex32(char *b, int p, int max, unsigned int v)
     }
     return p;
 }
+/* Fault-resilient MMIO read (system/exception.c).  Returns 0 / -1. */
+extern int safe_mmio_read32(unsigned long addr, unsigned int *out);
+
 int xhci_pcie_dump_html(char *out, int max)
 {
     int p = 0;
@@ -135,7 +138,12 @@ int xhci_pcie_dump_html(char *out, int max)
     for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); i++) {
         p = s_put(out, p, max, regs[i].name);
         p = s_put(out, p, max, " = ");
-        p = s_puthex32(out, p, max, PCIE_REG(regs[i].off));
+        unsigned int v;
+        if (safe_mmio_read32(PCIE_BASE + regs[i].off, &v) == 0) {
+            p = s_puthex32(out, p, max, v);
+        } else {
+            p = s_put(out, p, max, "FAULT");
+        }
         p = s_put(out, p, max, "\n");
     }
     if (p < max) out[p] = 0;
