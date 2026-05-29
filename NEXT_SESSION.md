@@ -1,5 +1,46 @@
 # NEXT_SESSION — xinu-rpi4
 
+## 🎯 NEXT — USB driver (Pi 4 xHCI/VL805) + HID keyboard & mouse  ★ユーザ次回主目標
+
+Pi 4 (BCM2711) で USB-A キーボード/マウスを使えるようにする。現在の Xinu は USB スタック無し
+（banner 旧版に "no input -- HDMI-only demo (no USB stack)" があった通り）。
+
+**Pi 4 の USB 構成**: ボード上の USB-A 2.0/3.0 ポートは **VL805**（PCIe 経由の xHCI 1.0 USB 3.0 コントローラ）。
+DWC2 ではない（USPi は DWC2 専用なので使えない）。EEPROM ファームウェアの VL805 への注入は Pi
+ブートローダが行うので、カーネル側は PCIe を上げて xHCI を喋れば良い。
+
+**既存の足場**: `include/xhci.h` / `include/usb.h` のスタブ、`loader/main.c::xhci_keyboard_event(char)` フック、
+`device/video/shellwin.c::shellwin_handle_key(char)` の受け口（フック→shell window へ流す配線済み）。
+USPi は除去済み（main.c 273-行コメント "USPi is gone — Pi 4 USB-A needs xHCI"）。
+
+**スコープ（段階）**:
+1. **PCIe RC を起動**（BCM2711 PCIe ホストブリッジ初期化 / mmio マッピング / VL805 デバイス検出）
+2. **xHCI コントローラ初期化**（Operational/Runtime レジスタ、Command Ring、Event Ring、Device Context Base Array、IRQ 配線=GIC SPI）
+3. **USB バス列挙**（GetDescriptor / SetAddress / SetConfiguration）
+4. **HID クラス**（boot protocol：キーボード 8-byte report、マウス 4-byte report）
+5. **scancode → ASCII** マップ → `xhci_keyboard_event(c)` → 既存 `shellwin_handle_key` で shell へ
+6. （任意）マウスイベント → `wm_cursor_set` 等に配線
+
+**参考実装**: Linux drivers/usb/host/xhci.c, xhci-pci.c; USPi → 代替に circle (https://github.com/rsta2/circle)
+の lib/usb/xhci*.cpp が Pi 4 で動く xHCI 実装として最良の参考。Pi 4 の PCIe / VL805 初期化は
+linux/arch/arm64/boot/dts/broadcom/bcm2711.dtsi + drivers/pci/controller/pcie-brcmstb.c。
+
+**この作業の前提条件（注意）**:
+- カーネルは preemptive networking 含み大きくなっている。USB は IRQ 駆動なので GIC ルーティングを増やす。
+- ブートローダ設定（config.txt の `start_x=1` や `dtoverlay=disable-bt` 等）が必要かもしれない — VL805 が
+  ファームウェアロード後に PCIe に現れるタイミングに注意。
+- 大規模なので段階毎に flash & 実機検証（USB マウスを挿して mouse desc が読めるか、HID report が来るか）。
+- xHCI の MMIO レジスタ仕様は Intel xHCI 1.2 spec。
+
+## 中断時点の状態（2026-05-30）
+
+- branch **`wip/actor-preempt-on-monitor`** tip `74ba179`（pushed）。
+- aipl プロセス基盤あり（dormant）。/llm は実証済み経路（条件付きゲート＋drain）で 40/40 健全。
+- 残課題（actor 系）: 並行二重リクエスト・aipl forward 固着・FP/SIMD ctxsw 退避（下記項目参照）。
+- USB 着手するなら **mainline / 新ブランチ**を切ったほうが綺麗（preemption arc と独立）。提案ブランチ名: `feat/xhci-usb-hid`。
+
+
+
 ## ✅/⏳ 2026-05-29 — ★アクター・プリエンプション wedge 解消（MultiAgent 連打）＋残エッジ特定★実機検証済
 
 branch **`wip/actor-preempt-on-monitor`**（= `wip/actor-preempt-vheap-lock` を Runtime 監視ベースに合流）。
