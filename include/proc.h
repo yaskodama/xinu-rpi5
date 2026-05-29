@@ -60,6 +60,9 @@ void proc_exit(void);
 void proc_set_preempt(int on);
 void proc_resched_request(void);
 void proc_preempt(void);
+/* Live runtime accessors (read by the HDMI runtime monitor). */
+int           proc_preempt_on(void);
+unsigned long proc_ctxsw_count(void);
 /* Block the current process (removes it from CURR; resched won't re-ready
  * it) until proc_ready() puts it back.  Used by mailbox receive. */
 void proc_block(void);

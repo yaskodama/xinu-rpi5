@@ -1,5 +1,21 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-29 — ★HDMI 生存型ランタイム監視（案①）★実機検証済
+
+保留中のアクター・プリエンプション wedge を将来追うための前提＝「**計器は固着し得る経路の外**」。
+app ワーカー(=HTTP サーバ兼 vheap ユーザ)が固まると HTTP 診断ごと死ぬので、**wm(NULLPROC, 非 preempt)が
+毎フレーム描く専用「Runtime」窓**に app ワーカーの生状態を表示する。HTTP が死んでも画面は生き続ける。
+- **heartbeat** が肝: `app_beat()`(tcp_server.c)を**リクエスト開始時**＋**LLM トークン毎**(llm.c, weak)に加算。
+  win_runtime が毎フレーム前値と比較し、`app=WORKING` かつ heartbeat 停止＝**STALL(赤)=wedge** を可視化。
+  前進中=ALIVE(緑)、待機=idle(灰)。
+- 表示(全て wm 描画で生存): app_state(IDLE/QUEUED/WORKING/DONE)・hb・ALIVE/STALL・pre(=proc_preempt_on)・
+  sw(ctxsw 数)・served・girq。新アクセサ: proc.c `proc_preempt_on`/`proc_ctxsw_count`(g_ctxsw を proc_resched で加算)、
+  tcp_server.c `app_beat`/`rt_app_state`/`rt_served`/`rt_heartbeat`。Runtime 窓は Graphics 上部(glass の上)に最前面。
+- **実機検証**: /llm?n=256 で served 増加・app 動作、/netpreempt?on=1 で pre=ON、girq 生存。`/netstat` が常に
+  WORKING を返すのは「その /netstat 自身を app ワーカーが処理中」だから＝HTTP では idle を観測不能＝HDMI 監視の意義。
+- 次: これを土台に `wip/actor-preempt-vheap-lock` を再開し、MultiAgent wedge 時に Runtime 窓で固着点(app_state /
+  hb 停止)を観測する。さらに進捗 watchdog(一定 hb 停止で画面に最後の通過点をダンプ)も載せられる。
+
 ## ⏸️ 2026-05-29 — アクターへのプリエンプション拡張（vheap ロック）★保留・実機 wedge
 
 AIPL アクターを安全にプリエンプト可能にすべく vheap spin-yield ミューテックス（Option A）を試作したが、

@@ -176,6 +176,11 @@ extern int  tcp_app_req_pending(void);
 extern int  tcp_app_work(void);     /* run cc/llm for the queued request   */
 extern void tcp_app_flush(void);    /* send the finished response          */
 
+/* Live runtime state for the HDMI monitor in win_banner (tcp_server.c). */
+extern int           rt_app_state(void);   /* 0=IDLE 1=QUEUED 2=WORKING 3=DONE */
+extern unsigned long rt_served(void);      /* responses flushed               */
+extern unsigned long rt_heartbeat(void);   /* app-worker forward-progress beat */
+
 static void waiter_kick(waiter_t *w)          /* from any context (IRQ-safe) */
 {
     unsigned long d = irq_save();
@@ -314,12 +319,13 @@ static void win_banner(window_t *self, unsigned int frame)
     int xb = self->x + 8;
     int yb = self->y + WM_TITLEBAR_H + 6;
     int LH = 12 * fs;
+    unsigned int bg = self->content_bg;
     draw_string_at(xb, yb,          "Xinu " BOARD_NAME " Window System",
-        0xFF00FF80U, self->content_bg);
-    draw_string_at(xb, yb + LH,     "B U M1 S0 X0 -- cooperative scheduler",
-        0xFFCCCCCCU, self->content_bg);
-    draw_string_at(xb, yb + 2 * LH, "no input -- HDMI-only demo (no USB stack)",
-        0xFF888888U, self->content_bg);
+        0xFF00FF80U, bg);
+    draw_string_at(xb, yb + LH,     "B U M1 S0 X0 -- net process + app worker (/netpreempt)",
+        0xFFCCCCCCU, bg);
+    draw_string_at(xb, yb + 2 * LH, "live runtime monitor -> the Runtime window",
+        0xFF888888U, bg);
 }
 
 /* Link state sampled once at boot (see the rationale where it is set):
@@ -460,6 +466,64 @@ static void win_status(window_t *self, unsigned int frame)
         draw_string_at(xb + 184*fs, yb + line*LH, tcp_state_str(), nfg, bg);
         line++;
     }
+}
+
+/* Runtime monitor — a LIVE, on-device-survivable view of the app worker.
+ * Drawn by the wm, which runs in NULLPROC and is never preempted, so it stays
+ * visible even when the app worker / HTTP path wedges (the diagnostic channel
+ * lives OUTSIDE the path that can wedge — the NEXT_SESSION lesson).  Read it as:
+ *   app=WORKING + heartbeat frozen (STALL) -> the worker is stuck mid-compute
+ *   app=IDLE/idle                          -> nothing queued (normal)
+ * A small dedicated panel; the layout designer can grow its font / resize it. */
+static void win_runtime(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int xb = self->x + 8;
+    int yb = self->y + WM_TITLEBAR_H + 6;
+    int LH = 12 * fs;
+    int line = 0;
+    unsigned int bg = self->content_bg;
+    static unsigned long last_hb = 0;
+    static const char *st[] = { "IDLE", "QUEUED", "WORKING", "DONE" };
+
+    int as = rt_app_state(); if (as < 0 || as > 3) as = 0;
+    unsigned long hb = rt_heartbeat();
+    int working = (as == 2);
+    int alive   = (hb != last_hb);
+    last_hb = hb;
+
+    char l[64]; int n;
+
+    draw_string_at(xb, yb + line*LH, "Runtime", 0xFF80FF80U, bg); line++;
+
+    /* app=<state>  + ALIVE/STALL/idle */
+    n = 0; { const char *a = "app="; while (*a) l[n++] = *a++;
+             const char *s = st[as]; while (*s) l[n++] = *s++; l[n] = 0; }
+    draw_string_at(xb, yb + line*LH, l, 0xFFFFFFFFU, bg);
+    {
+        const char *status; unsigned int scol;
+        if (working && !alive) { status = "STALL"; scol = 0xFFFF6060U; }   /* wedge! */
+        else if (alive)        { status = "ALIVE"; scol = 0xFF80FF80U; }
+        else                   { status = "idle";  scol = 0xFFAAAAAAU; }
+        draw_string_at(xb + 8*fs*(n + 1), yb + line*LH, status, scol, bg);
+    }
+    line++;
+
+    n = 0; kv_append(l, &n, "hb=", hb);
+    draw_string_at(xb, yb + line*LH, l, 0xFFCCCCCCU, bg); line++;
+
+    n = 0; { const char *a = "pre="; while (*a) l[n++] = *a++;
+             const char *s = proc_preempt_on() ? "ON" : "off"; while (*s) l[n++] = *s++;
+             l[n++] = ' '; }
+    kv_append(l, &n, "sw=", proc_ctxsw_count());
+    draw_string_at(xb, yb + line*LH, l, 0xFF80E0FFU, bg); line++;
+
+    n = 0; kv_append(l, &n, "served=", rt_served());
+    draw_string_at(xb, yb + line*LH, l, 0xFF80E0FFU, bg); line++;
+
+    n = 0; kv_append(l, &n, "girq=", genet_irq_count());
+    draw_string_at(xb, yb + line*LH, l, 0xFF80E0FFU, bg); line++;
 }
 
 static void win_anim(window_t *self, unsigned int frame)
@@ -818,6 +882,7 @@ static void win_actors(window_t *self, unsigned int frame)
 static window_t banner_win;
 static window_t actors_win;
 static window_t gfx_win;
+static window_t runtime_win;
 static window_t status_win;
 
 /* Graphics window — replays the actor-drawn line/circle command list (the
@@ -1179,10 +1244,10 @@ void kernel_main(void)
 
         /* Graphics window: right side of the 1024x768 screen.  AIPL actors
          * draw line segments / circles into it via the gfx_* builtins. */
-        gfx_win.x = 631;
-        gfx_win.y = 5;
-        gfx_win.width  = 375;
-        gfx_win.height = 744;
+        gfx_win.x = 624;
+        gfx_win.y = 118;
+        gfx_win.width  = 391;
+        gfx_win.height = 644;
         const char *gt = "Graphics";
         for (int i = 0; i < WM_TITLE_MAX && gt[i]; i++) gfx_win.title[i] = gt[i];
         gfx_win.chrome_color = 0xFF80FFC0U;
@@ -1191,6 +1256,23 @@ void kernel_main(void)
         gfx_win.content_bg   = 0xFF0A1014U;
         gfx_win.draw_content = win_gfx;
         wm_add(&gfx_win);
+
+        /* Runtime monitor: a compact live view of the app worker, sat over the
+         * top of the Graphics window (above the wine glass).  Added LAST so the
+         * wm paints it front-most and it is always readable. */
+        runtime_win.x = 630;
+        runtime_win.y = 0;
+        runtime_win.width  = 356;
+        runtime_win.height = 104;
+        runtime_win.font_scale = 1;
+        const char *rt = "Runtime";
+        for (int i = 0; i < WM_TITLE_MAX && rt[i]; i++) runtime_win.title[i] = rt[i];
+        runtime_win.chrome_color = 0xFFFFD060U;
+        runtime_win.title_bg     = 0xFF504010U;
+        runtime_win.title_fg     = 0xFFFFFFFFU;
+        runtime_win.content_bg   = 0xFF14100AU;
+        runtime_win.draw_content = win_runtime;
+        wm_add(&runtime_win);
 
         /* Start the cursor at the centre of the *screen* (not the
          * virtual desktop) so it stays in view as the viewport

@@ -144,6 +144,16 @@ static int          g_app_resp_len;
 static unsigned long g_app_served;     /* responses flushed (diagnostic)     */
 static int          g_net_preempt;     /* preemptive networking on/off        */
 
+/* App-worker heartbeat: bumped on each request and per LLM token (llm.c) so a
+ * wedge is visible on the HDMI runtime monitor even when HTTP is dead — if
+ * app_state == WORKING but the heartbeat stops advancing, the worker is stuck.
+ * Read by the wm in NULLPROC (which never wedges), so the channel survives. */
+volatile unsigned long g_app_heartbeat;
+void          app_beat(void)          { g_app_heartbeat++; }
+int           rt_app_state(void)      { return g_app_state; }
+unsigned long rt_served(void)         { return g_app_served; }
+unsigned long rt_heartbeat(void)      { return g_app_heartbeat; }
+
 /* Preemption control (system/proc.c) — toggled at runtime via /netpreempt
  * so preemptive networking can be enabled only after correctness is proven. */
 extern void proc_set_preempt(int on);
@@ -666,6 +676,7 @@ int tcp_app_work(void)
 {
     if (g_app_state != APP_QUEUED) return 0;
     g_app_state = APP_WORKING;
+    app_beat();                                 /* heartbeat: request started */
     g_app_resp_len = http_build(g_app_req, g_app_resp, (int)sizeof g_app_resp);
     __asm__ volatile ("dsb sy" ::: "memory");   /* resp visible before DONE */
     g_app_state = APP_DONE;

@@ -29,6 +29,9 @@ static void net_drain(void)
 
 extern const unsigned char model_data[];
 extern const unsigned char tok_data[];
+/* weak: HDMI runtime-monitor heartbeat (tcp_server.c); no-op on targets
+ * built without it so QEMU/Pi5 still link. */
+extern void app_beat(void) __attribute__((weak));
 
 /* ---------- tiny float helpers (no libm) ---------- */
 /* emit the AArch64 FP sqrt directly (no sqrtf libcall in this freestanding build) */
@@ -322,6 +325,7 @@ int llm_generate(const char *prompt, int max_new, void (*sink)(char), int drain,
             gen++;
         }
         token = next; pos++;
+        if (app_beat) app_beat();                     /* runtime-monitor heartbeat (per token) */
         if (g_drain) net_drain();                     /* keep the RX ring from overflowing */
     }
     return gen;

@@ -24,8 +24,14 @@ int            currpid;
  * proc_preempt() (run after the IRQ is EOI'd) acts on it. */
 static volatile int g_preempt_on;
 static volatile int g_resched_pending;
+static volatile unsigned long g_ctxsw;     /* context switches (live diagnostic) */
 void proc_set_preempt(int on)      { g_preempt_on = on ? 1 : 0; }
 void proc_resched_request(void)    { g_resched_pending = 1; }
+
+/* Live runtime accessors for the HDMI monitor (drawn by the wm in NULLPROC,
+ * so they stay visible even when the app worker / HTTP path wedges). */
+int           proc_preempt_on(void)  { return g_preempt_on; }
+unsigned long proc_ctxsw_count(void) { return g_ctxsw; }
 
 static struct procent *ready_head;
 static struct procent *ready_tail;
@@ -196,6 +202,7 @@ void proc_resched(void)
 
     newp->state = PR_CURR;
     currpid     = new_pid;
+    g_ctxsw++;
 
     ctxsw(&oldp->sp, newp->sp);
     /* Returns here when somebody ctxsw()'s back to us. */
