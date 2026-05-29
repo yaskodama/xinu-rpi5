@@ -13,8 +13,10 @@
 #ifndef XINU_RPI4_VIDEO_H
 #define XINU_RPI4_VIDEO_H
 
-#define SCREEN_WIDTH    640
-#define SCREEN_HEIGHT   480
+/* XGA 1024x768: a higher framebuffer res renders the 8x8 font smaller on the
+ * monitor and shows more of the 1280x960 virtual desktop. */
+#define SCREEN_WIDTH    1024
+#define SCREEN_HEIGHT   768
 #define SCREEN_DEPTH    32
 #define FONT_WIDTH      8
 #define FONT_HEIGHT     8
@@ -77,6 +79,29 @@ void draw_glyph_at(int px, int py, char c,
                    unsigned int fg, unsigned int bg);
 void draw_string_at(int px, int py, const char *s,
                     unsigned int fg, unsigned int bg);
+
+/* As above but each glyph is magnified `scale`x (nearest-neighbour); advances
+ * 8*scale px per character.  scale<=1 == the 1x path.  Used for per-window
+ * font sizing set by the AIPL layout designer. */
+void draw_glyph_scaled(int px, int py, char c,
+                       unsigned int fg, unsigned int bg, int scale);
+void draw_string_scaled(int px, int py, const char *s,
+                        unsigned int fg, unsigned int bg, int scale);
+
+/* Magnification applied to draw_string_at (set by the wm per window). */
+void video_set_text_scale(int s);
+int  video_text_scale(void);
+
+/* Actor graphics canvas: AIPL actors append line/circle commands (color =
+ * palette index 0..7); the Graphics window replays them via gfx_render()
+ * each frame, clipped to its content rect. */
+void gfx_clear(void);
+void gfx_line(int x0, int y0, int x1, int y1, int color);
+void gfx_circle(int cx, int cy, int r, int color);
+/* Draw a 3D wireframe wine glass (solid of revolution) tumbled by ax/ay/az
+ * degrees about the X/Y/Z axes; replaces the current command list each call. */
+void gfx_glass(int ax, int ay, int az);
+void gfx_render(int ox, int oy, int w, int h);
 
 /* Busy-wait based on the AArch64 generic timer (CNTPCT_EL0).
  * Used for animation pacing in wm_run(). */

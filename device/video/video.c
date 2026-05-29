@@ -261,6 +261,175 @@ void fill_rect(int x, int y, int w, int h, unsigned int color)
     }
 }
 
+/* ===================================================================
+ *  Actor graphics canvas.  AIPL actors append line/circle commands
+ *  (gfx_line / gfx_circle); the Graphics window replays the whole
+ *  list every frame via gfx_render() so the drawing survives the wm's
+ *  per-frame wipe.  Coordinates are window-content-relative; rendering
+ *  clips to the window's content rect (and the framebuffer).
+ * ===================================================================
+ */
+struct gfx_cmd { unsigned char type; int a, b, c, d; unsigned int color; };
+#define GFX_MAX 1024
+static struct gfx_cmd g_gfx[GFX_MAX];
+static int g_gfx_n;
+static const unsigned int gfx_palette[8] = {
+    0xFF101010U,  /* 0 near-black */ 0xFFFF5050U, /* 1 red    */
+    0xFF50FF50U,  /* 2 green      */ 0xFF5090FFU, /* 3 blue   */
+    0xFFFFFF50U,  /* 4 yellow     */ 0xFF50FFFFU, /* 5 cyan   */
+    0xFFFF50FFU,  /* 6 magenta    */ 0xFFFFFFFFU, /* 7 white  */
+};
+static unsigned int gfx_col(int idx) { return gfx_palette[(unsigned)idx & 7]; }
+
+/* one pixel, clipped to the content rect [clx,cly,clw,clh] AND the screen */
+static void gfx_pix(int x, int y, unsigned int color,
+                    int clx, int cly, int clw, int clh)
+{
+    if (x < clx || y < cly || x >= clx + clw || y >= cly + clh) return;
+    int sx = x - view_x, sy = y - view_y;
+    if (sx < 0 || sy < 0 || sx >= (int)fb_width || sy >= (int)fb_height) return;
+    *((unsigned int *)(fb_draw + sy * fb_pitch) + sx) = color;
+}
+
+static int iabs(int v) { return v < 0 ? -v : v; }
+
+static void gfx_seg(int x0, int y0, int x1, int y1, unsigned int color,
+                    int clx, int cly, int clw, int clh)
+{
+    int dx = iabs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -iabs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy, e2;
+    for (int guard = 0; guard < 8192; guard++) {        /* bound: never spin */
+        gfx_pix(x0, y0, color, clx, cly, clw, clh);
+        if (x0 == x1 && y0 == y1) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static void gfx_ring(int cx, int cy, int r, unsigned int color,
+                     int clx, int cly, int clw, int clh)
+{
+    if (r < 0) r = -r;
+    int x = r, y = 0, err = 1 - r;
+    while (x >= y) {
+        gfx_pix(cx + x, cy + y, color, clx, cly, clw, clh);
+        gfx_pix(cx + y, cy + x, color, clx, cly, clw, clh);
+        gfx_pix(cx - y, cy + x, color, clx, cly, clw, clh);
+        gfx_pix(cx - x, cy + y, color, clx, cly, clw, clh);
+        gfx_pix(cx - x, cy - y, color, clx, cly, clw, clh);
+        gfx_pix(cx - y, cy - x, color, clx, cly, clw, clh);
+        gfx_pix(cx + y, cy - x, color, clx, cly, clw, clh);
+        gfx_pix(cx + x, cy - y, color, clx, cly, clw, clh);
+        y++;
+        if (err < 0) err += 2 * y + 1;
+        else { x--; err += 2 * (y - x) + 1; }
+    }
+}
+
+void gfx_clear(void) { g_gfx_n = 0; }
+
+void gfx_line(int x0, int y0, int x1, int y1, int color)
+{
+    if (g_gfx_n >= GFX_MAX) return;
+    struct gfx_cmd *c = &g_gfx[g_gfx_n++];
+    c->type = 1; c->a = x0; c->b = y0; c->c = x1; c->d = y1; c->color = gfx_col(color);
+}
+
+void gfx_circle(int cx, int cy, int r, int color)
+{
+    if (g_gfx_n >= GFX_MAX) return;
+    struct gfx_cmd *c = &g_gfx[g_gfx_n++];
+    c->type = 2; c->a = cx; c->b = cy; c->c = r; c->d = 0; c->color = gfx_col(color);
+}
+
+/* ---- 3D wireframe wine glass (a solid of revolution) -------------------
+ * The bare-metal JIT has no libm, so a fixed-point sine table (sin*1024 for
+ * 0..90 deg) + symmetry give isin/icos.  gfx_glass(ax,ay,az) builds the glass
+ * fresh each call: a profile curve (radius vs height) revolved into a ring grid
+ * (GLASS_M heights x GLASS_N angles), then tumbled by rotating each vertex about
+ * all three axes (ay folds into the revolution = spin about Y; then about X by
+ * ax, then about Z by az), projected orthographically, then drawn as parallels
+ * (rings) + meridians (verticals).  One /actor/send drives a whole frame. */
+static const short sintab[91] = {
+       0,   18,   36,   54,   71,   89,  107,  125,  143,  160,
+     178,  195,  213,  230,  248,  265,  282,  299,  316,  333,
+     350,  367,  384,  400,  416,  433,  449,  465,  481,  496,
+     512,  527,  543,  558,  573,  587,  602,  616,  630,  644,
+     658,  672,  685,  698,  711,  724,  737,  749,  761,  773,
+     784,  796,  807,  818,  828,  839,  849,  859,  868,  878,
+     887,  896,  904,  912,  920,  928,  935,  943,  949,  956,
+     962,  968,  974,  979,  984,  989,  994,  998, 1002, 1005,
+    1008, 1011, 1014, 1016, 1018, 1020, 1022, 1023, 1023, 1024,
+    1024,
+};
+static int isin(int deg)
+{
+    deg %= 360; if (deg < 0) deg += 360;
+    if (deg <=  90) return  sintab[deg];
+    if (deg <= 180) return  sintab[180 - deg];
+    if (deg <= 270) return -sintab[deg - 180];
+    return -sintab[360 - deg];
+}
+static int icos(int deg) { return isin(deg + 90); }
+
+#define GLASS_M 11        /* profile points (rim -> base)        */
+#define GLASS_N 16        /* angular segments around the axis    */
+
+void gfx_glass(int ax, int ay, int az)
+{
+    static const short gr[GLASS_M] = { 72, 71, 62, 48, 30, 12,  5,   5,   8,  45,  60 };
+    static const short gh[GLASS_M] = {150,120, 90, 60, 35, 10,-20, -90,-125,-148,-155 };
+    const int cx = 185, cy = 370;          /* centre, window-content coords  */
+    const int cxr = icos(ax), sxr = isin(ax);   /* rotation about X (degrees) */
+    const int czr = icos(az), szr = isin(az);   /* rotation about Z (degrees) */
+    int px[GLASS_M * GLASS_N], py[GLASS_M * GLASS_N];
+
+    gfx_clear();
+    for (int i = 0; i < GLASS_M; i++) {
+        for (int j = 0; j < GLASS_N; j++) {
+            int th = (j * 360) / GLASS_N + ay;          /* revolve + spin about Y */
+            int x  = gr[i] * icos(th) / 1024;
+            int y  = gh[i];
+            int z  = gr[i] * isin(th) / 1024;
+            int y1 = (y  * cxr - z  * sxr) / 1024;       /* rotate about X */
+            int z1 = (y  * sxr + z  * cxr) / 1024;
+            int x2 = (x  * czr - y1 * szr) / 1024;       /* rotate about Z */
+            int y2 = (x  * szr + y1 * czr) / 1024;
+            (void)z1;                                    /* depth unused (orthographic) */
+            px[i * GLASS_N + j] = cx + x2;
+            py[i * GLASS_N + j] = cy - y2;
+        }
+    }
+    /* parallels: the ring at each profile height (cyan) */
+    for (int i = 0; i < GLASS_M; i++)
+        for (int j = 0; j < GLASS_N; j++) {
+            int a = i * GLASS_N + j, b = i * GLASS_N + (j + 1) % GLASS_N;
+            gfx_line(px[a], py[a], px[b], py[b], 5);
+        }
+    /* meridians: the profile curve at each angle (yellow) */
+    for (int j = 0; j < GLASS_N; j++)
+        for (int i = 0; i < GLASS_M - 1; i++) {
+            int a = i * GLASS_N + j, b = (i + 1) * GLASS_N + j;
+            gfx_line(px[a], py[a], px[b], py[b], 4);
+        }
+}
+
+/* Replay the command list into a window content area at (ox,oy) of size w×h.
+ * Command coordinates are relative to (ox,oy). */
+void gfx_render(int ox, int oy, int w, int h)
+{
+    if (!fb_ready) return;
+    for (int i = 0; i < g_gfx_n; i++) {
+        struct gfx_cmd *c = &g_gfx[i];
+        if (c->type == 1)
+            gfx_seg(ox + c->a, oy + c->b, ox + c->c, oy + c->d, c->color, ox, oy, w, h);
+        else if (c->type == 2)
+            gfx_ring(ox + c->a, oy + c->b, c->c, c->color, ox, oy, w, h);
+    }
+}
+
 void draw_rect(int x, int y, int w, int h, unsigned int color)
 {
     /* Express the four edges as 1-px-thick fill_rects — they
@@ -299,13 +468,67 @@ void draw_glyph_at(int px, int py, char c,
     }
 }
 
+/* Current text magnification for draw_string_at — the wm sets this to the
+ * window's font_scale around each draw_content() so existing 1x-written
+ * windows scale their glyphs without changing every call (they still must
+ * scale their own line/column spacing).  Default 1. */
+static int g_text_scale = 1;
+void video_set_text_scale(int s) { g_text_scale = (s < 1) ? 1 : (s > 4 ? 4 : s); }
+int  video_text_scale(void)      { return g_text_scale; }
+
 void draw_string_at(int px, int py, const char *s,
                     unsigned int fg, unsigned int bg)
 {
     if (!fb_ready) return;
+    int sc = g_text_scale;
     while (*s) {
-        draw_glyph_at(px, py, *s, fg, bg);
-        px += FONT_WIDTH;
+        draw_glyph_scaled(px, py, *s, fg, bg, sc);
+        px += FONT_WIDTH * sc;
+        s++;
+    }
+}
+
+/* Magnified glyph: each 8x8 font pixel becomes a scale x scale block
+ * (nearest-neighbour).  scale<=1 falls back to the 1x path. */
+void draw_glyph_scaled(int px, int py, char c,
+                       unsigned int fg, unsigned int bg, int scale)
+{
+    if (!fb_ready) return;
+    if (scale <= 1) { draw_glyph_at(px, py, c, fg, bg); return; }
+    unsigned char ci = (unsigned char)c;
+    if (ci < 0x20 || ci > 0x7F) ci = '?';
+    const unsigned char *glyph = font8x8[ci - 0x20];
+
+    int sx = px - view_x;
+    int sy = py - view_y;
+    if (sx >= (int)fb_width || sy >= (int)fb_height) return;
+    if (sx + FONT_WIDTH * scale <= 0 || sy + FONT_HEIGHT * scale <= 0) return;
+
+    for (int gy = 0; gy < FONT_HEIGHT; gy++) {
+        unsigned char bits = glyph[gy];
+        for (int sj = 0; sj < scale; sj++) {
+            int rsy = sy + gy * scale + sj;
+            if (rsy < 0 || rsy >= (int)fb_height) continue;
+            unsigned int *line = (unsigned int *)(fb_draw + rsy * fb_pitch);
+            for (int gx = 0; gx < FONT_WIDTH; gx++) {
+                unsigned int col = (bits & (0x80 >> gx)) ? fg : bg;
+                for (int si = 0; si < scale; si++) {
+                    int rsx = sx + gx * scale + si;
+                    if (rsx < 0 || rsx >= (int)fb_width) continue;
+                    line[rsx] = col;
+                }
+            }
+        }
+    }
+}
+
+void draw_string_scaled(int px, int py, const char *s,
+                        unsigned int fg, unsigned int bg, int scale)
+{
+    if (scale < 1) scale = 1;
+    while (*s) {
+        draw_glyph_scaled(px, py, *s, fg, bg, scale);
+        px += FONT_WIDTH * scale;
         s++;
     }
 }

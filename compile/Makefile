@@ -77,7 +77,7 @@ INCLUDE = -I../include -I../extern/xinu-raz-include
 # -mstrict-align makes the compiler never emit an unaligned access, which
 # removes that whole class of landmine kernel-wide.
 COMMON  = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
-          -mgeneral-regs-only -mstrict-align $(INCLUDE)
+          -mgeneral-regs-only -mstrict-align $(INCLUDE) -MMD -MP
 
 # Pi 5 (BCM2712, Cortex-A76).  Peripheral base 0x107C000000; PL011 at
 # 0x107D001000; mailbox at 0x107C00B880 (best-effort, unverified on
@@ -205,3 +205,8 @@ clean:
 	rm -rf obj kernel_*.elf kernel_*.img kernel8.elf kernel8.img qemu-smoke.log
 
 .PHONY: all pi4 pi5 qemu qemu-run qemu-smoke install install_pi4 install_pi5 clean
+
+# Auto-generated header dependencies (-MMD): a change to e.g. a struct in a
+# header now recompiles every .c that includes it, instead of leaving stale
+# objects with a mismatched layout (which silently boot-crashed the Pi).
+-include $(wildcard obj/pi4/*.d obj/pi5/*.d obj/qemu/*.d)

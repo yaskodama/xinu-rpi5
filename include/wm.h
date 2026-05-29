@@ -23,6 +23,10 @@ typedef struct window {
     int           width, height;
     char          title[WM_TITLE_MAX + 1];
 
+    /* Per-window content font magnification (1 = 8x8 default; set by the
+     * AIPL layout designer via wm_window_font()).  0 is treated as 1. */
+    int           font_scale;
+
     /* ARGB colours for the window chrome and content background. */
     unsigned int  chrome_color;
     unsigned int  title_bg;
@@ -41,6 +45,17 @@ typedef struct window {
  * everything previously added, so later windows are "on top" in
  * draw order, though we don't currently overlap them). */
 void wm_add(window_t *w);
+
+/* Runtime window geometry — driven by the AIPL screen-layout designer.
+ * Windows are addressed by their add order (0-based).  move/resize take
+ * effect on the next frame; resize ignores dimensions < 24 px. */
+int wm_window_count(void);
+int wm_window_move(int idx, int x, int y);
+int wm_window_resize(int idx, int w, int h);
+int wm_window_name(int idx, char *out, int cap);
+int wm_window_get(int idx, int *x, int *y, int *w, int *h);
+int wm_window_font(int idx, int scale);   /* set content font magnification (1..4) */
+int wm_window_fontscale(int idx);          /* current scale, or 1 */
 
 /* Main loop.  Clears the desktop to a dark background, walks the
  * window list, and redraws frame by frame at ~20 fps.  Never

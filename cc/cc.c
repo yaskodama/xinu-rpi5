@@ -395,6 +395,54 @@ static void cc_enqueue(long to, long mid, long a0, long a1, long a2, long a3)
 /* `new C()` -> spawn an actor process; returns its id (== g_obj index). */
 static long cc_actor_new(void) { return (long)ap_spawn(); }
 
+/* Window-layout builtins (device/video/wm.c) — let an AIPL "Layout" actor
+ * reposition the on-screen windows, driven by the Py-I screen designer.
+ * Args arrive as value_t ints; idx is the window's add order (0-based). */
+extern int wm_window_count(void);
+extern int wm_window_move(int idx, int x, int y);
+extern int wm_window_resize(int idx, int w, int h);
+extern int wm_window_font(int idx, int scale);
+static long cc_win_move(long id, long x, long y)
+{
+    wm_window_move((int)v_int_of(id), (int)v_int_of(x), (int)v_int_of(y));
+    return v_int(0);
+}
+static long cc_win_resize(long id, long w, long h)
+{
+    wm_window_resize((int)v_int_of(id), (int)v_int_of(w), (int)v_int_of(h));
+    return v_int(0);
+}
+static long cc_win_font(long id, long scale)
+{
+    wm_window_font((int)v_int_of(id), (int)v_int_of(scale));
+    return v_int(0);
+}
+static long cc_win_count(void) { return v_int(wm_window_count()); }
+
+/* Actor graphics (device/video/video.c) — draw into the Graphics window. */
+extern void gfx_clear(void);
+extern void gfx_line(int x0, int y0, int x1, int y1, int color);
+extern void gfx_circle(int cx, int cy, int r, int color);
+extern void gfx_glass(int ax, int ay, int az);
+static long cc_gfx_clear(void) { gfx_clear(); return v_int(0); }
+static long cc_gfx_glass(long ax, long ay, long az)
+{
+    gfx_glass((int)v_int_of(ax), (int)v_int_of(ay), (int)v_int_of(az));
+    return v_int(0);
+}
+static long cc_gfx_line(long x0, long y0, long x1, long y1, long col)
+{
+    gfx_line((int)v_int_of(x0), (int)v_int_of(y0), (int)v_int_of(x1),
+             (int)v_int_of(y1), (int)v_int_of(col));
+    return v_int(0);
+}
+static long cc_gfx_circle(long cx, long cy, long r, long col)
+{
+    gfx_circle((int)v_int_of(cx), (int)v_int_of(cy), (int)v_int_of(r),
+               (int)v_int_of(col));
+    return v_int(0);
+}
+
 /* `now obj.m(args)` inside a method -> synchronous call: block this actor
  * until the target replies with its return value. */
 static long cc_call(long self, long to, long method, long a0, long a1, long a2, long a3)
@@ -492,6 +540,14 @@ unsigned long cc_resolve_extern(const char *name)
         { "v_int_of",   (void *)&v_int_of     },
         { "enqueue",    (void *)&cc_enqueue   },
         { "cc_actor_new",(void *)&cc_actor_new},
+        { "cc_win_move",  (void *)&cc_win_move  },
+        { "cc_win_resize",(void *)&cc_win_resize},
+        { "cc_win_font",  (void *)&cc_win_font  },
+        { "cc_win_count", (void *)&cc_win_count },
+        { "cc_gfx_clear", (void *)&cc_gfx_clear },
+        { "cc_gfx_glass", (void *)&cc_gfx_glass },
+        { "cc_gfx_line",  (void *)&cc_gfx_line  },
+        { "cc_gfx_circle",(void *)&cc_gfx_circle},
         { "cc_call",    (void *)&cc_call      },
         { "cc_select",  (void *)&cc_select    },
         { "cc_sel_arg", (void *)&cc_sel_arg   },
@@ -644,6 +700,7 @@ static long (*g_res_methodid)(long);
 static long (*g_res_nobj)(void);
 static long (*g_res_clsname)(long);     /* __cls_name(cls) -> v_str  */
 static long (*g_res_objcls)(long);      /* __obj_cls(id)   -> v_int  */
+static long (*g_res_objfield)(long, long); /* __obj_field(id,fidx) -> value_t */
 
 static void res_free(void)
 {
@@ -652,7 +709,7 @@ static void res_free(void)
     if (g_res_arena) kfree(g_res_arena);
     g_res_code = 0; g_res_arena = 0;
     g_res_dispatch = 0; g_res_methodid = 0; g_res_nobj = 0;
-    g_res_clsname = 0; g_res_objcls = 0;
+    g_res_clsname = 0; g_res_objcls = 0; g_res_objfield = 0;
 }
 
 int cc_actor_load(const char *src, int srclen, char *out, int outcap)
@@ -698,6 +755,7 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     int aoff = cc_func_offset("apply");
     int cnoff = cc_func_offset("__cls_name");
     int ocoff = cc_func_offset("__obj_cls");
+    int ofoff = cc_func_offset("__obj_field");
 
     cc_sync_icache(code, (unsigned long)len);
 
@@ -727,6 +785,7 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     g_res_nobj     = (noff >= 0) ? (void *)(code + noff) : 0;
     g_res_clsname  = (cnoff >= 0) ? (void *)(code + cnoff) : 0;
     g_res_objcls   = (ocoff >= 0) ? (void *)(code + ocoff) : 0;
+    g_res_objfield = (ofoff >= 0) ? (void *)(code + ofoff) : 0;
 
     /* Append the actor count. */
     long nobj = g_res_nobj ? v_int_of(g_res_nobj()) : 0;
@@ -741,7 +800,8 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     return 0;
 }
 
-int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int outcap)
+int cc_actor_send_msg(int actor, const char *method, long a0, long a1, long a2,
+                      char *out, int outcap)
 {
     if (!g_res_dispatch || !g_res_methodid) {
         const char *m = "no resident actor program (POST /actor/load first)\n";
@@ -764,7 +824,7 @@ int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int ou
         return -1;
     }
 
-    long res = g_res_dispatch((long)actor, mid, v_int(arg), v_int(0), v_int(0), v_int(0));
+    long res = g_res_dispatch((long)actor, mid, v_int(a0), v_int(a1), v_int(a2), v_int(0));
     ap_note_msg(actor);
 
     /* Drain any asynchronous `send`s the handler triggered (delivered to
@@ -834,6 +894,15 @@ int cc_actor_name(int apid, char *out, int cap)
     return n;
 }
 
+/* Integer value of field `fidx` of resident actor `apid` (declaration order:
+ * for the Philosopher class field 1 is the meal count).  Returns -1 if there
+ * is no resident program / no field accessor.  Used by the Actors window. */
+long cc_actor_field(int apid, int fidx)
+{
+    if (!g_res_objfield) return -1;
+    return v_int_of(g_res_objfield((long)apid, (long)fidx));
+}
+
 /* ---- shell front-ends (also let the HTTP-only feature be tested on QEMU) ---- */
 
 static int cc_atoi(const char *s)
@@ -861,7 +930,7 @@ int cmd_amsg(int argc, char **argv)
     int  actor = cc_atoi(argv[1]);
     long arg   = (argc >= 4) ? cc_atoi(argv[3]) : 0;
     static char out[256];
-    cc_actor_send_msg(actor, argv[2], arg, out, sizeof out);
+    cc_actor_send_msg(actor, argv[2], arg, 0, 0, out, sizeof out);
     uart_puts(out); uart_puts("\n");
     return 0;
 }

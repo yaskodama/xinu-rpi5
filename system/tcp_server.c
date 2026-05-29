@@ -29,6 +29,12 @@ extern int preempt_demo(char *out, int outcap);
 /* GENET RX interrupt fire counter (device/genet/genet.c) — for /genetirq diag. */
 extern unsigned long genet_irq_count(void);
 
+/* wm window inventory (device/video/wm.c) — for the /windows layout designer. */
+extern int wm_window_count(void);
+extern int wm_window_get(int idx, int *x, int *y, int *w, int *h);
+extern int wm_window_name(int idx, char *out, int cap);
+extern int wm_window_fontscale(int idx);
+
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
 /* --- byte/checksum helpers (duplicated, intentionally — keeps
@@ -513,6 +519,28 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " served=");    bl = s_putdec(body, bl, (long)g_app_served);
         bl = s_put(body, bl, " preempt=");   bl = s_put(body, bl, g_net_preempt ? "on" : "off");
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /windows") || starts_with(req, "POST /windows")) {
+        /* Read-only window inventory for the Py-I layout designer: id, name,
+         * and current geometry of every wm window (JSON). */
+        ctype = "application/json";
+        int nw = wm_window_count();
+        bl = s_put(body, bl, "[");
+        for (int i = 0; i < nw; i++) {
+            int x = 0, y = 0, ww = 0, hh = 0;
+            char nm[40];
+            wm_window_get(i, &x, &y, &ww, &hh);
+            if (wm_window_name(i, nm, sizeof nm) < 0) nm[0] = 0;
+            if (i) bl = s_put(body, bl, ",");
+            bl = s_put(body, bl, "{\"id\":");   bl = s_putdec(body, bl, i);
+            bl = s_put(body, bl, ",\"name\":\""); bl = s_put(body, bl, nm);
+            bl = s_put(body, bl, "\",\"x\":");   bl = s_putdec(body, bl, x);
+            bl = s_put(body, bl, ",\"y\":");     bl = s_putdec(body, bl, y);
+            bl = s_put(body, bl, ",\"w\":");     bl = s_putdec(body, bl, ww);
+            bl = s_put(body, bl, ",\"h\":");     bl = s_putdec(body, bl, hh);
+            bl = s_put(body, bl, ",\"fs\":");    bl = s_putdec(body, bl, wm_window_fontscale(i));
+            bl = s_put(body, bl, "}");
+        }
+        bl = s_put(body, bl, "]");
     } else if (starts_with(req, "POST /chat") || starts_with(req, "GET /chat")) {
         /* Converse with a resident actor: deliver the message (POST body or
          * ?m= for GET) as a STRING to actor 0's `say` method and return its
@@ -556,15 +584,18 @@ static int http_build(const char *req, char *out, int max)
         cc_actor_load(asrc, aslen, ares, sizeof ares);
         bl = s_put(body, bl, ares);
     } else if (path_eq(req, "/actor/send")) {
-        /* Exchange a message with a resident actor:
-         *   GET /actor/send?to=<id>&m=<method>&arg=<n> */
+        /* Exchange a message with a resident actor.  Up to 3 int args:
+         *   GET /actor/send?to=<id>&m=<method>&arg=<n>[&a1=<n>&a2=<n>]
+         * (arg == a0; a1/a2 let e.g. the Layout actor take move(id,x,y).) */
         ctype = "text/plain";
         int  to  = q_int(req, "to", 0);
-        int  arg = q_int(req, "arg", 0);
+        int  a0  = q_int(req, "arg", 0);
+        int  a1  = q_int(req, "a1", 0);
+        int  a2  = q_int(req, "a2", 0);
         char method[32];
         if (!q_param(req, "m", method, sizeof method)) method[0] = 0;
         static char mres[256];
-        cc_actor_send_msg(to, method, arg, mres, sizeof mres);
+        cc_actor_send_msg(to, method, a0, a1, a2, mres, sizeof mres);
         bl = s_put(body, bl, mres);
         bl = s_put(body, bl, "\n");
     } else if (path_eq(req, "/send")) {

@@ -25,6 +25,7 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap);
 /* Send a message to a resident actor: apply `method` (by name) with
  * integer `arg` to actor `actor`, rendering the result into `out`.
  * Returns 0, or -1 if no program is loaded / the method is unknown. */
-int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int outcap);
+int cc_actor_send_msg(int actor, const char *method, long a0, long a1, long a2,
+                      char *out, int outcap);
 
 #endif /* XINU_RPI4_CC_H */

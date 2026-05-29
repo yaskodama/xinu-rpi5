@@ -307,16 +307,18 @@ static char *u_to_hex16(unsigned long v, char *buf)
 static void win_banner(window_t *self, unsigned int frame)
 {
     (void)frame;
-    /* Static text inside the content area.  draw_string_at is at
-     * pixel coordinates so we offset from the window origin. */
-    draw_string_at(self->x + 8,  self->y + WM_TITLEBAR_H + 6,
-        "Xinu " BOARD_NAME " Window System",
+    /* Static text inside the content area.  Glyphs auto-scale to the window's
+     * font size (the wm sets the text scale before draw_content); scale the
+     * line spacing to match so the rows don't overlap. */
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int xb = self->x + 8;
+    int yb = self->y + WM_TITLEBAR_H + 6;
+    int LH = 12 * fs;
+    draw_string_at(xb, yb,          "Xinu " BOARD_NAME " Window System",
         0xFF00FF80U, self->content_bg);
-    draw_string_at(self->x + 8,  self->y + WM_TITLEBAR_H + 18,
-        "B U M1 S0 X0 -- cooperative scheduler",
+    draw_string_at(xb, yb + LH,     "B U M1 S0 X0 -- cooperative scheduler",
         0xFFCCCCCCU, self->content_bg);
-    draw_string_at(self->x + 8,  self->y + WM_TITLEBAR_H + 30,
-        "no input -- HDMI-only demo (no USB stack)",
+    draw_string_at(xb, yb + 2 * LH, "no input -- HDMI-only demo (no USB stack)",
         0xFF888888U, self->content_bg);
 }
 
@@ -342,6 +344,8 @@ static void win_status(window_t *self, unsigned int frame)
     char *p;
     unsigned long midr, mpidr, current_el, cnt, freq;
     int line = 0;
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int LH = 12 * fs;
     int xb = self->x + 8;
     int yb = self->y + WM_TITLEBAR_H + 6;
 
@@ -354,14 +358,14 @@ static void win_status(window_t *self, unsigned int frame)
     unsigned int fg = 0xFFFFFFFFU;
     unsigned int bg = self->content_bg;
 
-    draw_string_at(xb, yb + line*12, "System status", 0xFF80FF80U, bg); line++;
+    draw_string_at(xb, yb + line*LH, "System status", 0xFF80FF80U, bg); line++;
 
     /* MIDR */
     {
         char tmp[24];
         u_to_hex16(midr, tmp);
-        draw_string_at(xb, yb + line*12, "MIDR_EL1:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, tmp, fg, bg);
+        draw_string_at(xb, yb + line*LH, "MIDR_EL1:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, tmp, fg, bg);
         line++;
     }
 
@@ -370,8 +374,8 @@ static void win_status(window_t *self, unsigned int frame)
         char tmp[8] = {'E','L',' ',0};
         tmp[3] = (char)('0' + ((current_el >> 2) & 3));
         tmp[4] = 0;
-        draw_string_at(xb, yb + line*12, "CurrentEL:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, tmp, fg, bg);
+        draw_string_at(xb, yb + line*LH, "CurrentEL:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, tmp, fg, bg);
         line++;
     }
 
@@ -379,8 +383,8 @@ static void win_status(window_t *self, unsigned int frame)
     {
         char tmp[12];
         p = u_to_dec(mpidr & 0xFFUL, tmp, sizeof tmp);
-        draw_string_at(xb, yb + line*12, "Core:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, p, fg, bg);
+        draw_string_at(xb, yb + line*LH, "Core:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, p, fg, bg);
         line++;
     }
 
@@ -389,10 +393,10 @@ static void win_status(window_t *self, unsigned int frame)
         char tmp[24];
         unsigned long secs = freq ? (cnt / freq) : 0UL;
         p = u_to_dec(secs, tmp, sizeof tmp);
-        draw_string_at(xb, yb + line*12, "Uptime:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, p, fg, bg);
-        draw_string_at(xb + 80 + 8 * (int)(tmp + sizeof tmp - 1 - p),
-                       yb + line*12, " s", fg, bg);
+        draw_string_at(xb, yb + line*LH, "Uptime:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, p, fg, bg);
+        draw_string_at(xb + 80*fs + 8*fs * (int)(tmp + sizeof tmp - 1 - p),
+                       yb + line*LH, " s", fg, bg);
         line++;
     }
 
@@ -400,10 +404,10 @@ static void win_status(window_t *self, unsigned int frame)
     {
         char tmp[24];
         p = u_to_dec(mem_free_bytes() >> 10, tmp, sizeof tmp);
-        draw_string_at(xb, yb + line*12, "Heap free:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, p, fg, bg);
-        draw_string_at(xb + 80 + 8 * (int)(tmp + sizeof tmp - 1 - p),
-                       yb + line*12, " KiB", fg, bg);
+        draw_string_at(xb, yb + line*LH, "Heap free:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, p, fg, bg);
+        draw_string_at(xb + 80*fs + 8*fs * (int)(tmp + sizeof tmp - 1 - p),
+                       yb + line*LH, " KiB", fg, bg);
         line++;
     }
 
@@ -411,8 +415,8 @@ static void win_status(window_t *self, unsigned int frame)
     {
         char tmp[24];
         p = u_to_dec((unsigned long)frame, tmp, sizeof tmp);
-        draw_string_at(xb, yb + line*12, "Frame:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, p, fg, bg);
+        draw_string_at(xb, yb + line*LH, "Frame:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, p, fg, bg);
         line++;
     }
 
@@ -429,10 +433,10 @@ static void win_status(window_t *self, unsigned int frame)
         unsigned int nfg = 0xFF80E0FFU;   /* light blue */
 
         line++;   /* blank separator */
-        draw_string_at(xb, yb + line*12, "Network", 0xFF80FF80U, bg); line++;
+        draw_string_at(xb, yb + line*LH, "Network", 0xFF80FF80U, bg); line++;
 
-        draw_string_at(xb, yb + line*12, "link:", nfg, bg);
-        draw_string_at(xb + 48, yb + line*12, g_net_link ? "UP" : "DOWN", nfg, bg);
+        draw_string_at(xb, yb + line*LH, "link:", nfg, bg);
+        draw_string_at(xb + 48*fs, yb + line*LH, g_net_link ? "UP" : "DOWN", nfg, bg);
         line++;
 
         n = 0;
@@ -440,20 +444,20 @@ static void win_status(window_t *self, unsigned int frame)
         kv_append(l, &n, "ov",  genet_rx_overrun_count());
         kv_append(l, &n, "rc",  genet_rx_recover_count());
         kv_append(l, &n, "txt", genet_tx_timeout_count());
-        draw_string_at(xb, yb + line*12, l, nfg, bg); line++;
+        draw_string_at(xb, yb + line*LH, l, nfg, bg); line++;
 
         n = 0;
         kv_append(l, &n, "any", tcp_any_count());
         kv_append(l, &n, "seg", tcp_seg_rx_count());
         kv_append(l, &n, "syn", tcp_syn_count());
-        draw_string_at(xb, yb + line*12, l, nfg, bg); line++;
+        draw_string_at(xb, yb + line*LH, l, nfg, bg); line++;
 
         n = 0;
         kv_append(l, &n, "sak", tcp_synack_count());
         kv_append(l, &n, "est", tcp_estab_count());
         kv_append(l, &n, "txf", tcp_txfail_count());
-        draw_string_at(xb, yb + line*12, l, nfg, bg);
-        draw_string_at(xb + 184, yb + line*12, tcp_state_str(), nfg, bg);
+        draw_string_at(xb, yb + line*LH, l, nfg, bg);
+        draw_string_at(xb + 184*fs, yb + line*LH, tcp_state_str(), nfg, bg);
         line++;
     }
 }
@@ -637,6 +641,7 @@ static void vfs_populate_demo(void)
 struct ftree_ctx {
     int x, y;          /* cursor inside content area in PIXEL coords */
     int max_y;
+    int fs;            /* font scale (line height / indent multiplier) */
     unsigned int fg;
     unsigned int bg;
     unsigned int dir_fg;
@@ -648,15 +653,16 @@ static void ftree_visit_safe(int depth, vfs_node_t *node, void *vctx)
 {
     struct ftree_ctx *c = (struct ftree_ctx *)vctx;
     if (c->y > c->max_y) return;
-    int xb = c->x + depth * 16;
-    if (depth > 0) draw_string_at(xb - 14, c->y, "|-", c->fg, c->bg);
+    int fs = c->fs > 0 ? c->fs : 1;
+    int xb = c->x + depth * 16 * fs;
+    if (depth > 0) draw_string_at(xb - 14 * fs, c->y, "|-", c->fg, c->bg);
     const char *nm = (depth == 0) ? "/" : node->name;
     unsigned int colour = (node->kind == VFS_DIR) ? c->dir_fg : c->fg;
     draw_string_at(xb, c->y, nm, colour, c->bg);
     if (node->kind == VFS_DIR) {
-        draw_string_at(xb + 8 * simple_strlen(nm), c->y, "/", colour, c->bg);
+        draw_string_at(xb + 8 * fs * simple_strlen(nm), c->y, "/", colour, c->bg);
     }
-    c->y += 10;
+    c->y += 10 * fs;
 }
 
 static void win_ftree(window_t *self, unsigned int frame)
@@ -667,6 +673,7 @@ static void win_ftree(window_t *self, unsigned int frame)
         .x      = self->x + 8,
         .y     = self->y + WM_TITLEBAR_H + 6,
         .max_y = self->y + self->height - 12,
+        .fs    = self->font_scale > 0 ? self->font_scale : 1,
         .fg    = 0xFFCCCCCCU,
         .bg    = self->content_bg,
         .dir_fg= 0xFF60D0FFU
@@ -682,55 +689,59 @@ static void win_mem(window_t *self, unsigned int frame)
     unsigned int fg = 0xFFFFFFFFU;
     unsigned int hi = 0xFFFFD060U;
     unsigned int bg = self->content_bg;
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int lh = 10 * fs, cw = 88 * fs;     /* line height + value column, scaled */
     int xb = self->x + 8;
     int yb = self->y + WM_TITLEBAR_H + 6;
     int line = 0;
 
-    draw_string_at(xb, yb + (line++) * 10, "Heap (getmem)",   hi, bg);
+    draw_string_at(xb, yb + (line++) * lh, "Heap (getmem)",   hi, bg);
     char *p;
     p = u_to_dec(mem_total_bytes() >> 10, tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  total:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  total:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(mem_free_bytes() >> 10, tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  free :", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  free :", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(mem_largest_block() >> 10, tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  larg :", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  larg :", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     line++;
-    draw_string_at(xb, yb + (line++) * 10, "kmalloc",         hi, bg);
+    draw_string_at(xb, yb + (line++) * lh, "kmalloc",         hi, bg);
     p = u_to_dec(kmalloc_live_blocks(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  live :", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  live :", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(kmalloc_live_bytes(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  bytes:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  bytes:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(kmalloc_total_allocs(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  allocs:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  allocs:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(kmalloc_total_frees(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  frees:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  frees:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     line++;
-    draw_string_at(xb, yb + (line++) * 10, "VFS",              hi, bg);
+    draw_string_at(xb, yb + (line++) * lh, "VFS",              hi, bg);
     p = u_to_dec(vfs_node_count(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  nodes:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  nodes:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(vfs_total_file_bytes(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  bytes:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  bytes:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 }
 
-/* Resident actor's class name (cc/cc.c) — for the Actors window. */
-extern int cc_actor_name(int apid, char *out, int cap);
+/* Resident actor's class name + a field value (cc/cc.c) — for the Actors
+ * window.  cc_actor_field(apid,1) is the philosopher's meal count. */
+extern int  cc_actor_name(int apid, char *out, int cap);
+extern long cc_actor_field(int apid, int fidx);
 
 /* "Actors (live)" window — shows the JIT/AIPL resident actors (loaded via
  * /actor/load: e.g. the dining philosophers), one row each with the Xinu pid,
@@ -739,6 +750,8 @@ extern int cc_actor_name(int apid, char *out, int cap);
 static void win_actors(window_t *self, unsigned int frame)
 {
     (void)frame;
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int LH = 12 * fs;
     int xb = self->x + 8;
     int yb = self->y + WM_TITLEBAR_H + 6;
     int line = 0;
@@ -746,19 +759,19 @@ static void win_actors(window_t *self, unsigned int frame)
     char tmp[24]; char *p;
 
     int n = ap_live_count();
-    draw_string_at(xb, yb + line*12, "Live actors:", 0xFF80FF80U, bg);
+    draw_string_scaled(xb, yb + line*LH, "Live actors:", 0xFF80FF80U, bg, fs);
     p = u_to_dec((unsigned long)n, tmp, sizeof tmp);
-    draw_string_at(xb + 104, yb + line*12, p, fg, bg);
+    draw_string_scaled(xb + 104*fs, yb + line*LH, p, fg, bg, fs);
     line += 2;
 
     if (n <= 0) {
-        draw_string_at(xb, yb + line*12, "(none - POST /actor/load)", 0xFF909090U, bg);
+        draw_string_scaled(xb, yb + line*LH, "(none - POST /actor/load)", 0xFF909090U, bg, fs);
         return;
     }
 
-    /* columns: id, name(class), pid, state, msgq, total msgs */
-    draw_string_at(xb, yb + line*12, "id name        pid st     q  msgs",
-                   0xFFB0B0B0U, bg);
+    /* columns: id, name(class), pid, state, msgq, total msgs, meals (eats) */
+    draw_string_scaled(xb, yb + line*LH, "id name        pid st     q msg eat",
+                       0xFFB0B0B0U, bg, fs);
     line++;
     for (int i = 0; i < n; i++) {
         int pid = -1, qlen = 0, waiting = 0; unsigned int nmsg = 0;
@@ -780,17 +793,22 @@ static void win_actors(window_t *self, unsigned int frame)
             }
         }
 
-        int col = xb;
+        long meals = cc_actor_field(i, 1);   /* Philosopher field 1 = meal count */
+
+        int col = xb, yy = yb + line*LH;
         p = u_to_dec((unsigned long)i,   tmp, sizeof tmp);
-        draw_string_at(col, yb + line*12, p, fg, bg);                  col += 20;
-        draw_string_at(col, yb + line*12, name, 0xFF80FFD0U, bg);      col += 96;
+        draw_string_scaled(col, yy, p, fg, bg, fs);              col += 20*fs;
+        draw_string_scaled(col, yy, name, 0xFF80FFD0U, bg, fs);  col += 92*fs;
         p = u_to_dec((unsigned long)pid, tmp, sizeof tmp);
-        draw_string_at(col, yb + line*12, p, fg, bg);                  col += 32;
-        draw_string_at(col, yb + line*12, st, 0xFFFFD080U, bg);        col += 64;
+        draw_string_scaled(col, yy, p, fg, bg, fs);              col += 28*fs;
+        draw_string_scaled(col, yy, st, 0xFFFFD080U, bg, fs);    col += 58*fs;
         p = u_to_dec((unsigned long)qlen, tmp, sizeof tmp);
-        draw_string_at(col, yb + line*12, p, 0xFF80D0FFU, bg);         col += 24;
+        draw_string_scaled(col, yy, p, 0xFF80D0FFU, bg, fs);     col += 18*fs;
         p = u_to_dec((unsigned long)nmsg, tmp, sizeof tmp);
-        draw_string_at(col, yb + line*12, p, 0xFFD0D0D0U, bg);
+        draw_string_scaled(col, yy, p, 0xFFD0D0D0U, bg, fs);     col += 30*fs;
+        if (meals >= 0) { p = u_to_dec((unsigned long)meals, tmp, sizeof tmp); }
+        else            { tmp[0] = '-'; tmp[1] = 0; p = tmp; }
+        draw_string_scaled(col, yy, p, 0xFF80FF80U, bg, fs);     /* meals: green */
         line++;
     }
 }
@@ -799,7 +817,17 @@ static void win_actors(window_t *self, unsigned int frame)
  * actual screen dimensions in kernel_main(). */
 static window_t banner_win;
 static window_t actors_win;
+static window_t gfx_win;
 static window_t status_win;
+
+/* Graphics window — replays the actor-drawn line/circle command list (the
+ * gfx_* AIPL builtins) into its content area each frame. */
+static void win_gfx(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    gfx_render(self->x + 1, self->y + WM_TITLEBAR_H + 2,
+               self->width - 2, self->height - WM_TITLEBAR_H - 3);
+}
 static window_t anim_win;
 static window_t ftree_win;
 static window_t mem_win;
@@ -1040,10 +1068,10 @@ void kernel_main(void)
         /* Title-bar window: full *virtual* desktop width, slimmer
          * to make room for everything below.  Only the part inside
          * the viewport (0..sw) shows at any moment. */
-        banner_win.x = 0;
-        banner_win.y = 0;
-        banner_win.width  = WM_DESKTOP_W;
-        banner_win.height = 28;
+        banner_win.x = 0;            /* default layout from the AIPL designer (1024x768) */
+        banner_win.y = 10;
+        banner_win.width  = 549;
+        banner_win.height = 90;
         const char *bt = "Xinu " BOARD_NAME " on " SOC_NAME;
         for (int i = 0; i < WM_TITLE_MAX && bt[i]; i++) banner_win.title[i] = bt[i];
         banner_win.chrome_color = 0xFFAACCEEU;
@@ -1055,10 +1083,10 @@ void kernel_main(void)
 
         /* Status window: right side of the initial viewport so
          * the shell on the left has room to show the full log. */
-        status_win.x = 320;
-        status_win.y = 32;
-        status_win.width  = 320;
-        status_win.height = 200;
+        status_win.x = 338;
+        status_win.y = 267;
+        status_win.width  = 280;
+        status_win.height = 193;
         const char *st = "System status";
         for (int i = 0; i < WM_TITLE_MAX && st[i]; i++) status_win.title[i] = st[i];
         status_win.chrome_color = 0xFF60FF60U;
@@ -1070,10 +1098,10 @@ void kernel_main(void)
 
         /* File-tree window: well off the initial viewport so the
          * user can pan right to discover it. */
-        ftree_win.x = WM_DESKTOP_W - 320;
-        ftree_win.y = 32;
-        ftree_win.width  = 320;
-        ftree_win.height = 200;
+        ftree_win.x = 330;
+        ftree_win.y = 471;
+        ftree_win.width  = 285;
+        ftree_win.height = 280;
         const char *ft = "VFS tree";
         for (int i = 0; i < WM_TITLE_MAX && ft[i]; i++) ftree_win.title[i] = ft[i];
         ftree_win.chrome_color = 0xFF60D0FFU;
@@ -1086,10 +1114,10 @@ void kernel_main(void)
         /* Memory window: moved to the far-right of the virtual desktop
          * (pan right to see it) so the Actors window can take the visible
          * right-bottom slot of the initial viewport. */
-        mem_win.x = WM_DESKTOP_W - 320;
-        mem_win.y = 240;
-        mem_win.width  = 320;
-        mem_win.height = 220;
+        mem_win.x = 3;
+        mem_win.y = 443;
+        mem_win.width  = 316;
+        mem_win.height = 171;
         const char *mt = "Memory";
         for (int i = 0; i < WM_TITLE_MAX && mt[i]; i++) mem_win.title[i] = mt[i];
         mem_win.chrome_color = 0xFFFFE060U;
@@ -1103,10 +1131,10 @@ void kernel_main(void)
          * boot log lives here and must stay visible without any
          * scrolling so the user can read what happened during
          * USPi init. */
-        shell_win.x = 0;
-        shell_win.y = 32;
-        shell_win.width  = 320;
-        shell_win.height = 432;
+        shell_win.x = 5;
+        shell_win.y = 113;
+        shell_win.width  = 543;
+        shell_win.height = 134;
         const char *swt = "Shell (UART)";
         for (int i = 0; i < WM_TITLE_MAX && swt[i]; i++) shell_win.title[i] = swt[i];
         shell_win.chrome_color = 0xFF80E080U;
@@ -1119,8 +1147,8 @@ void kernel_main(void)
 
         /* Soft keyboard window: bottom-left of the initial 640×480
          * viewport.  Half-size as the user requested. */
-        softkbd_win.x = 0;
-        softkbd_win.y = 360;
+        softkbd_win.x = 4;
+        softkbd_win.y = 622;
         softkbd_win.width  = 320;
         softkbd_win.height = 120;
         const char *kbt = "Soft keyboard";
@@ -1136,10 +1164,10 @@ void kernel_main(void)
          * and added LAST so it is the front-most window (wm draws head->tail,
          * so the last-added one is painted on top).  Shows the live JIT/AIPL
          * resident actors + their state + mailbox depth. */
-        actors_win.x = 320;
-        actors_win.y = 240;
-        actors_win.width  = 320;
-        actors_win.height = 220;
+        actors_win.x = 2;
+        actors_win.y = 258;
+        actors_win.width  = 319;
+        actors_win.height = 177;
         const char *at = "Actors (live)";
         for (int i = 0; i < WM_TITLE_MAX && at[i]; i++) actors_win.title[i] = at[i];
         actors_win.chrome_color = 0xFFFF80E0U;
@@ -1148,6 +1176,21 @@ void kernel_main(void)
         actors_win.content_bg   = 0xFF181018U;
         actors_win.draw_content = win_actors;
         wm_add(&actors_win);
+
+        /* Graphics window: right side of the 1024x768 screen.  AIPL actors
+         * draw line segments / circles into it via the gfx_* builtins. */
+        gfx_win.x = 631;
+        gfx_win.y = 5;
+        gfx_win.width  = 375;
+        gfx_win.height = 744;
+        const char *gt = "Graphics";
+        for (int i = 0; i < WM_TITLE_MAX && gt[i]; i++) gfx_win.title[i] = gt[i];
+        gfx_win.chrome_color = 0xFF80FFC0U;
+        gfx_win.title_bg     = 0xFF205040U;
+        gfx_win.title_fg     = 0xFFFFFFFFU;
+        gfx_win.content_bg   = 0xFF0A1014U;
+        gfx_win.draw_content = win_gfx;
+        wm_add(&gfx_win);
 
         /* Start the cursor at the centre of the *screen* (not the
          * virtual desktop) so it stays in view as the viewport

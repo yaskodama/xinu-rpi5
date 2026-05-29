@@ -119,6 +119,77 @@ void wm_add(window_t *w)
     t->next = w;
 }
 
+/* ---- runtime window geometry (driven by the AIPL layout designer) ---- */
+static window_t *wm_nth(int idx)
+{
+    window_t *w = wm_head;
+    while (w && idx-- > 0) w = w->next;
+    return w;
+}
+
+int wm_window_count(void)
+{
+    int n = 0;
+    for (window_t *w = wm_head; w; w = w->next) n++;
+    return n;
+}
+
+int wm_window_move(int idx, int x, int y)
+{
+    window_t *w = wm_nth(idx);
+    if (!w) return -1;
+    if (x < 0) x = 0; if (x > WM_DESKTOP_W - 16) x = WM_DESKTOP_W - 16;
+    if (y < 0) y = 0; if (y > WM_DESKTOP_H - 16) y = WM_DESKTOP_H - 16;
+    w->x = x; w->y = y;        /* next frame redraws at the new spot */
+    return 0;
+}
+
+int wm_window_resize(int idx, int wd, int ht)
+{
+    window_t *w = wm_nth(idx);
+    if (!w) return -1;
+    if (wd >= 24) w->width  = wd;   /* keep room for the titlebar/chrome */
+    if (ht >= 24) w->height = ht;
+    return 0;
+}
+
+int wm_window_name(int idx, char *out, int cap)
+{
+    window_t *w = wm_nth(idx);
+    if (!w || cap <= 0) return -1;
+    int i = 0;
+    while (w->title[i] && i < cap - 1) { out[i] = w->title[i]; i++; }
+    out[i] = 0;
+    return i;
+}
+
+int wm_window_get(int idx, int *x, int *y, int *wd, int *ht)
+{
+    window_t *w = wm_nth(idx);
+    if (!w) return -1;
+    if (x)  *x  = w->x;
+    if (y)  *y  = w->y;
+    if (wd) *wd = w->width;
+    if (ht) *ht = w->height;
+    return 0;
+}
+
+int wm_window_font(int idx, int scale)
+{
+    window_t *w = wm_nth(idx);
+    if (!w) return -1;
+    if (scale < 1) scale = 1;
+    if (scale > 4) scale = 4;          /* keep glyphs sane vs. the window size */
+    w->font_scale = scale;
+    return 0;
+}
+
+int wm_window_fontscale(int idx)
+{
+    window_t *w = wm_nth(idx);
+    return (w && w->font_scale > 0) ? w->font_scale : 1;
+}
+
 static void draw_chrome(window_t *w)
 {
     /* outer border */
@@ -191,8 +262,15 @@ void wm_run(void)
          * virtual desktop coordinates. */
         video_set_viewport(vp_x, vp_y);
         for (window_t *w = wm_head; w; w = w->next) {
+            video_set_text_scale(1);          /* chrome/title always 1x */
             draw_chrome(w);
-            if (w->draw_content) w->draw_content(w, frame);
+            if (w->draw_content) {
+                /* Scale draw_string_at glyphs to this window's font size; the
+                 * window's own draw fn scales its line/column spacing to match. */
+                video_set_text_scale(w->font_scale > 0 ? w->font_scale : 1);
+                w->draw_content(w, frame);
+                video_set_text_scale(1);
+            }
         }
 
         draw_cursor();   /* screen-space overlay, always on top */
