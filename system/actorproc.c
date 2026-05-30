@@ -30,6 +30,11 @@ static struct {
 static int g_nact;
 static long (*g_actor_dispatch)(long, long, long, long, long, long);
 
+/* suicide flag: set by ap_suicide(self); the receive loop checks it after
+ * each dispatch returns and proc_exits the actor's process, freeing its
+ * slot for ap_spawn to reuse. */
+static int g_dead[AP_NACT];
+
 /* let-it-crash: a per-actor non-local-jump buffer back to its receive loop,
  * armed only while a handler is running.  crash() (ap_crash) longjmps here. */
 static void *g_actor_jmp[AP_NACT][5];   /* __builtin_setjmp frame: FP, SP, PC */
@@ -199,6 +204,17 @@ static void actor_proc_main(void)
                 ap_post((int)g_cur_reply[s], AP_REPLY, -1, AP_CRASH_REPLY, 0, 0, 0);
         }
         aipl_unlock_all();                  /* release fully (also covers the crash longjmp) */
+
+        /* Suicide check: if ap_suicide(self) was called inside the handler,
+         * exit the receive loop now, free our slot, and proc_exit so the
+         * Xinu scheduler reclaims our stack.  ap_spawn finds pid == -1
+         * slots first, so the slot is immediately reusable. */
+        if (g_dead[self]) {
+            g_act[self].pid = -1;
+            /* leave g_dead[self] = 1 so introspection sees this slot as dead
+             * until ap_spawn flips it back to 0; ap_run won't wake us either. */
+            proc_exit();        /* never returns */
+        }
     }
 }
 
@@ -215,22 +231,49 @@ void ap_crash(void)
 
 int ap_spawn(void)
 {
-    if (g_nact >= AP_NACT) return -1;
-    int id = g_nact;
+    /* Find a freed slot (pid == -1, dead == 1) and reuse it; this lets
+     * suicide-spawn cycles run indefinitely with a bounded actor table.
+     * Without recycling, a 10 000-spawn benchmark would exhaust AP_NACT
+     * even though only a few actors are alive at any moment. */
+    int id = -1;
+    for (int i = 0; i < g_nact; i++) {
+        if (g_act[i].pid == -1) { id = i; break; }
+    }
+    if (id < 0) {
+        if (g_nact >= AP_NACT) return -1;
+        id = g_nact;
+        g_nact++;
+    }
     g_act[id].head = g_act[id].tail = 0;
     g_act[id].waiting = 0;
     g_act[id].nmsg = 0;
     g_jmp_armed[id] = 0;
+    g_dead[id] = 0;
     int pid = proc_create_arg(actor_proc_main, 8192, "actor", (void *)(long)id);
-    if (pid < 0) return -1;
+    if (pid < 0) { g_act[id].pid = -1; return -1; }
     g_act[id].pid = pid;
-    g_nact++;
     return id;
 }
 
+/* Mark an actor as dead.  The actor's own receive loop (actor_proc_main)
+ * checks g_dead[self] after each dispatch returns and calls proc_exit().
+ * Safe to call from inside the actor's dispatch handler on self == id. */
+void ap_suicide(int id)
+{
+    if (id < 0 || id >= g_nact) return;
+    g_dead[id] = 1;
+}
+
+/* The previous 1 000 000 guard limit was hit at the 10 M actor scale
+ * (each spawn-and-suicide cycle costs a few yields, so 10 M actors with a
+ * pool cap of 32 needs > 1 M yield iterations).  Bump to 200 M and add
+ * a heartbeat to UART so a long run is visible in the serial console,
+ * and an obvious break point on truly stuck systems. */
+extern void uart_puts(const char *);
 void ap_run(void)
 {
-    for (int guard = 0; guard < 1000000; guard++) {
+    int hb_counter = 0;
+    for (long guard = 0; guard < 200000000L; guard++) {
         int busy = 0;
         for (int i = 0; i < g_nact; i++) {
             if (g_act[i].pid <= 0) continue;
@@ -248,6 +291,13 @@ void ap_run(void)
         }
         if (!busy) break;
         proc_yield();
+        /* Heartbeat every ~1 M yields (~few seconds wall time on Pi 4).
+         * Visible in serial console; useful for diagnosing whether a
+         * long /actor/load is still progressing vs hung. */
+        if ((++hb_counter) >= 1000000) {
+            hb_counter = 0;
+            uart_puts(".");      /* one dot per million yields */
+        }
     }
 }
 

@@ -138,6 +138,17 @@ void uart_puts(const char *s)
     }
 }
 
+/* Hex print without printf — useful inside ISRs and low-level probe code
+ * that can't allocate or take locks.  Always emits exactly 8 hex digits
+ * for 32-bit clarity (high bits dropped if value > 0xFFFFFFFF). */
+void uart_puthex(unsigned long v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    for (int i = 7; i >= 0; i--) {
+        uart_putc(hex[(v >> (i * 4)) & 0xF]);
+    }
+}
+
 char uart_getc(void)
 {
     /* Busy-wait until the RX FIFO has something. */

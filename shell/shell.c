@@ -419,12 +419,13 @@ static int cmd_procdemo(int argc, char **argv)
     return 0;
 }
 
+extern void pm_reset(void);
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    uart_puts("reboot: RP1 watchdog not wired up yet — spinning in WFE.\n");
-    uart_puts("        (power-cycle the board to recover)\n");
-    for (;;) __asm__ volatile ("wfe");
+    uart_puts("reboot: triggering BCM2711 watchdog reset...\n");
+    pm_reset();                /* never returns; SoC resets immediately */
+    return 0;                  /* unreachable */
 }
 
 static int cmd_ps(int argc, char **argv)

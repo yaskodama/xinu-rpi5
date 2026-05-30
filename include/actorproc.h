@@ -13,6 +13,11 @@ void ap_set_dispatch(long (*fn)(long self, long method, long a0, long a1, long a
 void ap_reset(void);                 /* drop all actors (no free)        */
 void ap_killall(void);               /* reap all actor processes + stacks */
 int  ap_spawn(void);                 /* new actor process; returns id/-1  */
+/* Terminate actor `id` and free its slot for reuse by a later ap_spawn.
+ * Called from inside the actor's own dispatch handler (suicide pattern);
+ * the receive loop notices the dead flag, releases the vheap lock, and
+ * proc_exits.  Safe to call only on `id == self`. */
+void ap_suicide(int id);
 void ap_send(long to, long method, long a0, long a1, long a2, long a3);
 /* Synchronous call: deliver to `to`, block `self` until `to` replies with
  * its method's return value, and return that value.  (AIPL `now`.) */

@@ -488,10 +488,23 @@ static int q_int(const char *req, const char *key, int dflt)
 {
     char v[16];
     if (!q_param(req, key, v, sizeof v)) return dflt;
-    int neg = 0, i = 0, n = 0;
+    int neg = 0, i = 0;
+    unsigned int n = 0;
     if (v[0] == '-') { neg = 1; i = 1; }
-    for (; v[i] >= '0' && v[i] <= '9'; i++) n = n * 10 + (v[i] - '0');
-    return neg ? -n : n;
+    /* Hex form 0x...  — needed for ?addr=0x7e0000b4 style probes */
+    if (v[i] == '0' && (v[i+1] == 'x' || v[i+1] == 'X')) {
+        i += 2;
+        for (; v[i]; i++) {
+            char c = v[i];
+            if (c >= '0' && c <= '9')      n = (n << 4) | (unsigned)(c - '0');
+            else if (c >= 'a' && c <= 'f') n = (n << 4) | (unsigned)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') n = (n << 4) | (unsigned)(c - 'A' + 10);
+            else break;
+        }
+    } else {
+        for (; v[i] >= '0' && v[i] <= '9'; i++) n = n * 10 + (unsigned)(v[i] - '0');
+    }
+    return neg ? -(int)n : (int)n;
 }
 
 /* Path begins right after "GET " and runs to the next space. */
@@ -577,6 +590,20 @@ static int http_build(const char *req, char *out, int max)
     const char *ctype = "application/json";
     (void)max;
 
+    if (starts_with(req, "POST /reboot") || starts_with(req, "GET /reboot")) {
+        /* Soft-wedge recovery: trigger BCM2711 watchdog reset.  The
+         * actor system / cc JIT may be unresponsive, but as long as
+         * the network gateway thread is alive we can take this route
+         * and avoid a physical power cycle.
+         *
+         * Note: the SoC reset happens before the HTTP reply gets
+         * flushed back, so the client sees `connection closed` / EOF
+         * rather than a 200 OK.  That's OK — Mac driver knows what
+         * it asked for. */
+        extern void pm_reset(void);
+        pm_reset();              /* never returns */
+        /* unreachable */
+    }
     if (starts_with(req, "POST /compile") || starts_with(req, "GET /compile")) {
         /* Dynamic compilation: the request carries C source, which we
          * compile and JIT-run in place; the reply is the program output
@@ -906,6 +933,18 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "post-write CTL = ");
         bl = s_puthex(body, bl, (unsigned int)post_ctl);
         bl = s_put(body, bl, "\nBUSY (bit 7) set => 0x128 is a real clock reg; SRC=6 PLL was the problem\n");
+    } else if (starts_with(req, "GET /pcie-clk-full") || starts_with(req, "POST /pcie-clk-full")) {
+        /* Replay the FULL firmware PCIe-bring-up sequence (multi-block:
+         * 0xFEE01000 + CPRMAN + 0xFEC11010/14).  See xhci.c for full
+         * disasm reference.  Reports final CPRMAN+0x128 value — if
+         * BUSY (bit 7) finally sets, clock is alive. */
+        extern int xhci_pcie_clk_full_sequence(void);
+        int ctl = xhci_pcie_clk_full_sequence();
+        ctype = "text/plain";
+        bl = s_put(body, bl, "pcie-clk-full: ran 11-step firmware sequence\n");
+        bl = s_put(body, bl, "CPRMAN+0x128 = ");
+        bl = s_puthex(body, bl, (unsigned int)ctl);
+        bl = s_put(body, bl, "\n(BUSY=bit 7 should be set if clock actually running)\n");
     } else if (starts_with(req, "GET /cprman-init") || starts_with(req, "POST /cprman-init")) {
         /* DIRECT CPRMAN MMIO write: replay start4.elf disasm pattern at
          * vaddr 0xed4995e — ungate suspected PCIe clock at CPRMAN+0x128.
@@ -963,6 +1002,95 @@ static int http_build(const char *req, char *out, int max)
             }
             bl = s_put(body, bl, "\n");
         }
+    } else if (starts_with(req, "GET /mmio-read") || starts_with(req, "POST /mmio-read")) {
+        /* Direct MMIO read via safe_mmio_read32 (setjmp around the load —
+         * sync faults return -1 instead of wedging the worker).  Use
+         * ?addr=0xFE0000B4 to probe the disassembly-identified PCIe gate.
+         * NOTE: bus-hang faults (no slave response) bypass setjmp so this
+         * can still lock the box; only use for addresses you have some
+         * reason to believe are mapped.  Default addr 0xFE0000B4 (gate). */
+        extern int safe_mmio_read32(unsigned long addr, unsigned int *out);
+        ctype = "text/plain";
+        unsigned long addr = (unsigned long)(unsigned int)q_int(req, "addr", 0xFE0000B4);
+        unsigned int v = 0;
+        int rc = safe_mmio_read32(addr, &v);
+        bl = s_put(body, bl, "addr=");
+        bl = s_puthex(body, bl, (unsigned int)addr);
+        if (rc == 0) {
+            bl = s_put(body, bl, " val=");
+            bl = s_puthex(body, bl, v);
+            bl = s_put(body, bl, " bit0=");
+            bl = s_put(body, bl, (v & 1U) ? "1" : "0");
+        } else {
+            bl = s_put(body, bl, " FAULT (unmapped or rejected)");
+        }
+        bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "POST /mmio-write")) {
+        /* Direct MMIO write via safe_mmio_write32.  POST-only to avoid
+         * accidental GETs.  Use ?addr=0xFE0000B4&val=0x1 to force the PCIe
+         * gate.  Reports rc + read-back so we can tell if the write stuck
+         * (real register vs read-only memory vs fault). */
+        extern int safe_mmio_write32(unsigned long addr, unsigned int val);
+        extern int safe_mmio_read32(unsigned long addr, unsigned int *out);
+        ctype = "text/plain";
+        unsigned long addr = (unsigned long)(unsigned int)q_int(req, "addr", 0xFE0000B4);
+        unsigned int val  = (unsigned int)q_int(req, "val", 1);
+        unsigned int before = 0, after = 0;
+        safe_mmio_read32(addr, &before);
+        int wrc = safe_mmio_write32(addr, val);
+        safe_mmio_read32(addr, &after);
+        bl = s_put(body, bl, "addr="); bl = s_puthex(body, bl, (unsigned int)addr);
+        bl = s_put(body, bl, " before="); bl = s_puthex(body, bl, before);
+        bl = s_put(body, bl, " wrote="); bl = s_puthex(body, bl, val);
+        bl = s_put(body, bl, " rc="); bl = s_putdec(body, bl, (long)wrc);
+        bl = s_put(body, bl, " after="); bl = s_puthex(body, bl, after);
+        bl = s_put(body, bl, (after == val) ? " [STUCK]\n" : " [NOT-STUCK]\n");
+    } else if (starts_with(req, "GET /mmio-sweep") || starts_with(req, "POST /mmio-sweep")) {
+        /* Sweep a small range of addresses around base ?addr=... step ?step=4
+         * count ?n=8.  Useful for seeing if the PCIe gate is part of a wider
+         * register block we can recognize.  Default sweeps 0xFE000080..0xFE0000B4
+         * which contains the gate (0xFE0000B4 = base+0x34 from firmware r3). */
+        extern int safe_mmio_read32(unsigned long addr, unsigned int *out);
+        ctype = "text/plain";
+        unsigned long base = (unsigned long)(unsigned int)q_int(req, "addr", 0xFE000080);
+        int step = q_int(req, "step", 4);
+        int n    = q_int(req, "n",    16);
+        if (n > 32) n = 32;
+        for (int i = 0; i < n; i++) {
+            unsigned long a = base + (unsigned long)(i * step);
+            unsigned int v = 0;
+            int rc = safe_mmio_read32(a, &v);
+            bl = s_puthex(body, bl, (unsigned int)a);
+            bl = s_put(body, bl, " = ");
+            if (rc == 0) bl = s_puthex(body, bl, v);
+            else         bl = s_put(body, bl, "FAULT");
+            bl = s_put(body, bl, "\n");
+        }
+    } else if (starts_with(req, "GET /pcie-fw-probe1") || starts_with(req, "POST /pcie-fw-probe1")) {
+        /* Single-address mailbox probe — query a SPECIFIC peripheral address
+         * to characterize firmware proxy behavior without risk of wedging on
+         * a different address.  Use ?addr=0x7e0000b4 for the gate; defaults
+         * to the gate if no addr given.  UART trace marks BEFORE/AFTER so
+         * the serial log identifies hang-causing addresses precisely. */
+        extern int xhci_pcie_fw_probe_one(char *out, int max, unsigned int addr);
+        ctype = "text/plain";
+        unsigned int addr = (unsigned int)q_int(req, "addr", 0x7E0000B4);
+        bl += xhci_pcie_fw_probe_one(body + bl, (int)sizeof body - bl, addr);
+    } else if (starts_with(req, "GET /pcie-fw-probe") || starts_with(req, "POST /pcie-fw-probe")) {
+        /* Multi-address sweep (safe subset only — skips known-risky
+         * addresses).  For unknown addresses use /pcie-fw-probe1?addr=...
+         * one at a time so a wedge only kills one HTTP request. */
+        extern int xhci_pcie_fw_probe(char *out, int max);
+        ctype = "text/plain";
+        bl += xhci_pcie_fw_probe(body + bl, (int)sizeof body - bl);
+    } else if (starts_with(req, "POST /pcie-fw-gate-force")) {
+        /* Try to set 0x7E0000B4 |= 1 via mailbox SET_PERIPH_REG (the firmware
+         * gate at ec63fec).  Reports before/after gate value + CPRMAN PCIe
+         * CTL after, so we can see whether the write propagated.  POST-only
+         * to avoid accidental GET. */
+        extern int xhci_pcie_fw_gate_force(char *out, int max);
+        ctype = "text/plain";
+        bl += xhci_pcie_fw_gate_force(body + bl, (int)sizeof body - bl);
     } else if (starts_with(req, "GET /pcie-init") || starts_with(req, "POST /pcie-init")) {
         /* On-demand BCM2711 PCIe RC bring-up (Linux pcie-brcmstb.c sequence).
          * After this, /pcie should show non-zero registers and PCIE_STATUS

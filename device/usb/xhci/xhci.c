@@ -213,6 +213,77 @@ int xhci_cprman_enable_pcie(void)
     return xhci_cprman_enable_pcie_src(6);   /* original: SRC=6 (matches firmware) */
 }
 
+/* Replay the FULL firmware PCIe bring-up sequence extracted from start4.elf
+ * disassembly at vaddr 0xed4995e onwards.  Multiple peripheral blocks are
+ * involved; the simple "write CPRMAN+0x128" pattern only configures the
+ * clock register but never makes it BUSY=1 (= clock actually running).
+ *
+ * Firmware sequence (from disasm):
+ *   1. *(0xFEE01000) |= 0x1               — likely "PCIe power domain on"
+ *   2. CPRMAN+0x128 = 0x5A000036          — CTL: KILL=1, ENAB=1, SRC=6
+ *   3. CPRMAN+0x12C = 0x5A000000          — DIV=0
+ *   4. CPRMAN+0x1390 |= 0x5A200001        — bit 21 + bit 0 (power domain ena)
+ *   5. *(0xFEC11010) &= ~1                — gating-related (unknown block)
+ *   6. *(0xFEC11014) &= ~1                — gating-related
+ *   7. CPRMAN+0x108 = 0x5A0003C0          — PLLD CTL
+ *   8. CPRMAN+0x20  = 0x5A000040          — PLLD DSI0HSCK
+ *   9. CPRMAN+0x34  = 0x5A000000          — PLLD per
+ *  10. CPRMAN+0x30  = 0x5A000040          — PLLD core
+ *  11. CPRMAN+0x30  = 0x5A000011          — re-write with OSC source enabled
+ *
+ * Returns a status code packing the final CPRMAN+0x128 value so we can see
+ * if BUSY (bit 7) finally gets set. */
+int xhci_pcie_clk_full_sequence(void)
+{
+    extern void delay_ms(unsigned int ms);
+    volatile unsigned int *unk_ee = (volatile unsigned int *)0xFEE01000UL;
+    volatile unsigned int *unk_ec_10 = (volatile unsigned int *)0xFEC11010UL;
+    volatile unsigned int *unk_ec_14 = (volatile unsigned int *)0xFEC11014UL;
+    volatile unsigned int *cm = (volatile unsigned int *)CPRMAN_BASE;
+
+    /* Step 1: power domain enable at 0xFEE01000 bit 0 — likely the "ungate
+     * PCIe / GENET / PHY power" register.  Read-modify-write to preserve
+     * any other state.  CAUTION: if this block is gated too, the read hangs. */
+    unsigned int v = *unk_ee;
+    *unk_ee = v | 0x1;
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* Step 2-3: CPRMAN PCIe CTL + DIV (as before). */
+    cm[0x128 / 4] = CPRMAN_PASSWORD | 0x36;          /* CTL: KILL+ENAB+SRC=6 */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    cm[0x12C / 4] = CPRMAN_PASSWORD;                 /* DIV = 0 */
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* Step 4: CPRMAN+0x1390 |= 0x5A200001 (preserve password, set bits) */
+    unsigned int x = cm[0x1390 / 4];
+    cm[0x1390 / 4] = (x & 0xFFFFFF) | 0x5A200001U;
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* Step 5-6: 0xFEC11010/14 bit-0 clear.  Likely PHY gating disable. */
+    unsigned int e10 = *unk_ec_10;
+    *unk_ec_10 = e10 & ~1U;
+    unsigned int e14 = *unk_ec_14;
+    *unk_ec_14 = e14 & ~1U;
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* Step 7-10: PLLD-related writes.  These are at known CPRMAN offsets
+     * (PLLD_CTRL=0x10C in Linux but here 0x108 — VC4 disasm offset includes
+     * the entry header maybe). */
+    cm[0x108 / 4] = CPRMAN_PASSWORD | 0x3C0;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    cm[0x20 / 4]  = CPRMAN_PASSWORD | 0x40;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    cm[0x34 / 4]  = CPRMAN_PASSWORD;
+    cm[0x30 / 4]  = CPRMAN_PASSWORD | 0x40;
+    cm[0x30 / 4]  = CPRMAN_PASSWORD | 0x11;
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* Let things settle then read back the PCIe CTL — BUSY bit 7 should
+     * be set if clock is actually running. */
+    delay_ms(5);
+    return (int)(cm[0x128 / 4] & ~CPRMAN_PASSWORD);
+}
+
 int xhci_periph_write(unsigned int addr, unsigned int val)
 {
     static volatile unsigned int __attribute__((aligned(16))) buf[12];
@@ -335,6 +406,113 @@ int xhci_pcie_bring_up(void)
     return -2;                  /* timed out waiting for link */
 }
 
+/* Firmware-proxied probe of the addresses our start4.elf disassembly
+ * identified as PCIe-init gating points.  Each row reports the value AND
+ * the mailbox response code: 0x80000004 = firmware handled (value valid),
+ * 0 = firmware ignored (value is stale buffer).  An ignored response on
+ * a peripheral that we KNOW exists means the firmware's address allow-list
+ * doesn't include it — strong signal about what is/isn't routed.
+ *
+ * The headline target is 0x7E0000B4 bit 0 — disasm shows firmware's PCIe
+ * init code at ec63ff2-ec63ff6 reads (0x7E000080 + 0x34) and gives up
+ * unless bit 0 is set.  If we can SEE this bit via mailbox, we know our
+ * gp+5476 deduction is sound.  If we can WRITE this bit, we have a way to
+ * push firmware down the PCIe-init path without touching the gp register
+ * directly. */
+/* Single-address probe — caller passes the address; we mailbox-read and
+ * format.  NO UART tracing inside (uart_putc fans out to screen_putc and
+ * shellwin_record_char which appeared to deadlock in HTTP-handler context).
+ * Mirror /cprman's exact pattern instead — a known-good caller. */
+int xhci_pcie_fw_probe_one(char *out, int max, unsigned int addr)
+{
+    int p = 0;
+    p = s_put(out, p, max, "probe addr=");
+    p = s_puthex32(out, p, max, addr);
+    p = s_put(out, p, max, " ");
+
+    unsigned int v = 0, r = 0;
+    int rc = xhci_periph_read(addr, &v, &r);
+
+    if (rc != 0) {
+        p = s_put(out, p, max, "MBOX-FAIL");
+    } else {
+        p = s_put(out, p, max, "val=");
+        p = s_puthex32(out, p, max, v);
+        p = s_put(out, p, max, " resp=");
+        p = s_puthex32(out, p, max, r);
+        if (r == 0)                    p = s_put(out, p, max, " [IGNORED]");
+        else if (r == 0x80000008U)     p = s_put(out, p, max, " [HANDLED]");
+        else if (r & 0x80000000U)      p = s_put(out, p, max, " [REPLIED]");
+    }
+    p = s_put(out, p, max, "\n");
+    if (p < max) out[p] = 0;
+    return p;
+}
+
+/* Full sweep — kept for callers that already trust the mailbox.  Reads
+ * the same address list as the per-address probe to make selective
+ * recall easy in shell scripts. */
+int xhci_pcie_fw_probe(char *out, int max)
+{
+    /* PROVEN-SAFE-ONLY sweep — these are the exact addresses that the
+     * /cprman route successfully reads in production.  Any address NOT
+     * in this list must be tried one-at-a-time via /pcie-fw-probe1?addr=...
+     * because firmware can wedge the AXI bus on unmapped addresses (and
+     * the wedge stalls ARM instruction fetch too, defeating mbox_call's
+     * own timeout). */
+    int p = 0;
+    static const unsigned int addrs[] = {
+        0x7E101128U,  /* CPRMAN PCIe CTL — confirmed good via /cprman */
+        0xFE101128U,  /* same, ARM view — confirmed good via /cprman */
+        0x7E1011D0U,  /* EMMC2 CTL — confirmed good via /cprman */
+    };
+    for (unsigned i = 0; i < sizeof(addrs)/sizeof(addrs[0]); i++) {
+        p += xhci_pcie_fw_probe_one(out + p, max - p, addrs[i]);
+    }
+    if (p < max) out[p] = 0;
+    return p;
+}
+
+/* Force the firmware's PCIe-present gate at 0x7E0000B4 bit 0.  If SET_PERIPH_REG
+ * actually writes to peripherals (vs. only allow-listed addresses), the next
+ * call from firmware's own init path will see bit 0 set and continue.  We
+ * cannot trigger firmware re-entry from here — but if a subsequent xHCI reset
+ * mailbox call (or anything that re-runs the gate check) succeeds, the link
+ * may finally come up.  Reads back BOTH the gate AND CPRMAN PCIe CTL so we
+ * can see whether anything followed on. */
+int xhci_pcie_fw_gate_force(char *out, int max)
+{
+    int p = 0;
+    unsigned int v = 0, r = 0;
+
+    /* Read current gate value */
+    xhci_periph_read(0x7E0000B4, &v, &r);
+    p = s_put(out, p, max, "gate before: val=");
+    p = s_puthex32(out, p, max, v); p = s_put(out, p, max, " resp=");
+    p = s_puthex32(out, p, max, r); p = s_put(out, p, max, "\n");
+
+    /* Write back with bit 0 set, preserving everything else */
+    unsigned int newv = v | 1U;
+    int wrc = xhci_periph_write(0x7E0000B4, newv);
+    p = s_put(out, p, max, "write 0x7E0000B4 |= 1 rc=");
+    p = s_puthex32(out, p, max, (unsigned int)wrc); p = s_put(out, p, max, "\n");
+
+    /* Read back */
+    xhci_periph_read(0x7E0000B4, &v, &r);
+    p = s_put(out, p, max, "gate after : val=");
+    p = s_puthex32(out, p, max, v); p = s_put(out, p, max, " resp=");
+    p = s_puthex32(out, p, max, r); p = s_put(out, p, max, "\n");
+
+    /* Re-poll CPRMAN PCIe CTL to see if anything propagated */
+    xhci_periph_read(0x7E101128, &v, &r);
+    p = s_put(out, p, max, "CPRMAN PCIe CTL after: val=");
+    p = s_puthex32(out, p, max, v); p = s_put(out, p, max, " resp=");
+    p = s_puthex32(out, p, max, r); p = s_put(out, p, max, "\n");
+
+    if (p < max) out[p] = 0;
+    return p;
+}
+
 int xhci_pcie_dump_html(char *out, int max)
 {
     int p = 0;
@@ -376,4 +554,20 @@ int xhci_pcie_dump_html(char *out, int max)
     if (p < max) out[p] = 0;
     return p;
 }
+/* Stubs for everything tcp_server.c calls via `extern` — without these
+ * the QEMU build (which has no PCIE_BASE) won't link. */
+int xhci_pcie_bring_up(void)                       { return -1; }
+int xhci_periph_read(unsigned int a, unsigned int *o, unsigned int *r)
+                                                   { (void)a; if (o) *o = 0; if (r) *r = 0; return -1; }
+int xhci_periph_write(unsigned int a, unsigned int v)  { (void)a; (void)v; return -1; }
+int xhci_firmware_revision(unsigned int *o, unsigned int *r)
+                                                   { if (o) *o = 0; if (r) *r = 0; return -1; }
+unsigned int xhci_cprman_read(unsigned int off)    { (void)off; return 0; }
+int xhci_cprman_enable_pcie(void)                  { return -1; }
+int xhci_cprman_enable_pcie_src(unsigned int src)  { (void)src; return -1; }
+int xhci_cprman_pcie_axi_enable(void)              { return -1; }
+int xhci_pcie_fw_probe(char *out, int max)
+{ const char *s = "fw-probe: not supported\n"; int p=0; while(*s && p<max-1) out[p++]=*s++; if(p<max) out[p]=0; return p; }
+int xhci_pcie_fw_gate_force(char *out, int max)
+{ const char *s = "fw-gate-force: not supported\n"; int p=0; while(*s && p<max-1) out[p++]=*s++; if(p<max) out[p]=0; return p; }
 #endif

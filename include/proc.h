@@ -16,7 +16,7 @@
 #ifndef XINU_RPI4_PROC_H
 #define XINU_RPI4_PROC_H
 
-#define NPROC          8
+#define NPROC          256
 #define NULLPROC       0
 #define PROC_NAME_LEN  16
 #define PROC_DEFAULT_STK   4096UL

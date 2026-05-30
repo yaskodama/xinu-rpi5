@@ -168,6 +168,18 @@ int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name,
     if (stksize < 1024) stksize = 1024;
     stksize = ROUNDMB(stksize);
 
+    /* If a previous occupant of this slot died via proc_exit (self-exit),
+     * its stack memory was never freed (proc_exit cannot freemem its own
+     * live stack).  Free it now, before allocating the new slot's stack —
+     * otherwise long-lived spawn-and-suicide patterns leak ~stksize bytes
+     * per cycle and exhaust the heap.  proctab[pid].stkbase==0 after
+     * proc_kill() so this is a no-op for kill-reaped slots. */
+    if (proctab[pid].stkbase) {
+        freemem(proctab[pid].stkbase, proctab[pid].stklen);
+        proctab[pid].stkbase = 0;
+        proctab[pid].stklen  = 0;
+    }
+
     void *stk = getmem(stksize);
     if (stk == 0) return -1;
 

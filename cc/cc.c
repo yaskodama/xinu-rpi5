@@ -100,10 +100,14 @@ static void emit_dec(long v)
  * which makes the generated code break out of the loop.  Time-based (via
  * the generic timer) rather than an iteration count, because the MMU/
  * caches are off so per-iteration speed is unpredictable — and, crucially,
- * the JIT runs synchronously inside genet_rx_tick, so a runaway must abort
- * within a few tens of ms or the GENET RX ring overflows and the network
- * wedges.  CC_TIMEOUT_MS bounds that dispatch stall. */
-#define CC_TIMEOUT_MS 100
+ * Historical: the line below used to say "runs inside genet_rx_tick, so a
+ * runaway must abort in tens of ms or the GENET RX ring overflows".  That
+ * stopped being true once /compile moved onto the dedicated app-worker
+ * process and ctxsw learned to save FP across preemption (commit b160287)
+ * — net stays alive even during multi-second compiles now.  Bumped from
+ * 100 ms to 10 000 ms so the NQueens load-distribution benchmark (Pi
+ * subtrees on the order of seconds) can run without absurd splitting. */
+#define CC_TIMEOUT_MS 60000
 static unsigned long g_deadline;
 static int           g_aborted;
 
@@ -228,6 +232,33 @@ static long v_list_push(long w, long x)
     b[0] = n + 1;
     for (long i = 0; i < n; i++) b[1 + i] = src[1 + i];
     b[1 + n] = x;
+    return (long)((unsigned long)b | V_LIST_TAG);
+}
+/* Immutable element write: return a new list whose element i is x and all
+ * other elements come from `w`.  Used by AIPL `array_set(a, i, v)` —
+ * matches OCaml AIPL's immutable semantics so tree-search code that
+ * relies on each branch having its own state ports unchanged to Pi 4. */
+static long v_list_set(long w, long iv, long x)
+{
+    if (!v_is_list(w)) return w;
+    long *src = v_list_ptr(w);
+    long n = src[0]; long i = v_int_of(iv);
+    if (i < 0 || i >= n) return w;
+    long *b = lheap_alloc((int)(n + 1)); if (!b) return w;
+    b[0] = n;
+    for (long k = 0; k < n; k++) b[1 + k] = src[1 + k];
+    b[1 + i] = x;
+    return (long)((unsigned long)b | V_LIST_TAG);
+}
+/* Allocate a fresh list of size n with every element set to v_int(0).
+ * Used by AIPL `var a[N];` (fixed-size array allocation). */
+static long v_list_zeros(long nv)
+{
+    long n = v_int_of(nv);
+    if (n < 0) n = 0;
+    long *b = lheap_alloc((int)(n + 1)); if (!b) return v_int(0);
+    b[0] = n;
+    for (long k = 0; k < n; k++) b[1 + k] = v_int(0);
     return (long)((unsigned long)b | V_LIST_TAG);
 }
 static int v_truthy(long w)
@@ -397,6 +428,18 @@ static void cc_enqueue(long to, long mid, long a0, long a1, long a2, long a3)
 /* `new C()` -> spawn an actor process; returns its id (== g_obj index). */
 static long cc_actor_new(void) { return (long)ap_spawn(); }
 
+/* `suicide()` -> mark `self` as dead.  Receive loop in actorproc.c sees the
+ * flag after this dispatch returns, releases the vheap lock, then proc_exits
+ * so the slot is reusable by a subsequent ap_spawn.  The JIT passes `self`
+ * (the int actor id) as the first argument; we strip the value_t tag so the
+ * runtime gets a plain int. */
+extern void ap_suicide(int id);
+static long cc_actor_suicide(long self_v)
+{
+    ap_suicide((int)v_int_of(self_v));
+    return v_int(0);
+}
+
 /* Window-layout builtins (device/video/wm.c) — let an AIPL "Layout" actor
  * reposition the on-screen windows, driven by the Py-I screen designer.
  * Args arrive as value_t ints; idx is the window's add order (0-based). */
@@ -542,6 +585,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "v_int_of",   (void *)&v_int_of     },
         { "enqueue",    (void *)&cc_enqueue   },
         { "cc_actor_new",(void *)&cc_actor_new},
+        { "cc_actor_suicide", (void *)&cc_actor_suicide},
         { "cc_win_move",  (void *)&cc_win_move  },
         { "cc_win_resize",(void *)&cc_win_resize},
         { "cc_win_font",  (void *)&cc_win_font  },
@@ -562,8 +606,10 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_chat",      (void *)&cc_chat      },
         { "v_list_new",    (void *)&v_list_new    },
         { "v_list_push",   (void *)&v_list_push   },
+        { "v_list_set",    (void *)&v_list_set    },
         { "v_list_get",    (void *)&v_list_get    },
         { "v_list_len",    (void *)&v_list_len    },
+        { "v_list_zeros",  (void *)&v_list_zeros  },
         { "v_list_map",    (void *)&v_list_map    },
         { "v_list_filter", (void *)&v_list_filter },
         { 0, 0 }
@@ -582,18 +628,49 @@ static void cc_sync_icache(void *p, unsigned long len)
 {
     unsigned long start = (unsigned long)p;
     unsigned long end   = start + len;
-    for (unsigned long a = start; a < end; a += 16)
-        __asm__ volatile ("dc cvau, %0" :: "r"(a) : "memory");
+    /* Self-modifying-code sync for Cortex-A72 on this XINU port — note that
+     * SCTLR_EL1.C is left OFF (D-cache disabled at EL1) while SCTLR_EL1.I
+     * is ON (I-cache enabled).  In that asymmetric configuration:
+     *   * JIT stores skip the L1 D-cache entirely (going straight to RAM
+     *     via the store buffer), so `dc cvau` (clean to PoU) is a no-op
+     *     for the data we just wrote.
+     *   * The unified L2 may still hold STALE instruction lines that L1 I
+     *     loaded on a previous call — those have to be invalidated all the
+     *     way to PoC (Point of Coherency), not just PoU.
+     * Replay both the canonical "JIT write" sequence (dc cvau + ic ivau, by
+     * VA, to PoU) AND a `dc civac` (clean+invalidate by VA to PoC) so any
+     * stale L2 line is evicted regardless of which path it came in on.
+     * Then a final `ic iallu` + dsb sy + isb makes sure the next fetch can
+     * only come from RAM, where codegen just wrote the new bytes. */
+    for (unsigned long a = start; a < end; a += 64) {           /* L2 line = 64 B */
+        __asm__ volatile ("dc cvau,  %0" :: "r"(a) : "memory");
+        __asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
+    }
     __asm__ volatile ("dsb sy" ::: "memory");
-    for (unsigned long a = start; a < end; a += 16)
+    for (unsigned long a = start; a < end; a += 64)
         __asm__ volatile ("ic ivau, %0" :: "r"(a) : "memory");
-    __asm__ volatile ("dsb sy; isb" ::: "memory");
+    __asm__ volatile ("ic iallu" ::: "memory");                 /* belt + braces */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    __asm__ volatile ("isb"    ::: "memory");
+    (void)end;
 }
 
 /* ---------- the `cc` shell command ---------- */
 
-#define CC_ARENA   (256 * 1024)
-#define CC_CODECAP ( 64 * 1024)
+/* Parse arena and codegen output buffer sizes.
+ *
+ * CC_ARENA — temporary, freed after parse+codegen.  Each AST node is
+ * ~64 bytes, each func_t + locals ~200 bytes.  A 17-function AIPL
+ * tree-decomposition program (e.g. parallel N-Queens) needs $\sim$ 500 KB
+ * easily, so 256 KB was a hard ceiling that produced ``cc: compile
+ * error'' (arena exhausted) silently.  Bumped to 2 MB to comfortably
+ * handle generated dispatch tables for actor systems up to ~50 methods.
+ *
+ * CC_CODECAP — AArch64 native output; bumped to 256 KB.  At 50 bytes per
+ * instruction and a few hundred instructions per method, 17 methods +
+ * dispatch fit easily. */
+#define CC_ARENA   (2  * 1024 * 1024)
+#define CC_CODECAP (256 * 1024)
 
 /* Shared core: compile `src` (n bytes) and execute in place.  Program
  * output goes wherever the sink (g_cap / UART) currently points.
