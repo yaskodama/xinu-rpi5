@@ -84,13 +84,22 @@ exception_init:
 // blocked).  The vector branched here without BL so x30 still
 // holds the interrupted code's value; we save x30 explicitly.
 //
-// Layout of the saved frame: 32 × 8 = 256 bytes, all GPRs except
-// SP itself (which is already where we want it).  Restored in
-// reverse, then ERET pops ELR / SPSR back.
+// Frame layout (saved low-address-first, so sp+0 = x0 etc.):
+//   sp +   0  x0..x30             (16 × 16 = 256 bytes)
+//   sp + 256  v0..v31 (q regs)    (32 × 16 = 512 bytes)
+//                                  total 768 bytes (still 16-aligned)
+//
+// The FP/NEON block is wide and not free, but irq_dispatch_c may
+// call schedule()/ctxsw() which switches to a different process —
+// the INTERRUPTED process's FP state must survive that switch, and
+// since the interrupted code can be anything (including llm.c /
+// cc.c built with FP enabled via PI4_FP_CFLAGS), we save all of
+// v0-v31.  Lazy / on-demand FP save would be smaller but adds
+// CPACR trap plumbing — punt until profiling shows it matters.
 // ----------------------------------------------------------------
 .global irq_entry
 irq_entry:
-    sub     sp, sp, #(16 * 16)
+    sub     sp, sp, #(16 * 16 + 32 * 16)
     stp     x0,  x1,  [sp, #16 *  0]
     stp     x2,  x3,  [sp, #16 *  1]
     stp     x4,  x5,  [sp, #16 *  2]
@@ -108,7 +117,42 @@ irq_entry:
     stp     x28, x29, [sp, #16 * 14]
     str     x30,      [sp, #16 * 15]
 
+    /* Save the full NEON/FP register file at sp + 256. */
+    stp     q0,  q1,  [sp, #16 * 16 + 32 *  0]
+    stp     q2,  q3,  [sp, #16 * 16 + 32 *  1]
+    stp     q4,  q5,  [sp, #16 * 16 + 32 *  2]
+    stp     q6,  q7,  [sp, #16 * 16 + 32 *  3]
+    stp     q8,  q9,  [sp, #16 * 16 + 32 *  4]
+    stp     q10, q11, [sp, #16 * 16 + 32 *  5]
+    stp     q12, q13, [sp, #16 * 16 + 32 *  6]
+    stp     q14, q15, [sp, #16 * 16 + 32 *  7]
+    stp     q16, q17, [sp, #16 * 16 + 32 *  8]
+    stp     q18, q19, [sp, #16 * 16 + 32 *  9]
+    stp     q20, q21, [sp, #16 * 16 + 32 * 10]
+    stp     q22, q23, [sp, #16 * 16 + 32 * 11]
+    stp     q24, q25, [sp, #16 * 16 + 32 * 12]
+    stp     q26, q27, [sp, #16 * 16 + 32 * 13]
+    stp     q28, q29, [sp, #16 * 16 + 32 * 14]
+    stp     q30, q31, [sp, #16 * 16 + 32 * 15]
+
     bl      irq_dispatch_c
+
+    ldp     q0,  q1,  [sp, #16 * 16 + 32 *  0]
+    ldp     q2,  q3,  [sp, #16 * 16 + 32 *  1]
+    ldp     q4,  q5,  [sp, #16 * 16 + 32 *  2]
+    ldp     q6,  q7,  [sp, #16 * 16 + 32 *  3]
+    ldp     q8,  q9,  [sp, #16 * 16 + 32 *  4]
+    ldp     q10, q11, [sp, #16 * 16 + 32 *  5]
+    ldp     q12, q13, [sp, #16 * 16 + 32 *  6]
+    ldp     q14, q15, [sp, #16 * 16 + 32 *  7]
+    ldp     q16, q17, [sp, #16 * 16 + 32 *  8]
+    ldp     q18, q19, [sp, #16 * 16 + 32 *  9]
+    ldp     q20, q21, [sp, #16 * 16 + 32 * 10]
+    ldp     q22, q23, [sp, #16 * 16 + 32 * 11]
+    ldp     q24, q25, [sp, #16 * 16 + 32 * 12]
+    ldp     q26, q27, [sp, #16 * 16 + 32 * 13]
+    ldp     q28, q29, [sp, #16 * 16 + 32 * 14]
+    ldp     q30, q31, [sp, #16 * 16 + 32 * 15]
 
     ldp     x0,  x1,  [sp, #16 *  0]
     ldp     x2,  x3,  [sp, #16 *  1]
@@ -126,5 +170,5 @@ irq_entry:
     ldp     x26, x27, [sp, #16 * 13]
     ldp     x28, x29, [sp, #16 * 14]
     ldr     x30,      [sp, #16 * 15]
-    add     sp, sp, #(16 * 16)
+    add     sp, sp, #(16 * 16 + 32 * 16)
     eret

@@ -182,24 +182,33 @@ int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name,
 
     /* Lay out an initial saved-register frame at the top of the
      * stack, in the exact order ctxsw.S restores them:
-     *   [sp + 0  ] x29 (FP)
-     *   [sp + 8  ] x30 (LR)   <-- where `ret` jumps; we put `entry` here
-     *   [sp + 16 ] x27
-     *   [sp + 24 ] x28
-     *   [sp + 32 ] x25
-     *   [sp + 40 ] x26
-     *   ...
-     *   [sp + 88 ] x20
-     * 12 quadwords = 96 bytes, keeping the 16-byte SP alignment. */
+     *   [sp +   0] x29 (FP)
+     *   [sp +   8] x30 (LR)   <-- where `ret` jumps; we put `entry` here
+     *   [sp +  16] d14, d15   <-- AAPCS64 callee-saved FP (low 64 bits)
+     *   [sp +  32] d12, d13
+     *   [sp +  48] d10, d11
+     *   [sp +  64] d8,  d9
+     *   [sp +  80] x27, x28
+     *   [sp +  96] x25, x26
+     *   [sp + 112] x23, x24
+     *   [sp + 128] x21, x22
+     *   [sp + 144] x19, x20
+     * 20 quadwords = 160 bytes, keeping the 16-byte SP alignment.
+     * Initial FP regs are zeroed — fresh process has no meaningful
+     * FP state. */
     unsigned long *sp_top = (unsigned long *)((unsigned char *)stk + stksize);
-    unsigned long *sp     = sp_top - 12;
+    unsigned long *sp     = sp_top - 20;
     sp[0]  = 0;                          /* x29 (FP)            */
     sp[1]  = (unsigned long)entry;       /* x30 (LR -> entry)   */
-    sp[2]  = 0; sp[3]  = 0;              /* x27, x28            */
-    sp[4]  = 0; sp[5]  = 0;              /* x25, x26            */
-    sp[6]  = 0; sp[7]  = 0;              /* x23, x24            */
-    sp[8]  = 0; sp[9]  = 0;              /* x21, x22            */
-    sp[10] = 0; sp[11] = 0;              /* x19, x20            */
+    sp[2]  = 0; sp[3]  = 0;              /* d14, d15            */
+    sp[4]  = 0; sp[5]  = 0;              /* d12, d13            */
+    sp[6]  = 0; sp[7]  = 0;              /* d10, d11            */
+    sp[8]  = 0; sp[9]  = 0;              /* d8,  d9             */
+    sp[10] = 0; sp[11] = 0;              /* x27, x28            */
+    sp[12] = 0; sp[13] = 0;              /* x25, x26            */
+    sp[14] = 0; sp[15] = 0;              /* x23, x24            */
+    sp[16] = 0; sp[17] = 0;              /* x21, x22            */
+    sp[18] = 0; sp[19] = 0;              /* x19, x20            */
     p->sp = (void *)sp;
 
     ready_push(p);
