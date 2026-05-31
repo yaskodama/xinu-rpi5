@@ -202,12 +202,29 @@ static long v_floatlit(long bits)
  * out as [len][item0]..[item_{len-1}], each a value_t.  Like string concat,
  * lists are immutable and bump-allocated: push() copies + appends, returning
  * a new list.  Reset per run alongside the string heap. */
-static long  g_lheap[2048];
+/* 2048 cells (16 KB) overflowed at N=6 N-Queens — Solver tree with
+ * ~150 nodes each doing v_list_set(cols, r, c) ran out, after which
+ * v_list_set silently returned the original ref so every child branch
+ * saw the same mutated cols (sols=26 instead of 4).  32 K cells = 256 KB
+ * gives margin for tree workloads up to ~N=10 (~35 000 nodes).  Also
+ * UART-log the overflow so the silent-misbehave failure mode never
+ * recurs unnoticed. */
+static long  g_lheap[32768];
 static int   g_lheaplen;
-static void  lheap_reset(void) { g_lheaplen = 0; }
+static int   g_lheap_overflows;          /* count of failed allocations */
+int  cc_lheap_used(void)      { return g_lheaplen; }
+int  cc_lheap_overflows(void) { return g_lheap_overflows; }
+static void  lheap_reset(void) { g_lheaplen = 0; g_lheap_overflows = 0; }
 static long *lheap_alloc(int ncells)
 {
-    if (ncells < 0 || g_lheaplen + ncells > (int)(sizeof(g_lheap)/sizeof(g_lheap[0]))) return 0;
+    if (ncells < 0 || g_lheaplen + ncells > (int)(sizeof(g_lheap)/sizeof(g_lheap[0]))) {
+        if (g_lheap_overflows == 0) {                       /* one-shot log */
+            extern void uart_puts(const char *);
+            uart_puts("[cc] lheap OVERFLOW — array_set returns stale ref; bump g_lheap\n");
+        }
+        g_lheap_overflows++;
+        return 0;
+    }
     long *p = &g_lheap[g_lheaplen]; g_lheaplen += ncells; return p;
 }
 static long *v_list_ptr(long w) { return (long *)((unsigned long)w & V_PTR_MASK); }

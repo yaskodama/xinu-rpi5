@@ -17,7 +17,11 @@
 #include "irq.h"
 
 #define AP_NACT  (NPROC - 1)        /* one Xinu process per actor       */
-#define AP_QLEN  64
+#define AP_QLEN  256       /* was 64 — N=6+ N-Queens tree saturated parent
+                            * mailboxes (drops were silent in ap_post, causing
+                            * received != expected mismatches and indefinite
+                            * waits).  256 gives each actor enough headroom
+                            * for the deeper trees the JIT-actor pattern hits. */
 
 static struct {
     struct ap_msg q[AP_QLEN];
@@ -234,7 +238,12 @@ int ap_spawn(void)
     /* Find a freed slot (pid == -1, dead == 1) and reuse it; this lets
      * suicide-spawn cycles run indefinitely with a bounded actor table.
      * Without recycling, a 10 000-spawn benchmark would exhaust AP_NACT
-     * even though only a few actors are alive at any moment. */
+     * even though only a few actors are alive at any moment.
+     *
+     * Note: tested 2026-05-31 disabling recycling did NOT fix the N=6
+     * N-Queens wrong-answer (sols=26 vs expected 4), so recycling isn't
+     * the source of that bug — it's somewhere in aipl2c-generated code
+     * or v_list_set / v_add semantics under high-concurrency tree-search. */
     int id = -1;
     for (int i = 0; i < g_nact; i++) {
         if (g_act[i].pid == -1) { id = i; break; }
