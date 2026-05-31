@@ -1,0 +1,80 @@
+// nqueens_orch_mac.abcl — Mac OCaml AIPL 用 N-Queens オーケストレータ.
+//
+// 規約:
+//   - global 変数はアクター識別子のみ (var x = new Class(args);)
+//   - 関数定義はすべて class の内側
+//   - OCaml AIPL は new Class(args) で init(args) が auto-invoke
+//   - now actor.method(args) で同期呼出 (戻り値を受け取れる)
+//   - 配列は functional immutable: array_set は新配列を返す
+//
+// xinu-rpi4 版 (nqueens_orch.abcl) との違い:
+//   * now / future / 戻り値 reply が使える → 部分木 worker に投げ集約
+//   * GC API は使わない (Mac には actor pool 上限がほぼ無い)
+//   * 型注釈ナシでも OCaml 型推論はクリーンに通る (改良後の事前バインド)
+
+class Worker {
+  function safe(cols, row, c) {
+    var i = 0;
+    while (i < row) do {
+      var p = array_get(cols, i);
+      if (p == c)            { return 0; }
+      if (p - c == row - i)  { return 0; }
+      if (c - p == row - i)  { return 0; }
+      i = i + 1;
+    }
+    return 1;
+  }
+
+  /* recursive 形にして OCaml 型推論を pass (while+mutation だと
+     再帰呼び出しの戻り型未定で type mismatch を踏む) */
+  function try_col(cols, n, row, c) {
+    if (c >= n) { return 0; }
+    var here = 0;
+    if (safe(cols, row, c)) {
+      var cols2 = array_set(cols, row, c);
+      here = nq_count(cols2, n, row + 1);
+    }
+    return here + try_col(cols, n, row, c + 1);
+  }
+
+  function nq_count(cols, n, row) {
+    if (row == n) { return 1; }
+    return try_col(cols, n, row, 0);
+  }
+
+  method solve(n, k) {
+    var cols[12];
+    var cols2 = array_set(cols, 0, k);
+    reply(nq_count(cols2, n, 1));
+  }
+}
+
+class Orchestrator {
+  /* mac_dispatch を recursive 形に: while+mutation だと型エラーになる */
+  function dispatch(n, k_first, k_last) {
+    if (k_first >= k_last) { return 0; }
+    var w = new Worker();
+    var sub = now w.solve(n, k_first);
+    return sub + dispatch(n, k_first + 1, k_last);
+  }
+
+  function one(label, n) {
+    var t0 = now_ms();
+    var sol = dispatch(n, 0, n);
+    var dt = (now_ms()) - t0;
+    print("[" + label + "] N=" + n + " sol=" + sol + " elapsed_ms=" + dt);
+    return sol;
+  }
+
+  method init(tag) {
+    print("=== Mac OCaml orchestrator: " + tag + " ===");
+    var _4 = one("N=4", 4);
+    var _5 = one("N=5", 5);
+    var _6 = one("N=6", 6);
+    var _7 = one("N=7", 7);
+    var _8 = one("N=8", 8);
+    print("=== done ===");
+  }
+}
+
+var orch = new Orchestrator("Mac OCaml actor-based");

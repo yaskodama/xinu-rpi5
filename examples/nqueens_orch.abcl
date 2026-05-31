@@ -1,0 +1,201 @@
+// nqueens_orch.abcl — distributed N-Queens benchmark fully expressed in AIPL.
+//
+// 規約:
+//   - global 変数はアクター識別子のみ (var x = new Class();)
+//   - 関数定義はすべて class の内側
+//   - 評価の駆動 (Orchestrator) もアクターとして定義
+//   - 型推論クリーン: フィールド・引数・戻り値すべてに型注釈
+//
+// 構造:
+//   slot 0: GC          (gc_sweep を司り、自身を保護)
+//   slot 1: Root        (N-Queens の Solver tree の頂点)
+//   slot 2: Orchestrator (N=4..8 を順に root に流し込み、結果を集計)
+//   slot 3..K: Solver actors (動的)
+//
+// 外部 (Mac/Python) は /actor/load 後、 /actor/send で
+// Orchestrator.get(k) を polling して結果を取り出すだけ.
+
+class Solver {
+  /* actor handles are slot ids at runtime; `any` is the inferencer
+     escape hatch so `send parent.reply(...)` passes the actor check. */
+  var parent      : any = 0;
+  var parent_slot : int = 0;
+  var expected    : int = 0;
+  var received    : int = 0;
+  var sumv        : int = 0;
+
+  function safe(cols: any, r: int, c: int) -> int {
+    var i : int = 0;
+    while (i < r) do {
+      var p : int = array_get(cols, i);
+      if (p == c)          { return 0; }
+      if (p - c == r - i)  { return 0; }
+      if (c - p == r - i)  { return 0; }
+      i = i + 1;
+    }
+    return 1;
+  }
+
+  method init_parent(par: any, sl: int) {
+    parent = par;
+    parent_slot = sl;
+  }
+
+  method compute(cols: any, r: int, n: int) {
+    received = 0;  sumv = 0;
+    if (r == n) {
+      send parent.reply(parent_slot, 1);
+      suicide();
+    } else {
+      var c : int = 0;
+      var n_kids : int = 0;
+      while (c < n) do {
+        if (safe(cols, r, c)) {
+          var cols2 : any = array_set(cols, r, c);
+          var child : any = new Solver();
+          send child.init_parent(self, n_kids);
+          send child.compute(cols2, r + 1, n);
+          n_kids = n_kids + 1;
+        }
+        c = c + 1;
+      }
+      expected = n_kids;
+      if (n_kids == 0) {
+        send parent.reply(parent_slot, 0);
+        suicide();
+      }
+    }
+  }
+
+  method reply(slot: int, v: int) {
+    sumv = sumv + v;
+    received = received + 1;
+    if (received == expected) {
+      send parent.reply(parent_slot, sumv);
+      suicide();
+    }
+  }
+}
+
+class Root {
+  var n           : int = 0;
+  var orch_id     : any = 0;       /* actor handle of Orchestrator */
+  var n_solutions : int = 0;
+
+  method set_orch(o: any) {
+    orch_id = o;
+  }
+
+  method bootstrap(nv: int) {
+    n = nv;
+    n_solutions = 0;
+    var cols[12];
+    var top : any = new Solver();
+    send top.init_parent(self, 0);
+    send top.compute(cols, 0, n);
+  }
+
+  method reply(slot: int, v: int) {
+    n_solutions = v;
+    send orch_id.on_result(n, v);
+  }
+}
+
+class Orchestrator {
+  var root_id : any = 0;
+  var gc_id   : any = 0;
+  var n_idx   : int = 0;
+  var n_done  : int = 0;
+  var t_start : int = 0;
+  /* 5 個の結果スロット (N=4..8) */
+  var s4 : int = 0; var s5 : int = 0; var s6 : int = 0; var s7 : int = 0; var s8 : int = 0;
+  /* 5 個の経過時間 (ms) */
+  var t4 : int = 0; var t5 : int = 0; var t6 : int = 0; var t7 : int = 0; var t8 : int = 0;
+
+  /* renamed from `init` so `new Orchestrator()` doesn't get arity-checked
+     against it (the type system reserves `init` for constructor binding). */
+  method start(root: any, gc: any) {
+    root_id = root;
+    gc_id   = gc;
+    /* 自分自身, Root, GC を sweep から保護 */
+    actor_protect(self,    1);
+    actor_protect(root_id, 1);
+    actor_protect(gc_id,   1);
+    /* Root にコールバック先 (this Orchestrator) を教える */
+    send root_id.set_orch(self);
+    /* 最初の N=4 を起動 */
+    n_idx = 0;
+    t_start = now_ms();
+    print("[ORCH] N=4 start");
+    send root_id.bootstrap(4);
+  }
+
+  method on_result(n: int, sol: int) {
+    var elapsed : int = now_ms() - t_start;
+    if (n_idx == 0) { s4 = sol; t4 = elapsed; }
+    if (n_idx == 1) { s5 = sol; t5 = elapsed; }
+    if (n_idx == 2) { s6 = sol; t6 = elapsed; }
+    if (n_idx == 3) { s7 = sol; t7 = elapsed; }
+    if (n_idx == 4) { s8 = sol; t8 = elapsed; }
+    print("[ORCH] N=" + n + " sol=" + sol + " elapsed_ms=" + elapsed);
+    n_idx = n_idx + 1;
+    gc_sweep(30000, 0);                     /* zombie check (期待: 0) */
+    t_start = now_ms();
+    if (n_idx == 1) { print("[ORCH] N=5 start"); send root_id.bootstrap(5); }
+    if (n_idx == 2) { print("[ORCH] N=6 start"); send root_id.bootstrap(6); }
+    if (n_idx == 3) { print("[ORCH] N=7 start"); send root_id.bootstrap(7); }
+    if (n_idx == 4) { print("[ORCH] N=8 start"); send root_id.bootstrap(8); }
+    if (n_idx == 5) { n_done = 1; print("[ORCH] all done"); }
+  }
+
+  method get(k: int) -> int {
+    if (k == 0)  { return n_done; }
+    if (k == 1)  { return n_idx; }
+    if (k == 10) { return s4; }
+    if (k == 11) { return s5; }
+    if (k == 12) { return s6; }
+    if (k == 13) { return s7; }
+    if (k == 14) { return s8; }
+    if (k == 20) { return t4; }
+    if (k == 21) { return t5; }
+    if (k == 22) { return t6; }
+    if (k == 23) { return t7; }
+    if (k == 24) { return t8; }
+    return 0;
+  }
+}
+
+class GC {
+  var threshold_ms : int = 30000;
+  var killed_total : int = 0;
+  var scans_total  : int = 0;
+  var last_killed  : int = 0;
+  var last_scanned : int = 0;
+
+  method setup(my_id: any) {
+    actor_protect(my_id, 1);
+  }
+
+  method tick() {
+    last_scanned = actor_count();
+    last_killed  = gc_sweep(threshold_ms, 0);
+    killed_total = killed_total + last_killed;
+    scans_total  = scans_total + 1;
+  }
+
+  method get(k: int) -> int {
+    if (k == 0) { return killed_total; }
+    if (k == 1) { return scans_total; }
+    if (k == 2) { return last_killed; }
+    if (k == 3) { return last_scanned; }
+    if (k == 4) { return threshold_ms; }
+    return 0;
+  }
+}
+
+/* 全 global は actor 識別子のみ. 関数は全て class の中. */
+var gc   = new GC();
+send gc.setup(gc);
+var root = new Root();
+var orch = new Orchestrator();
+send orch.start(root, gc);
