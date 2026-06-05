@@ -119,6 +119,31 @@ void wm_add(window_t *w)
     t->next = w;
 }
 
+/* Address a window by its add order (0-based), like the Pi 4 Layout actor's
+ * win_move/win_resize builtins.  The Mac screen-designer ships geometry over
+ * the debug UART and these reposition the live windows (the wm_run loop
+ * repaints every frame, so changes show on the next frame). */
+window_t *wm_nth(int id)
+{
+    window_t *w = wm_head;
+    while (w && id-- > 0) w = w->next;
+    return w;
+}
+
+void wm_move_window(int id, int x, int y)
+{
+    window_t *w = wm_nth(id);
+    if (w) { w->x = x; w->y = y; }
+}
+
+void wm_resize_window(int id, int w_, int h_)
+{
+    window_t *w = wm_nth(id);
+    if (!w) return;
+    if (w_ >= 32) w->width  = w_;     /* keep at least a usable chrome size */
+    if (h_ >= 24) w->height = h_;
+}
+
 static void draw_chrome(window_t *w)
 {
     /* outer border */

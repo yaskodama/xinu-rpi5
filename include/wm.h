@@ -42,6 +42,13 @@ typedef struct window {
  * draw order, though we don't currently overlap them). */
 void wm_add(window_t *w);
 
+/* Reposition / resize a window by its add order (0-based).  Used by the
+ * serial layout-command parser so the Mac screen-designer can rearrange the
+ * live desktop over the debug UART (Pi 5 has no network). */
+struct window *wm_nth(int id);
+void wm_move_window(int id, int x, int y);
+void wm_resize_window(int id, int w, int h);
+
 /* Main loop.  Clears the desktop to a dark background, walks the
  * window list, and redraws frame by frame at ~20 fps.  Never
  * returns — callers should have finished bootstrapping. */

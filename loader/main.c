@@ -610,6 +610,62 @@ static void win_mem(window_t *self, unsigned int frame)
     draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
 }
 
+/* ------------------------------------------------------------------ *
+ * Debug-UART control channel — the Mac "screen designer" (Py-I        *
+ * dashboard /layout5) ships window geometry + keystrokes over the     *
+ * serial line because the Pi 5 has no working network.  Framing:      *
+ *   0x1D 'M' id x y \n   -> move window <id> to (x,y)                  *
+ *   0x1D 'R' id w h  \n   -> resize window <id> to w×h                 *
+ *   any other byte       -> keystroke into the focused Shell window   *
+ * ------------------------------------------------------------------ */
+static int sc_atoi_adv(const char **pp)
+{
+    const char *p = *pp;
+    while (*p == ' ' || *p == '\t') p++;
+    int sign = 1;
+    if (*p == '-') { sign = -1; p++; }
+    int v = 0, got = 0;
+    while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; got = 1; }
+    *pp = p;
+    return got ? sign * v : 0;
+}
+
+static void serial_layout_cmd(const char *s)
+{
+    char op = s[0];
+    const char *p = s + 1;
+    int id = sc_atoi_adv(&p);
+    int a  = sc_atoi_adv(&p);
+    int b  = sc_atoi_adv(&p);
+    if (op == 'M') wm_move_window(id, a, b);
+    else if (op == 'R') wm_resize_window(id, a, b);
+}
+
+static void serial_io_tick(void)
+{
+    static char cmd[64];
+    static int  clen = 0;
+    static int  in_cmd = 0;
+    int ch, budget = 256;
+
+    genet_rx_tick();                 /* keep the (no-op on Pi 5) net drain */
+
+    while (budget-- > 0 && (ch = uart_poll_char()) >= 0) {
+        if (!in_cmd) {
+            if (ch == 0x1D) { in_cmd = 1; clen = 0; }   /* GS: command start */
+            else shellwin_handle_key((char)ch);         /* keystroke -> Shell */
+        } else {
+            if (ch == '\n' || ch == '\r') {
+                cmd[clen] = 0;
+                serial_layout_cmd(cmd);
+                in_cmd = 0; clen = 0;
+            } else if (clen < (int)sizeof(cmd) - 1) {
+                cmd[clen++] = (char)ch;
+            }
+        }
+    }
+}
+
 /* Static window descriptors — laid out after video_init() picks the
  * actual screen dimensions in kernel_main(). */
 static window_t banner_win;
@@ -905,7 +961,7 @@ void kernel_main(void)
         shell_win.content_bg   = 0xFF000010U;
         shell_win.draw_content = shellwin_draw;
         wm_add(&shell_win);
-        wm_set_tick(genet_rx_tick);
+        wm_set_tick(serial_io_tick);   /* drain net + debug-UART layout/keys */
 
         /* Soft keyboard window: bottom-left of the initial 640×480
          * viewport.  Half-size as the user requested. */
