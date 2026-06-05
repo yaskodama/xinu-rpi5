@@ -80,6 +80,7 @@ void uart_init(void)
     }
 #endif
 
+#ifndef UART_NO_REINIT
     /* 1. Disable while we reprogram. */
     UART_CR = 0;
 
@@ -98,6 +99,11 @@ void uart_init(void)
 
     /* 4. Re-enable TX + RX. */
     UART_CR = CR_UARTEN | CR_TXE | CR_RXE;
+#else
+    /* Pi 5 debug UART (0x107D001000): firmware already enabled it at
+     * 115200 (reference clock != 48 MHz, so re-deriving IBRD/FBRD would
+     * garble the proven config).  Leave it untouched — just drain RX. */
+#endif
 
     /* Drain any bytes the firmware / QEMU stdio pumped in before we
      * finished reprogramming — otherwise piped-stdin smoke tests

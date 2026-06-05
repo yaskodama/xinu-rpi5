@@ -61,12 +61,30 @@ void timer_init(void)
     connect_interrupt(TIMER_IRQ_PPI, timer_irq_handler, 0);
     gic_enable_irq(TIMER_IRQ_PPI);
 
+#ifdef GIC_BASE
     /* ENABLE=1, IMASK=0 — IRQ now pending in CNTP, will fire as
      * soon as the CPU unmasks DAIF.I (caller's responsibility). */
     cntp_set_ctl(1);
+#else
+    /* No reachable GIC (Pi 5: 41-bit GIC unmapped with MMU off).  Leave
+     * the timer IRQ MASKED so an undeliverable/un-acked PPI can't livelock
+     * the CPU; the free-running CNTPCT counter still drives timer_ticks(). */
+    cntp_set_ctl(2);                /* ENABLE=0, IMASK=1 */
+#endif
 }
 
 unsigned long timer_ticks(void)
 {
-    return tick_count;
+    /* Pi 5: the GIC (0x1007FFF9000) is a 41-bit address, unreachable with
+     * the MMU off (40-bit PA limit -> address-size fault), so the timer
+     * PPI is never delivered and tick_count never advances.  Derive a live
+     * tick from the always-readable generic-timer COUNTER instead — no GIC,
+     * no memory access, just a system register.  (Pi 4's GIC is 32-bit and
+     * the real IRQ path keeps tick_count authoritative there.) */
+    if (tick_count) return tick_count;          /* real IRQ path is live */
+    unsigned long cnt, frq;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(cnt));
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(frq));
+    if (frq < TIMER_HZ) return cnt;             /* avoid div-by-zero      */
+    return cnt / (frq / TIMER_HZ);              /* polled 100 Hz uptime   */
 }

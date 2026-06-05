@@ -62,8 +62,8 @@ void wm_cursor_set(int x, int y, int visible);
  * wm_pan(dx, dy) shifts the viewport by (dx, dy) pixels, clamping
  * so the viewport never leaves the desktop.  wm_set_viewport()
  * is the absolute version. */
-#define WM_DESKTOP_W   1280
-#define WM_DESKTOP_H    960
+#define WM_DESKTOP_W   1920
+#define WM_DESKTOP_H   1080
 
 void wm_pan(int dx, int dy);
 void wm_set_viewport(int x, int y);

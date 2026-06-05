@@ -13,8 +13,8 @@
 #ifndef XINU_RPI5_VIDEO_H
 #define XINU_RPI5_VIDEO_H
 
-#define SCREEN_WIDTH    640
-#define SCREEN_HEIGHT   480
+#define SCREEN_WIDTH    1920
+#define SCREEN_HEIGHT   1080
 #define SCREEN_DEPTH    32
 #define FONT_WIDTH      8
 #define FONT_HEIGHT     8

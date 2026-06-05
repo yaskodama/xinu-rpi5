@@ -83,9 +83,20 @@ COMMON  = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
 # 0x107C00B880 (best-effort).  Serial console = GPIO14/15 = RP1 UART0 at
 # BCM2712-side 0x1F00030000 (PCIe window to RP1; needs pciex4_reset=0 in
 # config.txt).  HEAP_END 1 GiB conservative for the smallest Pi 5.
+# Console = PCIe-independent BCM2712 debug UART @ 0x107D001000 (the 3-pin
+# JST between the micro-HDMIs; firmware brings it up at 115200, proven by
+# first-light).  NOT the RP1 UART0 @ 0x1F00030000 — that is behind PCIe and
+# data-aborts unless pciex4_reset=0.  UART_NO_REINIT keeps the firmware's
+# baud (the debug UART clock != 48 MHz, so re-deriving IBRD/FBRD would
+# garble the proven 115200).  GIC-400 @ 0x1007FFF8000 (from the official
+# bcm2712 dtb: soc ranges 0x0->0x10_00000000, gic child 0x7fff9000);
+# GIC_GROUP1 because Pi 5 hands off in NON-secure EL1 under BL31, so the
+# timer PPI must be group 1 or the NS CPU interface never sees it.
 PI5_CFLAGS  = $(COMMON) -mcpu=cortex-a76 \
-              -DUART0_BASE=0x1F00030000UL \
+              -DUART0_BASE=0x107D001000UL \
+              -DUART_NO_REINIT \
               -DMBOX_BASE=0x107C013880UL \
+              -DMBOX_PROBE_BUS \
               -DHEAP_END=0x40000000UL \
               -DBOARD_NAME=\"Pi5\" \
               -DSOC_NAME=\"BCM2712\" \

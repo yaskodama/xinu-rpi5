@@ -64,12 +64,24 @@ void gic_init(void)
      * — but writing the low banks is harmless on GIC-400. */
     for (int n = 8; n < 256; n++) GICD_ITARGETSR(n) = 0x01010101U;
 
-    /* All IRQs in group 0 for now (Pi 4 boots EL1 non-secure so
-     * group 0 maps to the CPU interface we read from). */
+#ifdef GIC_GROUP1
+    /* Pi 5: BL31 (ARM Trusted Firmware) hands us off in NON-secure EL1.
+     * The NS CPU interface only ever sees group-1 interrupts; a group-0
+     * (secure) IRQ is delivered as FIQ to the secure world and our
+     * GICC_IAR read returns 1022 (can't-ack).  So every IRQ we want
+     * (the timer PPI 30, future SPIs) must be group 1. */
+    for (int n = 0; n < 32; n++) GICD_IGROUPR(n) = 0xFFFFFFFFU;
+
+    /* Enable group 1 (NS view: GICD_CTLR bit0 = EnableGrp1). */
+    GICD_CTLR = 1;
+#else
+    /* Pi 4: secure-world boot (no ATF monitor) — group 0 maps to the
+     * CPU interface we read from. */
     for (int n = 0; n < 32; n++) GICD_IGROUPR(n) = 0;
 
     /* Enable distributor. */
     GICD_CTLR = 1;
+#endif
 
     /* CPU interface: priority mask wide open, then enable. */
     GICC_PMR  = 0xF0;
