@@ -97,6 +97,7 @@ PI5_CFLAGS  = $(COMMON) -mcpu=cortex-a76 \
               -DUART_NO_REINIT \
               -DMBOX_BASE=0x107C013880UL \
               -DMBOX_PROBE_BUS \
+              -DRP1_ETH_BASE=0x1F00100000UL \
               -DHEAP_END=0x40000000UL \
               -DBOARD_NAME=\"Pi5\" \
               -DSOC_NAME=\"BCM2712\" \

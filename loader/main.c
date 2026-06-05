@@ -803,6 +803,16 @@ void kernel_main(void)
      * ~0x06000000 on Pi 4) so we know the controller is powered. */
     genet_init();
 
+#ifdef RP1_ETH_BASE
+    /* Pi 5: the real NIC is the Cadence GEM inside the RP1 (over PCIe).
+     * Milestone 1 — confirm the controller answers at 0x1F00100000
+     * (needs pciex4_reset=0 in config.txt to keep PCIe up). */
+    {
+        extern int rp1eth_probe(void);
+        rp1eth_probe();
+    }
+#endif
+
     /* Pass our MAC to the responder so ARP replies carry the
      * right source MAC.  d8:3a:dd:a7:fd:bf — confirmed from
      * pre-reset UMAC read on this Pi 4. */
