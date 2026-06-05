@@ -155,6 +155,45 @@ static int pcie_link_up(void)
     return ((s & STATUS_DL_ACTIVE) && (s & STATUS_PHYLINKUP)) ? 1 : 0;
 }
 
+/* ---- PCIe enumeration: program the RC bridge + the RP1 endpoint so the
+ * RP1's BAR claims PCIe addr 0 and memory decode is on. ---- */
+#define EXT_CFG_INDEX 0x9000
+#define EXT_CFG_DATA  0x8000
+#define CMD_MEM_BM    (0x2u|0x4u|0x40u|0x100u)   /* MEMORY|MASTER|PARITY|SERR */
+
+#define W8(a,v)   (*(volatile unsigned char  *)(u64)(a) = (unsigned char)(v))
+#define W16(a,v)  (*(volatile unsigned short *)(u64)(a) = (unsigned short)(v))
+#define W32(a,v)  (*(volatile u32            *)(u64)(a) = (u32)(v))
+#define RD32(a)   (*(volatile u32 *)(u64)(a))
+
+static u64 ep(int reg)   /* bus1/slot0/func0 config window */
+{
+    P(EXT_CFG_INDEX) = (1u << 20);          /* cfg_index(bus1,devfn0,0) */
+    return PCIE_BASE + EXT_CFG_DATA + reg;
+}
+
+static void pcie_enumerate(void)
+{
+    /* --- the RC bridge (bus 0, its own config @ PCIE_BASE+reg) --- */
+    W8 (PCIE_BASE + 0x19, 1);               /* secondary bus   = 1 */
+    W8 (PCIE_BASE + 0x1a, 1);               /* subordinate bus = 1 */
+    W16(PCIE_BASE + 0x20, 0);               /* memory base  (pcie 0 >> 16) */
+    W16(PCIE_BASE + 0x22, 0);               /* memory limit */
+    W16(PCIE_BASE + 0x3e, 1);               /* bridge control: parity */
+    W16(PCIE_BASE + 0x04, CMD_MEM_BM);      /* bridge command */
+
+    /* --- the RP1 endpoint (bus 1) --- */
+    u32 viddid = RD32(ep(0x00));
+    uart_puts("pcie: EP bus1 VID/DID = 0x"); puthex(viddid); uart_puts("\n");
+
+    W8 (ep(0x0c), 16);                      /* cache line size 64/4 */
+    W32(ep(0x10), 0x0u | 0x4u);             /* BAR0 = pcie 0, 64-bit mem */
+    W32(ep(0x14), 0x0u);                    /* BAR0 high */
+    W32(ep(0x18), 0x00400000u);             /* BAR2 = RP1 SRAM pcie 0x400000 */
+    W32(ep(0x1c), 0x0u);                    /* BAR2 high */
+    W16(ep(0x04), CMD_MEM_BM);              /* endpoint command: memory enable */
+}
+
 /* Returns 0 if the link to the RP1 came up. */
 int rp1pcie_init(void)
 {
@@ -229,12 +268,16 @@ int rp1pcie_init(void)
     u32 st = P(MISC_PCIE_STATUS);
     uart_puts("pcie: STATUS=0x"); puthex(st);
     uart_puts(pcie_link_up() ? "  LINK UP\n" : "  link down\n");
+    if (!pcie_link_up()) return -1;
 
-    /* probe: read the RP1 clock controller — should no longer be 0xdeaddead */
+    /* link is up — enumerate so the RP1's BAR claims PCIe addr 0 */
+    pcie_enumerate();
+
+    /* now the RP1 window should be live (not 0xdeaddead / 0xffffffff) */
     uart_puts("pcie: RP1 clocks@0x1F00018000 = 0x");
     puthex(R(0x1F00018000UL)); uart_puts("\n");
 
-    return pcie_link_up() ? 0 : -1;
+    return 0;
 }
 
 #endif /* RP1_ETH_BASE */
