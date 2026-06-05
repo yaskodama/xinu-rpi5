@@ -61,6 +61,37 @@ static void rp1_clk_enable_eth(void)
     for (volatile unsigned long i = 0; i < 200000u; i++) { }   /* settle */
 }
 
+static void msdelay(unsigned ms)
+{
+    unsigned long f, end, now;
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(f));
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+    end = now + (f / 1000u) * ms + 1;
+    do { __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now)); } while (now < end);
+}
+
+/* RP1 GPIO: drive ETH_RST_N (GPIO 32 = bank 1, pin 4, active-low) to pulse the
+ * Ethernet PHY's reset, then release it.  CTRL = OEOVER(ENABLE) | OUTOVER(val)
+ * | FUNCSEL(sys_rio).  OUTOVER 2 = force low, 3 = force high. */
+#define RP1_GPIO_IO     0x1F000D0000UL
+#define GCTRL(bk,pn)    (*(volatile unsigned int *)(RP1_GPIO_IO + (unsigned long)(bk)*0x4000 + (unsigned long)(pn)*8 + 4))
+static void rp1_phy_reset(void)
+{
+    GCTRL(1, 4) = (3u << 14) | (2u << 12) | 5u;   /* output enable, drive LOW  */
+    msdelay(10);                                   /* assert reset (>5ms)       */
+    GCTRL(1, 4) = (3u << 14) | (3u << 12) | 5u;   /* drive HIGH = release reset*/
+    msdelay(30);                                   /* let the PHY come up        */
+}
+
+/* Program a locally-administered MAC into the GEM's address-1 filter. */
+#define GEM_NCFGR 0x004
+static void rp1eth_set_mac(void)
+{
+    static const unsigned char mac[6] = { 0x02, 0xCA, 0xFE, 0xB0, 0x05, 0x01 };
+    E(GEM_SA1B) = mac[0] | (mac[1]<<8) | (mac[2]<<16) | (mac[3]<<24);
+    E(GEM_SA1T) = mac[4] | (mac[5]<<8);
+}
+
 /* Clause-22 MDIO read.  MAN = SOF(01) RW(10=read) PHYA REGA CODE(10). */
 unsigned int rp1eth_mdio_read(int phy, int reg)
 {
@@ -112,6 +143,18 @@ int rp1eth_probe(void)
         if (i < 5) uart_putc(':');
     }
     uart_puts("\n");
+
+    /* Bring up the management interface + PHY before reading its ID:
+     *  - NCFGR MDC clock divider = pclk/224 (GEM_CLK field, offset 18 = 7)
+     *  - program a MAC, then pulse the PHY reset (RP1 GPIO ETH_RST_N). */
+    if (alive) {
+        unsigned int ncfgr = E(GEM_NCFGR);
+        ncfgr &= ~(7u << 18);
+        ncfgr |=  (7u << 18);                      /* GEM_CLK_DIV224 */
+        E(GEM_NCFGR) = ncfgr;
+        rp1eth_set_mac();
+        rp1_phy_reset();
+    }
 
     unsigned int id1 = rp1eth_mdio_read(1, 2);    /* PHY ID reg 2 */
     unsigned int id2 = rp1eth_mdio_read(1, 3);    /* PHY ID reg 3 */
