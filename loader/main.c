@@ -808,7 +808,9 @@ void kernel_main(void)
      * Milestone 1 — confirm the controller answers at 0x1F00100000
      * (needs pciex4_reset=0 in config.txt to keep PCIe up). */
     {
+        extern int rp1pcie_init(void);
         extern int rp1eth_probe(void);
+        rp1pcie_init();     /* train the PCIe link to the RP1 first */
         rp1eth_probe();
     }
 #endif
