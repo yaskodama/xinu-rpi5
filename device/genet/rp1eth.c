@@ -177,6 +177,8 @@ static int g_rxhead, g_txi;
 static unsigned long g_rxcnt, g_txcnt;
 unsigned long rp1eth_rx_count(void) { return g_rxcnt; }
 unsigned long rp1eth_tx_count(void) { return g_txcnt; }
+unsigned int  rp1eth_rsr(void)  { return E(0x020); }            /* RX status */
+unsigned int  rp1eth_rxd0(void) { return g_rxr ? g_rxr[0].addr : 0xffffffffu; }
 
 unsigned int rp1eth_phy_bmsr(void) { return rp1eth_mdio_read(1, 1); }   /* BMSR */
 int rp1eth_link_up(void) { return (rp1eth_phy_bmsr() & 0x0004) ? 1 : 0; }/* bit2 */
@@ -208,6 +210,10 @@ void rp1eth_start(void)
     /* USRIO: select the RGMII interface (GEM_BIT(RGMII) = bit0).  Without this
      * the GEM stays in GMII mode and no frames flow even with the link up. */
     E(0x0c0) = 0x1u;
+
+    /* NCFGR: copy-all-frames (CAF/promiscuous, bit4) so the RX filter can't be
+     * the reason for Erx=0 while we debug; keep MDC clock. */
+    E(GEM_NCFGR) |= (1u << 4);
 
     E(GEM_NCR) = NCR_RE | NCR_TE | NCR_MPE_B;       /* enable RX + TX */
 
