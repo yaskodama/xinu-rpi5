@@ -19,8 +19,8 @@
 /* Visible scrollback size in the shell window.  18 rows × 72 cols
  * fits cleanly under our 640×480 layout with the 8×8 font.  Each
  * row stores a NUL-terminated string. */
-#define SHELLWIN_ROWS    74    /* enough rows to fill the shell window at 720p */
-#define SHELLWIN_COLS    61
+#define SHELLWIN_ROWS    112   /* enough rows to fill the tall shell window at 1080p */
+#define SHELLWIN_COLS    92
 
 /* Clear the ring and reset write head.  Must be called before any
  * uart traffic if shellwin output is to be captured. */

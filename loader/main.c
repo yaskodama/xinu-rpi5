@@ -1275,10 +1275,10 @@ void kernel_main(void)
 
         /* Status window: right side of the initial viewport so
          * the shell on the left has room to show the full log. */
-        status_win.x = 515;
-        status_win.y = 30;
-        status_win.width  = 373;
-        status_win.height = 330;
+        status_win.x = 772;
+        status_win.y = 44;
+        status_win.width  = 560;
+        status_win.height = 500;
         const char *st = "System status";
         for (int i = 0; i < WM_TITLE_MAX && st[i]; i++) status_win.title[i] = st[i];
         status_win.chrome_color = 0xFF60FF60U;
@@ -1290,10 +1290,10 @@ void kernel_main(void)
 
         /* File-tree window: well off the initial viewport so the
          * user can pan right to discover it. */
-        ftree_win.x = 896;
-        ftree_win.y = 30;
-        ftree_win.width  = 380;
-        ftree_win.height = 228;
+        ftree_win.x = 1344;
+        ftree_win.y = 44;
+        ftree_win.width  = 572;
+        ftree_win.height = 700;
         const char *ft = "VFS tree";
         for (int i = 0; i < WM_TITLE_MAX && ft[i]; i++) ftree_win.title[i] = ft[i];
         ftree_win.chrome_color = 0xFF60D0FFU;
@@ -1305,10 +1305,10 @@ void kernel_main(void)
 
         /* Memory window: right side, below status so it sits in
          * the initial viewport with the shell on the left. */
-        mem_win.x = 515;
-        mem_win.y = 366;
-        mem_win.width  = 373;
-        mem_win.height = 344;
+        mem_win.x = 772;
+        mem_win.y = 556;
+        mem_win.width  = 560;
+        mem_win.height = 518;
         const char *mt = "Memory";
         for (int i = 0; i < WM_TITLE_MAX && mt[i]; i++) mem_win.title[i] = mt[i];
         mem_win.chrome_color = 0xFFFFE060U;
@@ -1320,10 +1320,10 @@ void kernel_main(void)
 
         /* Actors window: a third column on the right (panned into view if the
          * initial viewport is narrower).  Lists gateway + AIPL actors + GC. */
-        actors_win.x = 896;
-        actors_win.y = 262;
-        actors_win.width  = 380;
-        actors_win.height = 228;
+        actors_win.x = 1344;
+        actors_win.y = 44;
+        actors_win.width  = 568;
+        actors_win.height = 1030;
         const char *at = "Actors";
         for (int i = 0; i < WM_TITLE_MAX && at[i]; i++) actors_win.title[i] = at[i];
         actors_win.chrome_color = 0xFFC080FFU;
@@ -1338,9 +1338,9 @@ void kernel_main(void)
          * scrolling so the user can read what happened during
          * USPi init. */
         shell_win.x = 0;
-        shell_win.y = 30;
-        shell_win.width  = 508;
-        shell_win.height = 686;
+        shell_win.y = 44;
+        shell_win.width  = 760;
+        shell_win.height = 1030;
         const char *swt = "Shell (UART)";
         for (int i = 0; i < WM_TITLE_MAX && swt[i]; i++) shell_win.title[i] = swt[i];
         shell_win.chrome_color = 0xFF80E080U;
@@ -1354,10 +1354,10 @@ void kernel_main(void)
 
         /* Soft keyboard window: bottom-left of the initial 640×480
          * viewport.  Half-size as the user requested. */
-        softkbd_win.x = 896;
-        softkbd_win.y = 494;
-        softkbd_win.width  = 380;
-        softkbd_win.height = 222;
+        softkbd_win.x = 1344;
+        softkbd_win.y = 756;
+        softkbd_win.width  = 572;
+        softkbd_win.height = 318;
         const char *kbt = "Soft keyboard";
         for (int i = 0; i < WM_TITLE_MAX && kbt[i]; i++) softkbd_win.title[i] = kbt[i];
         softkbd_win.chrome_color = 0xFFFFB060U;
