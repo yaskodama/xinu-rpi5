@@ -1086,7 +1086,7 @@ void kernel_main(void)
         { extern void rp1usb_probe(void); rp1usb_probe(); }  /* RP1 DWC3/xHCI host */
         { extern int rp1usb_xhci_init(void); rp1usb_xhci_init(); }  /* take over + run */
         { extern int rp1usb_enum_slot(int); rp1usb_enum_slot(2); }  /* reset c0p2 + enable slot */
-        { extern int rp1usb_address_device(int,int,int); rp1usb_address_device(1, 2, 2); }  /* slot1 port2 Low */
+        { extern int rp1usb_address_device(int,int,int,int); rp1usb_address_device(1, 2, 3, 0); }  /* slot1 port2 (High) */
     }
 #endif
 

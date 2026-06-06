@@ -308,7 +308,7 @@ static int           g_dev_slot, g_dev_speed;
 
 static unsigned int *ctx_at(unsigned char *p, int idx){ return (unsigned int *)(p + idx*g_ctx_stride); }
 
-int rp1usb_address_device(int slot, int port, int speed)
+int rp1usb_address_device(int slot, int port, int speed, int bsr)
 {
     g_dev_slot = slot; g_dev_speed = speed;
     /* EP0 transfer ring + link TRB. */
@@ -338,7 +338,8 @@ int rp1usb_address_device(int slot, int port, int speed)
     __asm__ volatile ("dsb sy":::"memory");
 
     unsigned long ic = XDA(g_input_ctx);
-    cmd_submit((unsigned)(ic&0xffffffff), (unsigned)(ic>>32), 0, (11u<<10)|((unsigned)slot<<24));
+    cmd_submit((unsigned)(ic&0xffffffff), (unsigned)(ic>>32), 0,
+               (11u<<10) | (bsr?(1u<<9):0u) | ((unsigned)slot<<24));
     struct trb ev = event_wait(33);
     g_addr_cc = (ev.status>>24)&0xff;
     uart_puts("rp1usb: address-device cc=");
@@ -346,6 +347,7 @@ int rp1usb_address_device(int slot, int port, int speed)
     return (g_addr_cc==1)?0:-1;
 }
 unsigned int rp1usb_addr_cc(void){ return g_addr_cc; }
+int          rp1usb_ctx_stride(void){ return g_ctx_stride; }
 
 /* On-screen accessors (HDMI, since serial is unreliable). */
 unsigned int rp1usb_caplen(int i){ return (i>=0&&i<2)?g_usb_caplen[i]:0; }

@@ -82,6 +82,7 @@ struct tcp_conn {
 
 static struct tcp_conn g_conn;
 static int g_reqlen;                  /* bytes of HTTP request accumulated so far */
+static int g_chain_len;               /* bytes of a kernel image staged for /chainload */
 static unsigned char g_my_mac[6];
 static unsigned char g_my_ip[4]  = { 192, 168, 3, 100 };
 static unsigned short g_listen_port = 23;
@@ -309,6 +310,18 @@ static int http_complete(const char *buf, int len)
     return (len >= he + (int)cl) ? 1 : 0;
 }
 
+/* Parse the Content-Length header value (or -1). */
+static int content_length(const char *req)
+{
+    int n = 0; while (req[n]) n++;
+    for (int i = 0; i + 15 < n; i++) {
+        const char *p = "content-length:"; int k = 0;
+        while (p[k]) { char c = req[i+k]; if (c>='A'&&c<='Z') c=(char)(c+32); if (c!=p[k]) break; k++; }
+        if (!p[k]) { int j=i+k; while (req[j]==' ') j++; int v=0; while (req[j]>='0'&&req[j]<='9') v=v*10+(req[j++]-'0'); return v; }
+    }
+    return -1;
+}
+
 /* vfs_walk callback: render an indented tree into a capped buffer. */
 struct treectx { char *b; int bl; int max; };
 static void tree_visit(int depth, vfs_node_t *n, void *c)
@@ -485,6 +498,56 @@ static int http_build(const char *req, char *out, int max)
         int arg = q_int(req, "arg", 0);
         char m[ACTOR_NAMELEN]; if (!q_param(req, "m", m, sizeof m)) m[0]=0;
         cc_actor_send_msg(to, m, arg, body, (int)sizeof body); bl = 0; while(body[bl])bl++;
+    } else if (str_starts(rpath, "/usb")) {
+        /* USB/xHCI diagnostics over HTTP (serial is unreliable on Pi 5). */
+        extern unsigned int rp1usb_ver(int); extern int rp1usb_ports(int);
+        extern unsigned int rp1usb_snpsid(int); extern unsigned int rp1usb_caplen(int);
+        extern unsigned int rp1usb_portsc(int,int); extern int rp1usb_connected(void);
+        extern unsigned int rp1usb_usbsts(void); extern int rp1usb_running(void);
+        extern unsigned int rp1usb_enum_portsc(void); extern unsigned int rp1usb_enum_cc(void);
+        extern unsigned int rp1usb_enum_slotid(void); extern unsigned int rp1usb_addr_cc(void);
+        extern int rp1usb_ctx_stride(void);
+        ctype = "text/plain";
+        /* Re-triggerable bring-up steps (iterate without reflashing): */
+        if (str_starts(rpath, "/usb/reset")) {
+            extern int rp1usb_enum_slot(int);
+            int p = q_int(req, "port", 2);
+            int r = rp1usb_enum_slot(p);
+            bl = s_put(body, bl, "reset+enableslot port="); bl = s_putdec(body, bl, p);
+            bl = s_put(body, bl, " -> slot="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " cc="); bl = s_putdec(body, bl, rp1usb_enum_cc());
+            bl = s_put(body, bl, " PORTSC="); bl = s_putdec(body, bl, rp1usb_enum_portsc());
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/addr")) {
+            extern int rp1usb_address_device(int,int,int,int);
+            int slot = q_int(req,"slot",1), port = q_int(req,"port",2);
+            int speed = q_int(req,"speed",2), bsr = q_int(req,"bsr",0);
+            rp1usb_address_device(slot, port, speed, bsr);
+            bl = s_put(body, bl, "addr slot="); bl = s_putdec(body, bl, slot);
+            bl = s_put(body, bl, " port="); bl = s_putdec(body, bl, port);
+            bl = s_put(body, bl, " speed="); bl = s_putdec(body, bl, speed);
+            bl = s_put(body, bl, " bsr="); bl = s_putdec(body, bl, bsr);
+            bl = s_put(body, bl, " -> cc="); bl = s_putdec(body, bl, rp1usb_addr_cc());
+            bl = s_put(body, bl, "\n");
+        } else {
+        bl = s_put(body, bl, "hciver=");   bl = s_putdec(body, bl, rp1usb_ver(0));
+        bl = s_put(body, bl, " ports=");   bl = s_putdec(body, bl, rp1usb_ports(0));
+        bl = s_put(body, bl, " caplen=");  bl = s_putdec(body, bl, rp1usb_caplen(0));
+        bl = s_put(body, bl, " dwc3id=");  bl = s_putdec(body, bl, rp1usb_snpsid(0));
+        bl = s_put(body, bl, " ctxstride="); bl = s_putdec(body, bl, rp1usb_ctx_stride());
+        bl = s_put(body, bl, "\nUSBSTS="); bl = s_putdec(body, bl, rp1usb_usbsts());
+        bl = s_put(body, bl, " running="); bl = s_putdec(body, bl, rp1usb_running());
+        bl = s_put(body, bl, " connected="); bl = s_putdec(body, bl, rp1usb_connected());
+        bl = s_put(body, bl, "\nports c0: ");
+        for (int p=0;p<3;p++){ bl=s_putdec(body,bl,rp1usb_portsc(0,p)); bl=s_put(body,bl," "); }
+        bl = s_put(body, bl, "\nports c1: ");
+        for (int p=0;p<3;p++){ bl=s_putdec(body,bl,rp1usb_portsc(1,p)); bl=s_put(body,bl," "); }
+        bl = s_put(body, bl, "\nenum: resetPORTSC="); bl = s_putdec(body, bl, rp1usb_enum_portsc());
+        bl = s_put(body, bl, " slotCC=");  bl = s_putdec(body, bl, rp1usb_enum_cc());
+        bl = s_put(body, bl, " slot=");    bl = s_putdec(body, bl, rp1usb_enum_slotid());
+        bl = s_put(body, bl, " addrDevCC="); bl = s_putdec(body, bl, rp1usb_addr_cc());
+        bl = s_put(body, bl, "\n");
+        }
     } else if (str_starts(rpath, "/api/actors-gc")) {
         /* GLOBAL actor GC: ?threshold_ms=<n>&dry=<0|1>.  Reaps idle actors. */
         extern int cc_actor_gc(long threshold_ms, int dry, char *out, int outcap);
@@ -492,6 +555,34 @@ static int http_build(const char *req, char *out, int max)
         int th = q_int(req, "threshold_ms", 0);
         int dry = q_int(req, "dry", 0);
         cc_actor_gc((long)th, dry, body, (int)sizeof body); bl = 0; while(body[bl])bl++;
+    } else if (str_starts(rpath, "/chainload")) {
+        /* Network kexec — POST the kernel in chunks to staging RAM, then GO.
+         *   POST /chainload?off=<byte>  body = a chunk (<=8 KB)
+         *   GET  /chainload?go=1&len=<N> -> relocate trampoline + boot it
+         * RAM-only: a bad image just needs a real power-cycle (no SD write). */
+        ctype = "text/plain";
+        volatile unsigned char *STAGE = (volatile unsigned char *)0x4000000UL;
+        if (req[0]=='P') {
+            int off = q_int(req, "off", -1);
+            const char *b = http_body(req);
+            int cl = content_length(req);
+            if (off == 0) g_chain_len = 0;
+            if (off >= 0 && b && cl > 0) {
+                for (int i = 0; i < cl; i++) STAGE[off + i] = (unsigned char)b[i];
+                if (off + cl > g_chain_len) g_chain_len = off + cl;
+                bl = s_put(body, bl, "ok off="); bl = s_putdec(body, bl, off);
+                bl = s_put(body, bl, " n=");     bl = s_putdec(body, bl, cl);
+                bl = s_put(body, bl, " total="); bl = s_putdec(body, bl, g_chain_len);
+                bl = s_put(body, bl, "\n");
+            } else bl = s_put(body, bl, "usage: POST /chainload?off=<byte> body=<chunk>\n");
+        } else if (q_int(req, "go", 0)) {
+            int len = q_int(req, "len", g_chain_len);
+            extern void kernel_chainload(unsigned long, unsigned long);
+            kernel_chainload(0x4000000UL, (unsigned long)len);   /* never returns */
+        } else {
+            bl = s_put(body, bl, "staged="); bl = s_putdec(body, bl, g_chain_len);
+            bl = s_put(body, bl, " bytes. GET /chainload?go=1&len=<N> to boot it\n");
+        }
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";
         bl = s_put(body, bl, "xinu-rpi5 (Pi 5) actor HTTP gateway\n"
