@@ -4,7 +4,9 @@
 #include "video.h"
 
 #define DESKTOP_BG     0xFF003366U   /* dark navy "desktop"          */
-#define DEFAULT_FPS    20            /* 1 frame every 50 ms          */
+#define DEFAULT_FPS    60            /* cap; the loop runs as fast as the
+                                       * redraw allows so the 100 Hz mouse pump
+                                       * shows up smoothly (was 20 = choppy)   */
 
 static window_t *wm_head;
 static void    (*wm_tick)(void);
