@@ -39,6 +39,8 @@ static unsigned int xhciver(unsigned long base){ return ((*(volatile unsigned in
 /* DWC3 global registers. */
 #define DWC3_GSNPSID      0xC120 /* core id + release: 0x5533xxxx etc.    */
 #define DWC3_GCTL         0xC110
+#define DWC3_GUSB2PHYCFG0 0xC200 /* bit6 SUSPHY, bit8 ENBLSLPM            */
+#define DWC3_GUSB3PIPECTL0 0xC2C0 /* bit17 SUSPHY (USB3)                  */
 
 static unsigned int g_usb_caplen[2], g_usb_ver[2], g_usb_hcs1[2], g_usb_snpsid[2];
 static unsigned int g_portsc[2][8];     /* PORTSC per controller per port */
@@ -178,6 +180,15 @@ int rp1usb_xhci_init(void)
     R32(g_oper, OP_USBCMD) |= USBCMD_HCRST;
     for (int i=0;i<200 && (R32(g_oper,OP_USBCMD)&USBCMD_HCRST);i++) xdelay(1000);
     for (int i=0;i<200 && (R32(g_oper,OP_USBSTS)&USBSTS_CNR);i++)   xdelay(1000);
+
+    /* 1b. DWC3 quirk: keep the USB2 PHY awake.  If GUSB2PHYCFG.SUSPHY (bit6) or
+     * ENBLSLPM (bit8) is left set, the PHY auto-suspends while a periodic
+     * (interrupt) endpoint sits NAKing between reports — so control transfers
+     * work but the mouse/keyboard interrupt endpoint never delivers data.  Clear
+     * them so periodic polling keeps running.  (Classic DWC3 bring-up fix.) */
+    R32(base, DWC3_GUSB2PHYCFG0)  &= ~((1u<<6)|(1u<<8));
+    R32(base, DWC3_GUSB3PIPECTL0) &= ~(1u<<17);
+    __asm__ volatile ("dsb sy":::"memory");
 
     /* 2. DCBAA + scratchpad. */
     for (int i=0;i<256;i++) g_dcbaa[i]=0;
@@ -663,7 +674,8 @@ void rp1usb_mouse_pump(void)
         unsigned long erdp=XDA(&g_evt_ring[g_evt_idx]);
         R32(g_rt, IR0_ERDP)   = (unsigned)((erdp&0xffffffff)|(1u<<3));
         R32(g_rt, IR0_ERDP+4) = (unsigned)(erdp>>32);
-        if (((ev.control>>10)&0x3f) == 32) {       /* Transfer Event */
+        if (((ev.control>>10)&0x3f) == 32 &&                     /* Transfer Event ... */
+            (int)((ev.control>>16)&0x1f) == g_mouse_dci) {       /* ...for OUR mouse EP */
             unsigned btn = g_mouse_buf[0];
             int dx = (int)(signed char)g_mouse_buf[1];
             int dy = (int)(signed char)g_mouse_buf[2];
