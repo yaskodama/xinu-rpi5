@@ -118,6 +118,16 @@ unsigned int rp1eth_mdio_read(int phy, int reg)
     return E(GEM_MAN) & 0xffff;
 }
 
+void rp1eth_mdio_write(int phy, int reg, unsigned int data)
+{
+    E(GEM_MAN) = (1u << 30) | (1u << 28)          /* SOF, OP=01 (write) */
+               | ((unsigned)(phy & 0x1f) << 23)
+               | ((unsigned)(reg & 0x1f) << 18)
+               | (2u << 16) | (data & 0xffff);
+    for (volatile unsigned long t = 0; t < 1000000u; t++)
+        if (E(GEM_NSR) & NSR_IDLE) break;
+}
+
 void rp1eth_get_mac(unsigned char mac[6])
 {
     unsigned int lo = E(GEM_SA1B), hi = E(GEM_SA1T);
@@ -180,10 +190,31 @@ void rp1eth_start(void)
     E(GEM_RBQP)   = (unsigned int)(unsigned long)g_rxr;
     E(GEM_TBQP)   = (unsigned int)(unsigned long)g_txr;
 
-    /* NCFGR: keep MDC clk; full-duplex + gigabit */
-    E(GEM_NCFGR) |= (1u<<1) | (1u<<10);
-
     E(GEM_NCR) = NCR_RE | NCR_TE | NCR_MPE_B;       /* enable RX + TX */
+
+    /* Bring the link up: restart autonegotiation, wait for it to complete. */
+    rp1eth_mdio_write(1, 0, 0x1200);                /* BMCR: ANEG enable+restart */
+    int up = 0;
+    for (int s = 0; s < 50; s++) {                  /* up to ~5 s */
+        msdelay(100);
+        if (rp1eth_mdio_read(1, 1) & 0x0004) { up = 1; break; }   /* BMSR link */
+    }
+
+    /* Configure NCFGR speed/duplex from the Broadcom aux status (reg 0x19,
+     * bits 10:8 = highest common denominator). */
+    unsigned int ncfgr = E(GEM_NCFGR);
+    ncfgr &= ~((1u<<0) | (1u<<1) | (1u<<10));       /* clear SPD, FD, GBE */
+    unsigned int aux = rp1eth_mdio_read(1, 0x19);
+    unsigned int hcd = (aux >> 8) & 0x7;
+    /* hcd: 7=1000FD 6=1000HD 5=100FD 3=100HD 2=10FD 1=10HD */
+    if (hcd == 7 || hcd == 6) ncfgr |= (1u<<10);                  /* gigabit */
+    else if (hcd == 5 || hcd == 3) ncfgr |= (1u<<0);             /* 100 Mbps */
+    if (hcd == 7 || hcd == 5 || hcd == 2) ncfgr |= (1u<<1);      /* full duplex */
+    E(GEM_NCFGR) = ncfgr;
+
+    uart_puts("rp1eth: aneg "); uart_puts(up ? "UP" : "DOWN");
+    uart_puts(" aux=0x"); put_hex32(aux);
+    uart_puts(" ncfgr=0x"); put_hex32(ncfgr); uart_puts("\n");
 }
 
 int rp1eth_tx_frame(const unsigned char *f, int len)
