@@ -329,7 +329,7 @@ static void win_status(window_t *self, unsigned int frame)
     }
 
     /* ---- Network (LIVE) ----
-     * Repainted every frame, so running `nc 192.168.3.100 23` from the
+     * Repainted every frame, so running `nc 192.168.3.101 23` from the
      * Mac makes the counters move here even though there is no USB
      * keyboard to run the `tcpstat` shell command.  Read it as:
      *   tcp.seg=0                  -> SYN never reached us (path/RX)
@@ -838,7 +838,7 @@ void kernel_main(void)
         unsigned char mymac[6] = { 0x02, 0xca, 0xfe, 0xb0, 0x05, 0x01 };  /* Pi 5 GEM */
         net_responder_set_mac(mymac);
     }
-    uart_puts("net: ARP+ICMP responder armed; static IP 192.168.3.100\n");
+    uart_puts("net: ARP+ICMP responder armed; static IP 192.168.3.101\n");
     /* Re-read link status here so it shows up at the *end* of the
      * boot log (after the shell-window ring has scrolled past the
      * original PHY-init lines). */
@@ -878,7 +878,7 @@ void kernel_main(void)
     /* NET-G TCP listener — now LIVE.  Give the TCP server our MAC
      * (it builds its own Ethernet headers, like the responder) and
      * open a passive listen on port 23 (telnet).  Connect with
-     * `nc 192.168.3.100 23` from the Mac; it completes the 3-way
+     * `nc 192.168.3.101 23` from the Mac; it completes the 3-way
      * handshake, prints a greeting, echoes keystrokes, and closes on
      * the first newline.  Dispatch is wired in genet_rx_tick(). */
     {
@@ -889,8 +889,8 @@ void kernel_main(void)
         tcp_listen(80);        /* HTTP actor gateway */
     }
     uart_puts("net: HTTP actor gateway on port 80\n");
-    uart_puts("     curl http://192.168.3.100/api/actors\n");
-    uart_puts("     curl 'http://192.168.3.100/send?to=0&m=bump'\n");
+    uart_puts("     curl http://192.168.3.101/api/actors\n");
+    uart_puts("     curl 'http://192.168.3.101/send?to=0&m=bump'\n");
 
     uart_puts("\n");
     uart_puts("Round 1: B/U/M1/S0/X0 done.\n");

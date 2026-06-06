@@ -262,11 +262,25 @@ int rp1eth_tx_frame(const unsigned char *f, int len)
     return ok ? 0 : -1;
 }
 
+static void rp1eth_rx_rearm(void)   /* hand the whole RX ring back to HW */
+{
+    for (int i = 0; i < RXN; i++) {
+        unsigned long ba = DA(g_rxb + i*RXBUF);
+        g_rxr[i].addr  = (LO(ba) & ~3u) | (i == RXN-1 ? 2u : 0u);
+        g_rxr[i].addrh = HI(ba);
+        g_rxr[i].ctrl  = 0;
+    }
+    g_rxhead = 0;
+    E(GEM_RBQP) = LO(DA(g_rxr));  E(GEM_RBQPH) = HI(DA(g_rxr));
+    E(0x020) = 0x0fu;               /* clear RSR (REC/BNA/OVR) */
+}
+
 int rp1eth_rx_poll(unsigned char **pkt)
 {
     if (!(g_rxr[g_rxhead].addr & 1u)) {
-        /* ring drained — clear RX BNA/overrun so the GEM resumes receiving */
-        if (E(0x020) & 0x05u) E(0x020) = 0x05u;
+        /* ring empty.  If the GEM halted on buffer-not-available, fully re-arm
+         * the ring so it resumes (the slow cooperative drain lets it fill). */
+        if (E(0x020) & 0x01u) rp1eth_rx_rearm();
         return 0;
     }
     int len = (int)(g_rxr[g_rxhead].ctrl & 0xfff);
