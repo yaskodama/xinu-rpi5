@@ -70,17 +70,31 @@ static void msdelay(unsigned ms)
     do { __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now)); } while (now < end);
 }
 
-/* RP1 GPIO: drive ETH_RST_N (GPIO 32 = bank 1, pin 4, active-low) to pulse the
- * Ethernet PHY's reset, then release it.  CTRL = OEOVER(ENABLE) | OUTOVER(val)
- * | FUNCSEL(sys_rio).  OUTOVER 2 = force low, 3 = force high. */
-#define RP1_GPIO_IO     0x1F000D0000UL
-#define GCTRL(bk,pn)    (*(volatile unsigned int *)(RP1_GPIO_IO + (unsigned long)(bk)*0x4000 + (unsigned long)(pn)*8 + 4))
+/* RP1 GPIO output, the proper 3-layer way (from circle gpiopin2712.cpp):
+ * PADS (clear OD = enable driver), CTRL FUNCSEL=5 (sys_rio), RIO OE/OUT with
+ * the atomic SET(+0x2000)/CLR(+0x3000) aliases.  ETH_RST_N = GPIO 32 =
+ * bank 1, pin 4, active-low — pulse low then release high. */
+#define RP1_GPIO_IO    0x1F000D0000UL
+#define RP1_GPIO_RIO   0x1F000E0000UL
+#define RP1_GPIO_PADS  0x1F000F0000UL
+#define G_CTRL(bk,pn)  (*(volatile unsigned int *)(RP1_GPIO_IO   + (unsigned long)(bk)*0x4000 + (unsigned long)(pn)*8 + 4))
+#define G_PAD(bk,pn)   (*(volatile unsigned int *)(RP1_GPIO_PADS + (unsigned long)(bk)*0x4000 + 4 + (unsigned long)(pn)*4))
+#define G_RIO(bk,off)  (*(volatile unsigned int *)(RP1_GPIO_RIO  + (unsigned long)(bk)*0x4000 + (off)))
+#define RIO_SET 0x2000
+#define RIO_CLR 0x3000
 static void rp1_phy_reset(void)
 {
-    GCTRL(1, 4) = (3u << 14) | (2u << 12) | 5u;   /* output enable, drive LOW  */
-    msdelay(10);                                   /* assert reset (>5ms)       */
-    GCTRL(1, 4) = (3u << 14) | (3u << 12) | 5u;   /* drive HIGH = release reset*/
-    msdelay(30);                                   /* let the PHY come up        */
+    const int bk = 1, pn = 4;
+    unsigned int pad = G_PAD(bk, pn);
+    pad &= ~(1u << 7);                 /* OD=0: enable the output driver  */
+    pad |=  (1u << 6);                 /* IE=1                            */
+    G_PAD(bk, pn) = pad;
+    G_CTRL(bk, pn) = 5u;               /* FUNCSEL = sys_rio (software GPIO) */
+    G_RIO(bk, RIO_SET + 4) = (1u << pn);   /* RIO_OE  set  -> output enable */
+    G_RIO(bk, RIO_CLR + 0) = (1u << pn);   /* RIO_OUT clr  -> drive LOW     */
+    msdelay(10);                       /* assert reset (>5ms)             */
+    G_RIO(bk, RIO_SET + 0) = (1u << pn);   /* RIO_OUT set  -> drive HIGH    */
+    msdelay(30);                       /* let the PHY come up             */
 }
 
 /* Program a locally-administered MAC into the GEM's address-1 filter. */
