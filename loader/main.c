@@ -347,6 +347,19 @@ static void win_status(window_t *self, unsigned int frame)
         draw_string_at(xb + 48, yb + line*12, g_net_link ? "UP" : "DOWN", nfg, bg);
         line++;
 
+#ifdef RP1_ETH_BASE
+        {   /* RP1 GEM live counters — readable on HDMI without serial */
+            extern unsigned long rp1eth_rx_count(void);
+            extern unsigned long rp1eth_tx_count(void);
+            extern int rp1eth_link_up(void);
+            n = 0;
+            kv_append(l, &n, "Elk", (unsigned long)rp1eth_link_up());
+            kv_append(l, &n, "Erx", rp1eth_rx_count());
+            kv_append(l, &n, "Etx", rp1eth_tx_count());
+            draw_string_at(xb, yb + line*12, l, 0xFFFFD060U, bg); line++;
+        }
+#endif
+
         n = 0;
         kv_append(l, &n, "rx",  genet_rx_packet_count());
         kv_append(l, &n, "ov",  genet_rx_overrun_count());

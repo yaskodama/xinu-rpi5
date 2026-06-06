@@ -174,6 +174,9 @@ struct gem_desc { volatile unsigned int addr, ctrl, addrh, resvd; };
 static struct gem_desc *g_rxr, *g_txr;
 static unsigned char   *g_rxb, *g_txb;
 static int g_rxhead, g_txi;
+static unsigned long g_rxcnt, g_txcnt;
+unsigned long rp1eth_rx_count(void) { return g_rxcnt; }
+unsigned long rp1eth_tx_count(void) { return g_txcnt; }
 
 unsigned int rp1eth_phy_bmsr(void) { return rp1eth_mdio_read(1, 1); }   /* BMSR */
 int rp1eth_link_up(void) { return (rp1eth_phy_bmsr() & 0x0004) ? 1 : 0; }/* bit2 */
@@ -244,6 +247,7 @@ int rp1eth_tx_frame(const unsigned char *f, int len)
     for (int t = 0; t < 1000000; t++)
         if (g_txr[ti].ctrl & (1u<<31)) { ok = 1; break; }       /* USED set = done */
     g_txi = (g_txi + 1) % TXN;
+    if (ok) g_txcnt++;
     return ok ? 0 : -1;
 }
 
@@ -259,6 +263,7 @@ void rp1eth_rx_release(void)
 {
     g_rxr[g_rxhead].addr &= ~1u;                                /* give back to HW */
     g_rxhead = (g_rxhead + 1) % RXN;
+    g_rxcnt++;
 }
 
 /* Returns 0 if a Cadence GEM answered at RP1_ETH_BASE (PCIe path alive). */
