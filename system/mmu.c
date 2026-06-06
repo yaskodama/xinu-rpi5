@@ -36,6 +36,11 @@ static unsigned long l1_hi[ENTRIES]__attribute__((aligned(4096)));  /* 1TB .. 1.
 
 void mmu_init(void)
 {
+    /* Enable EL1 FP/SIMD access (CPACR_EL1.FPEN = 0b11).  The AIPL value_t
+     * runtime in cc/cc.c does double arithmetic for float values; without this
+     * the first FP instruction it executes traps.  Harmless for integer code. */
+    __asm__ volatile ("msr cpacr_el1, %0\n isb\n" :: "r"(3UL << 20) : "memory");
+
     for (int i = 0; i < ENTRIES; i++) { l0[i] = 0; l1_lo[i] = 0; l1_hi[i] = 0; }
 
     l0[0] = (unsigned long)l1_lo | DESC_TABLE;   /* VA 0 .. 512GB     */

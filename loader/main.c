@@ -87,6 +87,23 @@ static void dhcp_drive(void)
     g_dhcp_tries++;
     dhcp_send_discover();                    /* sent here (guarded), not at boot */
 }
+
+/* Periodic GLOBAL actor GC.  Called from genet_rx_tick (inside its guard, so
+ * single-threaded against /actor/send), rate-limited to ~8 s.  Reaps actors of
+ * a resident AIPL program that have been idle > 20 s — the "globally-running"
+ * garbage collector.  On-demand sweeps with any threshold use /api/actors-gc. */
+extern int  cc_actor_gc(long threshold_ms, int dry, char *out, int outcap);
+extern int  cc_actor_resident(void);
+static unsigned long g_gc_last_tick;
+static void gc_drive(void)
+{
+    if (!cc_actor_resident()) return;
+    unsigned long now = timer_ticks();           /* ~100 Hz */
+    if (now - g_gc_last_tick < 800) return;       /* ~8 s between sweeps */
+    g_gc_last_tick = now;
+    cc_actor_gc(20000, 0, 0, 0);                  /* reap >20 s-idle actors */
+}
+
 /* TCP listener live counters for the on-screen Network panel (the Pi
  * has no USB keyboard yet, so the shell `tcpstat` is unreachable). */
 extern unsigned long tcp_any_count(void);
@@ -187,6 +204,7 @@ static void genet_rx_tick(void)
     }
 
     dhcp_drive();          /* run the DHCP state machine (rate-limited inside) */
+    gc_drive();            /* periodic global actor GC (rate-limited inside)   */
     g_rx_busy = 0;
 }
 
@@ -444,6 +462,20 @@ static void win_status(window_t *self, unsigned int frame)
                 kv_append(l, &n, "of", dhcp_offer_count());
                 kv_append(l, &n, "ak", dhcp_ack_count());
                 draw_string_at(xb, yb + line*12, l, 0xFF80FF80U, bg); line++;
+            }
+
+            /* AIPL actor platform + global GC live stats. */
+            {
+                extern int           cc_actor_resident(void);
+                extern int           cc_actor_live_count(void);
+                extern unsigned long cc_gc_run_count(void);
+                extern unsigned long cc_gc_kill_count(void);
+                n = 0;
+                kv_append(l, &n, "AIPL res", (unsigned long)cc_actor_resident());
+                kv_append(l, &n, "act", (unsigned long)cc_actor_live_count());
+                kv_append(l, &n, "gcRun", cc_gc_run_count());
+                kv_append(l, &n, "gcKil", cc_gc_kill_count());
+                draw_string_at(xb, yb + line*12, l, 0xFF80C0FFU, bg); line++;
             }
 
             /* last RX frame's first 14 bytes = dst MAC / src MAC / ethertype */

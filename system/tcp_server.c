@@ -81,6 +81,7 @@ struct tcp_conn {
 };
 
 static struct tcp_conn g_conn;
+static int g_reqlen;                  /* bytes of HTTP request accumulated so far */
 static unsigned char g_my_mac[6];
 static unsigned char g_my_ip[4]  = { 192, 168, 3, 100 };
 static unsigned short g_listen_port = 23;
@@ -277,6 +278,37 @@ static const char *http_body(const char *req)
     return 0;
 }
 
+/* Is the accumulated request complete?  Needs the CRLFCRLF header terminator;
+ * if a Content-Length header is present, also needs that many body bytes.
+ * Lets the server reassemble a POST body that spans several TCP segments. */
+static int http_complete(const char *buf, int len)
+{
+    int he = -1;
+    for (int i = 0; i + 3 < len; i++)
+        if (buf[i]=='\r'&&buf[i+1]=='\n'&&buf[i+2]=='\r'&&buf[i+3]=='\n') { he = i + 4; break; }
+    if (he < 0) return 0;                       /* headers not finished yet */
+    long cl = -1;
+    for (int i = 0; i + 15 < he; i++) {
+        const char *p = "content-length:";
+        int k = 0;
+        while (p[k]) {
+            char c = buf[i + k];
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            if (c != p[k]) break;
+            k++;
+        }
+        if (!p[k]) {                            /* matched the header name */
+            int j = i + k;
+            while (buf[j] == ' ') j++;
+            cl = 0;
+            while (buf[j] >= '0' && buf[j] <= '9') cl = cl * 10 + (buf[j++] - '0');
+            break;
+        }
+    }
+    if (cl < 0) return 1;                        /* no body expected (GET) */
+    return (len >= he + (int)cl) ? 1 : 0;
+}
+
 /* vfs_walk callback: render an indented tree into a capped buffer. */
 struct treectx { char *b; int bl; int max; };
 static void tree_visit(int depth, vfs_node_t *n, void *c)
@@ -437,6 +469,29 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, ccout);
             if (rc == 0) { bl = s_put(body, bl, "=> "); bl = s_putdec(body, bl, rv); bl = s_put(body, bl, "\n"); }
         }
+    } else if (str_starts(rpath, "/actor/load")) {
+        /* AIPL: POST the --xinu-jit C of an actor program; JIT it, spawn the
+         * actors, run the initial message cascade, keep them resident. */
+        extern int cc_actor_load(const char *src, int srclen, char *out, int outcap);
+        ctype = "text/plain";
+        const char *b = http_body(req);
+        if (b && *b) { int n=0; while(b[n])n++; cc_actor_load(b, n, body, (int)sizeof body); bl = 0; while(body[bl])bl++; }
+        else bl = s_put(body, bl, "usage: curl --data-binary @prog.c -X POST http://<ip>/actor/load\n");
+    } else if (path_eq(req, "/actor/send")) {
+        /* Message a resident actor: ?to=<id>&m=<method>&arg=<n>. */
+        extern int cc_actor_send_msg(int to, const char *method, int arg, char *out, int outcap);
+        ctype = "text/plain";
+        int to = q_int(req, "to", 0);
+        int arg = q_int(req, "arg", 0);
+        char m[ACTOR_NAMELEN]; if (!q_param(req, "m", m, sizeof m)) m[0]=0;
+        cc_actor_send_msg(to, m, arg, body, (int)sizeof body); bl = 0; while(body[bl])bl++;
+    } else if (str_starts(rpath, "/api/actors-gc")) {
+        /* GLOBAL actor GC: ?threshold_ms=<n>&dry=<0|1>.  Reaps idle actors. */
+        extern int cc_actor_gc(long threshold_ms, int dry, char *out, int outcap);
+        ctype = "text/plain";
+        int th = q_int(req, "threshold_ms", 0);
+        int dry = q_int(req, "dry", 0);
+        cc_actor_gc((long)th, dry, body, (int)sizeof body); bl = 0; while(body[bl])bl++;
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";
         bl = s_put(body, bl, "xinu-rpi5 (Pi 5) actor HTTP gateway\n"
@@ -444,7 +499,9 @@ static int http_build(const char *req, char *out, int max)
                              "GET /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n"
                              "POST /cc  (C source in body) -> JIT compile & run\n"
                              "GET /fs | /fs/ls/<dir> | /fs/cat/<file>\n"
-                             "POST /fs/mkdir/<dir> | /fs/write/<file> (body)\n");
+                             "POST /fs/mkdir/<dir> | /fs/write/<file> (body)\n"
+                             "POST /actor/load (AIPL --xinu-jit C) ; GET /actor/send?to&m&arg\n"
+                             "GET /api/actors-gc?threshold_ms=<n>&dry=<0|1>  (global actor GC)\n");
     } else {
         ctype = "text/plain";
         bl = s_put(body, bl, "404 not found\n");
@@ -551,6 +608,7 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         if (flags & TCP_FLAG_RST) { g_conn.state = TCP_LISTEN; return 1; }
         if ((flags & TCP_FLAG_ACK) && ack == g_conn.my_seq) {
             g_conn.state = TCP_ESTABLISHED;
+            g_reqlen = 0;                       /* fresh request accumulator */
             g_estab++;
             uart_puts("tcp: ESTABLISHED (await HTTP request)\n");
             /* HTTP: the client sends the request first; we reply when
@@ -567,19 +625,27 @@ int tcp_handle_packet(const unsigned char *frame, int len)
             return 1;
         }
         if (data_len > 0) {
-            /* Treat the first data segment as an HTTP request: copy it
-             * out of the (volatile) rx buffer, route it through the
-             * actor layer, send the response, then close.  A simple GET
-             * fits in one segment, which is all we handle here. */
-            static char http_req[1400];   /* room for a POST /cc body (1 MSS) */
+            /* Accumulate the HTTP request across TCP segments — a POST /cc or
+             * /actor/load body (AIPL C) easily exceeds one MSS.  We only act
+             * once http_complete() says headers + Content-Length bytes are in;
+             * until then we just ACK and wait for the next segment. */
+            static char g_req[16384];
             static char http_resp[1400];
-            int n = data_len < (int)sizeof(http_req) - 1
-                  ? data_len : (int)sizeof(http_req) - 1;
-            for (int i = 0; i < n; i++) http_req[i] = (char)data[i];
-            http_req[n] = 0;
-            g_conn.peer_seq = seq + data_len;     /* ack the whole request */
 
-            int rlen = http_build(http_req, http_resp, (int)sizeof http_resp);
+            /* Only accept in-order data (seq == what we expect); ignore the
+             * rest so a retransmit can't corrupt the buffer. */
+            if ((unsigned long)seq == g_conn.peer_seq) {
+                for (int i = 0; i < data_len && g_reqlen < (int)sizeof(g_req) - 1; i++)
+                    g_req[g_reqlen++] = (char)data[i];
+                g_req[g_reqlen] = 0;
+                g_conn.peer_seq = seq + data_len;
+            }
+            tcp_send(TCP_FLAG_ACK, 0, 0);          /* acknowledge the segment */
+
+            if (!http_complete(g_req, g_reqlen)) return 1;   /* need more */
+
+            int rlen = http_build(g_req, http_resp, (int)sizeof http_resp);
+            g_reqlen = 0;
             tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, http_resp, rlen);
             g_conn.my_seq += rlen;
 
