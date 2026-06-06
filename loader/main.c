@@ -501,6 +501,22 @@ static void win_status(window_t *self, unsigned int frame)
                 kv_append(l, &n, "p2", (unsigned long)rp1usb_portsc(1,1));
                 kv_append(l, &n, "p3", (unsigned long)rp1usb_portsc(1,2));
                 draw_string_at(xb, yb + line*12, l, 0xFF60E0FFU, bg); line++;
+                {
+                    extern unsigned int rp1usb_usbsts(void);
+                    extern int          rp1usb_running(void);
+                    n = 0;
+                    kv_append(l, &n, "xHCI USBSTS", (unsigned long)rp1usb_usbsts());
+                    kv_append(l, &n, "running", (unsigned long)rp1usb_running());
+                    draw_string_at(xb, yb + line*12, l, 0xFF40FFC0U, bg); line++;
+                    extern unsigned int rp1usb_enum_portsc(void);
+                    extern unsigned int rp1usb_enum_cc(void);
+                    extern unsigned int rp1usb_enum_slotid(void);
+                    n = 0;
+                    kv_append(l, &n, "p2 reset PORTSC", (unsigned long)rp1usb_enum_portsc());
+                    kv_append(l, &n, "slotCC", (unsigned long)rp1usb_enum_cc());
+                    kv_append(l, &n, "slot", (unsigned long)rp1usb_enum_slotid());
+                    draw_string_at(xb, yb + line*12, l, 0xFF40FFC0U, bg); line++;
+                }
             }
 
             /* last RX frame's first 14 bytes = dst MAC / src MAC / ethertype */
@@ -1064,6 +1080,8 @@ void kernel_main(void)
         rp1pcie_init();     /* train the PCIe link to the RP1 first */
         rp1eth_probe();
         { extern void rp1usb_probe(void); rp1usb_probe(); }  /* RP1 DWC3/xHCI host */
+        { extern int rp1usb_xhci_init(void); rp1usb_xhci_init(); }  /* take over + run */
+        { extern int rp1usb_enum_slot(int); rp1usb_enum_slot(2); }  /* reset c0p2 + enable slot */
     }
 #endif
 

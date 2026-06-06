@@ -94,6 +94,208 @@ void rp1usb_probe(void)
     g_usb_probed = 1;
 }
 
+/* ====================================================================
+ * Phase 3a — xHCI controller bring-up on controller 0 (the mouse is on
+ * c0p2, Low speed).  Reset the HC, build our own DCBAA + command ring +
+ * event ring (+ scratchpad), then set Run.  All DMA structures are static,
+ * 64-byte aligned, in low RAM; the controller reaches them over PCIe at
+ * physical + 0x1000000000 (same inbound window as the GEM).
+ * ==================================================================== */
+
+#define XDMA_OFFSET 0x1000000000UL
+#define XDA(p)      (((unsigned long)(p) & 0xffffffffffUL) + XDMA_OFFSET)
+
+/* operational register offsets (from oper base = base + CAPLENGTH) */
+#define OP_USBCMD   0x00
+#define OP_USBSTS   0x04
+#define OP_CRCR     0x18
+#define OP_DCBAAP   0x30
+#define OP_CONFIG   0x38
+/* capability regs */
+#define CAP_HCSPARAMS2 0x08
+#define CAP_DBOFF      0x14
+#define CAP_RTSOFF     0x18
+/* runtime interrupter-0 (from rt base + 0x20) */
+#define IR0_IMAN    0x20
+#define IR0_ERSTSZ  0x28
+#define IR0_ERSTBA  0x30
+#define IR0_ERDP    0x38
+
+#define USBCMD_RS   (1u<<0)
+#define USBCMD_HCRST (1u<<1)
+#define USBCMD_INTE (1u<<2)
+#define USBSTS_HCH  (1u<<0)
+#define USBSTS_CNR  (1u<<11)
+
+struct trb { unsigned int p0, p1, status, control; };
+
+#define CMD_RING_N   64
+#define EVT_RING_N   64
+#define NSCRATCH_MAX 64
+
+static unsigned long  g_xhci_base;
+static unsigned long  g_oper, g_rt, g_db;
+static unsigned long long g_dcbaa[256]      __attribute__((aligned(64)));
+static struct trb     g_cmd_ring[CMD_RING_N] __attribute__((aligned(64)));
+static struct trb     g_evt_ring[EVT_RING_N] __attribute__((aligned(64)));
+static unsigned long long g_erst[4]         __attribute__((aligned(64)));
+static unsigned long long g_scratch_arr[NSCRATCH_MAX] __attribute__((aligned(64)));
+static unsigned char  g_scratch_buf[NSCRATCH_MAX][4096] __attribute__((aligned(4096)));
+static int            g_cmd_idx, g_cmd_cycle = 1;
+static int            g_evt_idx, g_evt_cycle = 1;
+static unsigned int   g_xhci_usbsts_after;
+static int            g_xhci_running;
+
+static void xdelay(unsigned long us)
+{
+    unsigned long f; __asm__ volatile ("mrs %0, cntfrq_el0":"=r"(f));
+    unsigned long t0; __asm__ volatile ("mrs %0, cntpct_el0":"=r"(t0));
+    unsigned long d = (f/1000000UL)*us;
+    for (;;){ unsigned long t; __asm__ volatile("mrs %0, cntpct_el0":"=r"(t)); if (t-t0>=d) break; }
+}
+
+int rp1usb_xhci_init(void)
+{
+    unsigned long base = RP1_USB0;
+    g_xhci_base = base;
+    unsigned int caplen = R8(base, XHCI_CAPLENGTH);
+    g_oper = base + caplen;
+    g_rt   = base + (R32(base, CAP_RTSOFF) & ~0x1Fu);
+    g_db   = base + (R32(base, CAP_DBOFF)  & ~0x3u);
+
+    /* 1. Stop, then reset the controller. */
+    R32(g_oper, OP_USBCMD) &= ~USBCMD_RS;
+    for (int i=0;i<100 && !(R32(g_oper,OP_USBSTS)&USBSTS_HCH);i++) xdelay(1000);
+    R32(g_oper, OP_USBCMD) |= USBCMD_HCRST;
+    for (int i=0;i<200 && (R32(g_oper,OP_USBCMD)&USBCMD_HCRST);i++) xdelay(1000);
+    for (int i=0;i<200 && (R32(g_oper,OP_USBSTS)&USBSTS_CNR);i++)   xdelay(1000);
+
+    /* 2. DCBAA + scratchpad. */
+    for (int i=0;i<256;i++) g_dcbaa[i]=0;
+    unsigned int hcs2 = R32(base, CAP_HCSPARAMS2);
+    int nscratch = (int)(((hcs2>>27)&0x1f) | (((hcs2>>21)&0x1f)<<5));
+    if (nscratch > NSCRATCH_MAX) nscratch = NSCRATCH_MAX;
+    for (int i=0;i<nscratch;i++) g_scratch_arr[i] = XDA(&g_scratch_buf[i][0]);
+    if (nscratch > 0) g_dcbaa[0] = XDA(&g_scratch_arr[0]);
+    R32(g_oper, OP_DCBAAP)     = (unsigned int)(XDA(g_dcbaa) & 0xffffffff);
+    R32(g_oper, OP_DCBAAP+4)   = (unsigned int)(XDA(g_dcbaa) >> 32);
+
+    /* 3. Command ring. */
+    for (int i=0;i<CMD_RING_N;i++){ g_cmd_ring[i].p0=0;g_cmd_ring[i].p1=0;g_cmd_ring[i].status=0;g_cmd_ring[i].control=0; }
+    /* link TRB at end -> back to start, toggle cycle */
+    g_cmd_ring[CMD_RING_N-1].p0 = (unsigned int)(XDA(g_cmd_ring)&0xffffffff);
+    g_cmd_ring[CMD_RING_N-1].p1 = (unsigned int)(XDA(g_cmd_ring)>>32);
+    g_cmd_ring[CMD_RING_N-1].control = (6u<<10) | (1u<<1) | 1u;  /* Link TRB, TC=1, cycle */
+    g_cmd_idx=0; g_cmd_cycle=1;
+    R32(g_oper, OP_CRCR)   = (unsigned int)((XDA(g_cmd_ring)&0xffffffff) | 1u);  /* RCS=1 */
+    R32(g_oper, OP_CRCR+4) = (unsigned int)(XDA(g_cmd_ring)>>32);
+
+    /* 4. Event ring + ERST (interrupter 0). */
+    for (int i=0;i<EVT_RING_N;i++){ g_evt_ring[i].p0=0;g_evt_ring[i].p1=0;g_evt_ring[i].status=0;g_evt_ring[i].control=0; }
+    g_evt_idx=0; g_evt_cycle=1;
+    g_erst[0] = XDA(g_evt_ring);
+    g_erst[1] = (unsigned long long)EVT_RING_N;   /* segment size in low 16 bits */
+    R32(g_rt, IR0_ERSTSZ) = 1;
+    R32(g_rt, IR0_ERDP)   = (unsigned int)(XDA(g_evt_ring)&0xffffffff);
+    R32(g_rt, IR0_ERDP+4) = (unsigned int)(XDA(g_evt_ring)>>32);
+    R32(g_rt, IR0_ERSTBA) = (unsigned int)(XDA(g_erst)&0xffffffff);
+    R32(g_rt, IR0_ERSTBA+4)=(unsigned int)(XDA(g_erst)>>32);
+    R32(g_rt, IR0_IMAN)   = 0x2;                  /* IE=0, clear IP */
+
+    /* 5. CONFIG: announce max device slots = MaxSlots from HCSPARAMS1. */
+    R32(g_oper, OP_CONFIG) = (R32(base, XHCI_HCSPARAMS1) & 0xff);
+
+    /* 6. Run. */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    R32(g_oper, OP_USBCMD) |= USBCMD_RS;
+    for (int i=0;i<200 && (R32(g_oper,OP_USBSTS)&USBSTS_HCH);i++) xdelay(1000);
+
+    g_xhci_usbsts_after = R32(g_oper, OP_USBSTS);
+    g_xhci_running = !(g_xhci_usbsts_after & USBSTS_HCH);
+
+    uart_puts("rp1usb: xHCI init; USBSTS=0x");
+    { static const char hx[]="0123456789abcdef"; char b[9]; for(int i=0;i<8;i++)b[i]=hx[(g_xhci_usbsts_after>>((7-i)*4))&0xF]; b[8]=0; uart_puts(b);}
+    uart_puts(g_xhci_running ? " RUNNING\n" : " halted\n");
+    return g_xhci_running ? 0 : -1;
+}
+
+unsigned int rp1usb_usbsts(void)   { return g_xhci_usbsts_after; }
+int          rp1usb_running(void)  { return g_xhci_running; }
+
+/* ---------- Phase 3b: command ring submit + event wait + port reset + slot ----- */
+
+/* Push a command TRB (p0/p1/status given; control's low type/flags given,
+ * cycle added) and ring the command doorbell.  Handles the link-TRB wrap. */
+static void cmd_submit(unsigned int p0, unsigned int p1, unsigned int status, unsigned int control)
+{
+    struct trb *t = &g_cmd_ring[g_cmd_idx];
+    t->p0 = p0; t->p1 = p1; t->status = status;
+    t->control = (control & ~1u) | (g_cmd_cycle & 1u);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    g_cmd_idx++;
+    if (g_cmd_idx == CMD_RING_N - 1) {            /* hit the link TRB: wrap */
+        g_cmd_ring[CMD_RING_N-1].control = (g_cmd_ring[CMD_RING_N-1].control & ~1u) | (g_cmd_cycle & 1u);
+        __asm__ volatile ("dsb sy" ::: "memory");
+        g_cmd_idx = 0; g_cmd_cycle ^= 1;
+    }
+    R32(g_db, 0) = 0;                              /* doorbell 0 = command ring */
+    __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* Poll the event ring for one event whose cycle matches; returns its TRB by
+ * value (control==0 if none within the timeout).  Advances ERDP. */
+static struct trb event_wait(unsigned int want_type)
+{
+    struct trb ev; ev.p0=ev.p1=ev.status=ev.control=0;
+    for (int spin = 0; spin < 500; spin++) {
+        struct trb *e = &g_evt_ring[g_evt_idx];
+        __asm__ volatile ("dsb sy" ::: "memory");
+        if ((e->control & 1u) == (unsigned)g_evt_cycle) {
+            ev = *e;
+            g_evt_idx++;
+            if (g_evt_idx == EVT_RING_N) { g_evt_idx = 0; g_evt_cycle ^= 1; }
+            /* advance ERDP to the next slot (+ EHB clear) */
+            unsigned long erdp = XDA(&g_evt_ring[g_evt_idx]);
+            R32(g_rt, IR0_ERDP)   = (unsigned int)((erdp & 0xffffffff) | (1u<<3));
+            R32(g_rt, IR0_ERDP+4) = (unsigned int)(erdp >> 32);
+            unsigned int type = (ev.control >> 10) & 0x3f;
+            if (want_type == 0 || type == want_type) return ev;
+            spin = 0;                              /* consumed an unrelated event; keep going */
+            continue;
+        }
+        xdelay(1000);
+    }
+    return ev;
+}
+
+static unsigned int g_enum_portsc, g_enum_slotid, g_enum_cc;
+
+/* Reset port `p` (1-based) on controller 0 and Enable Slot. */
+int rp1usb_enum_slot(int p)
+{
+    unsigned long psc = g_oper + 0x400 + (p-1)*0x10;   /* PORTSC, from OPER base */
+    /* Port reset: write PR (bit4) + PP (bit9); change bits are RW1C. */
+    R32(psc, 0) = (1u<<9) | (1u<<4);
+    for (int i=0;i<100;i++){ xdelay(1000); if (!(R32(psc,0)&(1u<<4))) break; }  /* PR clears when done */
+    xdelay(20000);
+    g_enum_portsc = R32(psc, 0);
+
+    /* Enable Slot (TRB type 9). */
+    cmd_submit(0, 0, 0, (9u<<10));
+    struct trb ev = event_wait(33);                /* Command Completion Event */
+    g_enum_cc     = (ev.status >> 24) & 0xff;       /* completion code (1=success) */
+    g_enum_slotid = (ev.control >> 24) & 0xff;      /* assigned slot id */
+
+    uart_puts("rp1usb: enable-slot cc="); uart_putc((char)('0'+g_enum_cc/10%10)); uart_putc((char)('0'+g_enum_cc%10));
+    uart_puts(" slot="); uart_putc((char)('0'+g_enum_slotid/10%10)); uart_putc((char)('0'+g_enum_slotid%10));
+    uart_puts("\n");
+    return (g_enum_cc == 1) ? (int)g_enum_slotid : -1;
+}
+
+unsigned int rp1usb_enum_portsc(void){ return g_enum_portsc; }
+unsigned int rp1usb_enum_cc(void)    { return g_enum_cc; }
+unsigned int rp1usb_enum_slotid(void){ return g_enum_slotid; }
+
 /* On-screen accessors (HDMI, since serial is unreliable). */
 unsigned int rp1usb_caplen(int i){ return (i>=0&&i<2)?g_usb_caplen[i]:0; }
 unsigned int rp1usb_ver(int i)   { return (i>=0&&i<2)?g_usb_ver[i]:0; }
