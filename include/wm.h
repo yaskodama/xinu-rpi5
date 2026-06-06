@@ -34,8 +34,14 @@ typedef struct window {
      * (x+1 .. x+width-2  ×  y+TITLEBAR_H+1 .. y+height-2). */
     void        (*draw_content)(struct window *self, unsigned int frame);
 
+    int           focused;        /* 1 = currently selected window (bright chrome) */
     struct window *next;          /* internal — set by wm_add() */
 } window_t;
+
+/* Hit-test a screen-space point (e.g. the mouse cursor) against the window
+ * list and focus + raise the topmost window under it.  No-op if the point
+ * misses every window.  Returns the focused window, or NULL. */
+struct window *wm_focus_at(int screen_x, int screen_y);
 
 /* Push `w` onto the global window list (it will be redrawn after
  * everything previously added, so later windows are "on top" in

@@ -245,27 +245,34 @@ void xhci_keyboard_event(char c)
 static int  g_cursor_x = 320;
 static int  g_cursor_y = 240;
 
-/* Pointer sensitivity: the boot mouse streams ~130 reports/s, so raw deltas move
- * the cursor far too fast.  Divide by MOUSE_DIV, accumulating the remainder so
- * slow movements aren't lost. */
-#define MOUSE_DIV 3
-static int g_mouse_accx, g_mouse_accy;
+/* Cursor handling modelled 1:1 on the working Pi 3 (xinu-raz) usbMouseInterrupt:
+ * raw deltas (no scaling), centre on the first report, and CLAMP to the screen
+ * — no viewport panning (the pan-at-edge is what made it feel fast/jerky). */
+static int g_mouse_inited;
+static unsigned g_prev_btn;
 void xhci_mouse_event(unsigned nButtons, int dx, int dy)
 {
-    g_mouse_accx += dx; g_mouse_accy += dy;
-    int mx = g_mouse_accx / MOUSE_DIV; g_mouse_accx -= mx * MOUSE_DIV;
-    int my = g_mouse_accy / MOUSE_DIV; g_mouse_accy -= my * MOUSE_DIV;
-    g_cursor_x += mx;
-    g_cursor_y += my;
     int sw = (int)video_screen_width();
     int sh = (int)video_screen_height();
+    if (sw <= 0) sw = 1920;
+    if (sh <= 0) sh = 1080;
+
+    if (!g_mouse_inited) { g_cursor_x = sw / 2; g_cursor_y = sh / 2; g_mouse_inited = 1; }
+
+    g_cursor_x += dx;
+    g_cursor_y += dy;
+    if (g_cursor_x < 0)       g_cursor_x = 0;
+    if (g_cursor_y < 0)       g_cursor_y = 0;
+    if (g_cursor_x > sw - 1)  g_cursor_x = sw - 1;
+    if (g_cursor_y > sh - 1)  g_cursor_y = sh - 1;
+
     wm_set_autopan(0);
-    if (g_cursor_x < 0)        { wm_pan(g_cursor_x, 0);          g_cursor_x = 0; }
-    if (g_cursor_y < 0)        { wm_pan(0, g_cursor_y);          g_cursor_y = 0; }
-    if (g_cursor_x >= sw)      { wm_pan(g_cursor_x - sw + 1, 0); g_cursor_x = sw - 1; }
-    if (g_cursor_y >= sh)      { wm_pan(0, g_cursor_y - sh + 1); g_cursor_y = sh - 1; }
     wm_cursor_set(g_cursor_x, g_cursor_y, 1);
-    (void)nButtons;
+
+    /* Left button (bit0) press edge -> select the window under the cursor. */
+    if ((nButtons & 1u) && !(g_prev_btn & 1u))
+        wm_focus_at(g_cursor_x, g_cursor_y);
+    g_prev_btn = nButtons;
 }
 
 extern unsigned char _end[];   /* set by link.ld — top of static image */

@@ -146,16 +146,48 @@ void wm_resize_window(int id, int w_, int h_)
     if (h_ >= 24) w->height = h_;
 }
 
+/* Focus + raise the topmost window under a screen-space point (the cursor). */
+window_t *wm_focus_at(int sx, int sy)
+{
+    int dx = sx + vp_x, dy = sy + vp_y;        /* screen -> virtual-desktop coords */
+    window_t *hit = 0;
+    for (window_t *w = wm_head; w; w = w->next)
+        if (dx >= w->x && dx < w->x + w->width &&
+            dy >= w->y && dy < w->y + w->height)
+            hit = w;                           /* keep last == topmost in draw order */
+    if (!hit) return 0;
+
+    for (window_t *w = wm_head; w; w = w->next) w->focused = 0;
+    hit->focused = 1;
+
+    /* Raise: unlink and re-append so it draws last (on top). */
+    if (hit->next) {
+        if (wm_head == hit) wm_head = hit->next;
+        else { window_t *p = wm_head; while (p->next && p->next != hit) p = p->next;
+               if (p->next == hit) p->next = hit->next; }
+        hit->next = 0;
+        window_t *t = wm_head; while (t && t->next) t = t->next;
+        if (t) t->next = hit; else wm_head = hit;
+    }
+    return hit;
+}
+
 static void draw_chrome(window_t *w)
 {
-    /* outer border */
-    draw_rect(w->x, w->y, w->width, w->height, w->chrome_color);
+    /* Focused window gets a bright white border + lightened title bar. */
+    unsigned int border = w->focused ? 0xFFFFFFFFu : w->chrome_color;
+    unsigned int tbg    = w->focused ? (w->title_bg | 0x00505050u) : w->title_bg;
+
+    /* outer border (2 px when focused for a clearer selection cue) */
+    draw_rect(w->x, w->y, w->width, w->height, border);
+    if (w->focused && w->width > 4 && w->height > 4)
+        draw_rect(w->x + 1, w->y + 1, w->width - 2, w->height - 2, border);
 
     /* title bar background (one pixel inside the border) */
-    fill_rect(w->x + 1, w->y + 1, w->width - 2, WM_TITLEBAR_H, w->title_bg);
+    fill_rect(w->x + 1, w->y + 1, w->width - 2, WM_TITLEBAR_H, tbg);
 
     /* title text — left-aligned with a 4 px gutter */
-    draw_string_at(w->x + 4, w->y + 2, w->title, w->title_fg, w->title_bg);
+    draw_string_at(w->x + 4, w->y + 2, w->title, w->title_fg, tbg);
 
     /* separator under the title */
     fill_rect(w->x + 1, w->y + WM_TITLEBAR_H + 1,
