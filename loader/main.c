@@ -50,6 +50,7 @@ extern unsigned long dhcp_offer_count(void);
 extern unsigned long dhcp_ack_count(void);
 extern int  tcp_handle_packet(const unsigned char *frame, int len);
 extern void tcp_set_mac(const unsigned char mac[6]);
+extern void tcp_set_ip(const unsigned char ip[4]);
 extern void tcp_listen(unsigned short port);
 /* TCP listener live counters for the on-screen Network panel (the Pi
  * has no USB keyboard yet, so the shell `tcpstat` is unreachable). */
@@ -1009,6 +1010,13 @@ void kernel_main(void)
         unsigned char mymac[6] = { 0x02, 0xca, 0xfe, 0xb0, 0x05, 0x01 };  /* Pi 5 GEM */
         actor_init();          /* demo actors: 0=counter, 1=store */
         tcp_set_mac(mymac);
+#ifdef RP1_ETH_BASE
+        /* Pi 5's wired IP is .101 (Pi 4 holds .100).  tcp_server.c defaults
+         * g_my_ip to .100, so without this the listener rejects every SYN
+         * addressed to .101 (dst-IP mismatch) and HTTP/curl times out even
+         * though ARP+ICMP/ping already answer on .101. */
+        { unsigned char myip[4] = { 192, 168, 3, 101 }; tcp_set_ip(myip); }
+#endif
         tcp_listen(80);        /* HTTP actor gateway */
     }
     uart_puts("net: HTTP actor gateway on port 80\n");
