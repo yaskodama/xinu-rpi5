@@ -456,11 +456,14 @@ static void cc_sync_icache(void *p, unsigned long len);   /* defined below */
 
 static long (*g_dispatch)(long, long, long, long, long, long);  /* JIT'd dispatch */
 static long (*g_res_methodid)(long);                            /* JIT'd __method_id */
+static long (*g_res_objcls)(long);                              /* JIT'd __obj_cls(id)->v_int(cls) */
+static long (*g_res_clsname)(long);                             /* JIT'd __cls_name(cls)->v_str */
 static int  g_nact;                            /* high-water actor id */
 static unsigned char  g_alive[ACT_MAX];
 static unsigned char  g_protect[ACT_MAX];      /* GC-exempt */
 static unsigned long  g_born[ACT_MAX];         /* cc_now() at spawn */
 static unsigned long  g_lastact[ACT_MAX];      /* cc_now() of last dispatch */
+static char           g_clsname[ACT_MAX][16];  /* class name snapshot (for the window) */
 static unsigned long  g_gc_runs, g_gc_killed;  /* lifetime GC tallies */
 
 struct cc_msg { long to, mid, a0, a1, a2, a3; };
@@ -480,7 +483,22 @@ static unsigned long cc_idle_ms(int i)
 static void cc_actor_reset(void)
 {
     g_nact = 0; g_qh = g_qt = 0;
-    for (int i = 0; i < ACT_MAX; i++) { g_alive[i]=0; g_protect[i]=0; g_born[i]=0; g_lastact[i]=0; }
+    for (int i = 0; i < ACT_MAX; i++) { g_alive[i]=0; g_protect[i]=0; g_born[i]=0; g_lastact[i]=0; g_clsname[i][0]=0; }
+}
+
+/* Snapshot each new actor's class name (call the JIT'd __obj_cls/__cls_name)
+ * while we're still in the load/send path (single-threaded vs the render loop),
+ * so the Actors window can read plain strings without ever calling JIT'd code. */
+static void cc_snapshot_classnames(void)
+{
+    if (!g_res_objcls || !g_res_clsname) return;
+    for (int i = 0; i < g_nact; i++) {
+        if (!g_alive[i] || g_clsname[i][0]) continue;
+        long cls = v_int_of(g_res_objcls((long)i));
+        const char *nm = (const char *)g_res_clsname(cls);
+        int k = 0; if (nm) while (nm[k] && k < 15) { g_clsname[i][k] = nm[k]; k++; }
+        g_clsname[i][k] = 0;
+    }
 }
 static long cc_actor_new(void)
 {
@@ -578,7 +596,7 @@ static int  g_res_loaded;
 int cc_actor_load(const char *src, int srclen, char *out, int outcap)
 {
     unsigned long n = (unsigned long)(srclen < 0 ? 0 : srclen);
-    g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0;
+    g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0; g_res_objcls = 0; g_res_clsname = 0;
     if (!arena_init(CC_ARENA)) return -2;
     g_err = 0; g_errbuf[0] = 0;
 
@@ -599,13 +617,18 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     }
     cc_sync_icache(g_codebuf, (unsigned long)len);
 
-    /* Fresh actor world + value heaps; wire dispatch/__method_id/apply. */
+    /* Fresh actor world + value heaps; wire dispatch/__method_id/apply +
+     * the introspection entry points the Actors window uses. */
     cc_actor_reset(); vheap_reset(); lheap_reset();
     int doff = cc_func_offset("dispatch");
     int moff = cc_func_offset("__method_id");
     int aoff = cc_func_offset("apply");
+    int coff = cc_func_offset("__obj_cls");
+    int noff = cc_func_offset("__cls_name");
     g_dispatch     = (doff >= 0) ? (void *)(g_codebuf + doff) : 0;
     g_res_methodid = (moff >= 0) ? (void *)(g_codebuf + moff) : 0;
+    g_res_objcls   = (coff >= 0) ? (void *)(g_codebuf + coff) : 0;
+    g_res_clsname  = (noff >= 0) ? (void *)(g_codebuf + noff) : 0;
     cc_set_apply(aoff >= 0 ? (void *)(g_codebuf + aoff) : 0);
     cc_set_deadline();
 
@@ -613,6 +636,8 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     long (*mainfn)(void) = (long (*)(void))(g_codebuf + entry);
     mainfn();                 /* spawn actors + initial sends */
     cc_pump();                /* deliver the initial cascade (deadline-bounded) */
+    g_res_loaded = 1;         /* mark resident BEFORE the snapshot reads g_clsname */
+    cc_snapshot_classnames(); /* record class names for the Actors window */
     /* NOTE: arena deliberately NOT freed — the JIT'd code holds pointers to
      * string literals living in it; they must survive for later /actor/send. */
 
@@ -641,6 +666,7 @@ int cc_actor_send_msg(int to, const char *method, int arg, char *out, int outcap
     g_cap = out; g_capcap = outcap; g_caplen = 0;
     long res = g_dispatch((long)to, (long)midraw, v_int(arg), v_int(0), v_int(0), v_int(0));
     cc_pump();
+    cc_snapshot_classnames();   /* name any newly-spawned actors */
     /* append "=> <rendered result>" */
     const char *arrow = "=> "; for (int i=0;arrow[i]&&g_caplen<g_capcap-1;i++) g_cap[g_caplen++]=arrow[i];
     { char rb[32]; const char *rs = v_render(res, rb, sizeof rb); for(int i=0;rs[i]&&g_caplen<g_capcap-1;i++) g_cap[g_caplen++]=rs[i]; }
@@ -675,6 +701,20 @@ unsigned long cc_gc_run_count(void)   { return g_gc_runs; }
 unsigned long cc_gc_kill_count(void)  { return g_gc_killed; }
 int           cc_actor_live_count(void){ int n=0; for(int i=0;i<g_nact;i++) if(g_alive[i]) n++; return n; }
 int           cc_actor_resident(void) { return g_res_loaded; }
+
+/* Per-actor introspection for the on-screen Actors window.  pool_size returns 0
+ * unless a program is fully resident, so the window never iterates (and never
+ * calls the JIT'd __obj_cls/__cls_name) while /actor/load is mid-compile and
+ * the code buffer / pointers are being rewritten in the ISR. */
+int           cc_actor_pool_size(void){ return g_res_loaded ? g_nact : 0; }
+int           cc_actor_is_alive(int i){ return (i>=0&&i<ACT_MAX)?g_alive[i]:0; }
+int           cc_actor_is_protected(int i){ return (i>=0&&i<ACT_MAX)?g_protect[i]:0; }
+int           cc_actor_idle_ms(int i) { return (i>=0&&i<g_nact)?(int)cc_idle_ms(i):0; }
+const char   *cc_actor_classname(int i)         /* from the load-time snapshot */
+{
+    if (!g_res_loaded || i < 0 || i >= g_nact || !g_alive[i] || !g_clsname[i][0]) return 0;
+    return g_clsname[i];
+}
 
 /* ---------- extern-symbol table: the JIT's call-into-kernel seam ---------- */
 
@@ -767,7 +807,7 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
 {
     /* /cc reuses g_codebuf + the arena, so any resident actor program is now
      * invalid (its dispatch + string literals are about to be overwritten). */
-    g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0;
+    g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0; g_res_objcls = 0; g_res_clsname = 0;
     if (!arena_init(CC_ARENA)) return -2;
     g_err = 0; g_errbuf[0] = 0;
 

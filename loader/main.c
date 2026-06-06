@@ -478,6 +478,31 @@ static void win_status(window_t *self, unsigned int frame)
                 draw_string_at(xb, yb + line*12, l, 0xFF80C0FFU, bg); line++;
             }
 
+            /* RP1 USB (DWC3/xHCI) probe — Phase 1 of the mouse driver. */
+            {
+                extern unsigned int rp1usb_ver(int);
+                extern int          rp1usb_ports(int);
+                extern unsigned int rp1usb_snpsid(int);
+                extern unsigned int rp1usb_portsc(int, int);
+                extern int          rp1usb_connected(void);
+                n = 0;
+                kv_append(l, &n, "USB0 hciver", (unsigned long)rp1usb_ver(0));
+                kv_append(l, &n, "ports", (unsigned long)rp1usb_ports(0));
+                kv_append(l, &n, "connected", (unsigned long)rp1usb_connected());
+                draw_string_at(xb, yb + line*12, l, 0xFF60E0FFU, bg); line++;
+                /* per-port PORTSC: bit0 (1)=device connected. */
+                n = 0;
+                kv_append(l, &n, "c0p1", (unsigned long)rp1usb_portsc(0,0));
+                kv_append(l, &n, "p2", (unsigned long)rp1usb_portsc(0,1));
+                kv_append(l, &n, "p3", (unsigned long)rp1usb_portsc(0,2));
+                draw_string_at(xb, yb + line*12, l, 0xFF60E0FFU, bg); line++;
+                n = 0;
+                kv_append(l, &n, "c1p1", (unsigned long)rp1usb_portsc(1,0));
+                kv_append(l, &n, "p2", (unsigned long)rp1usb_portsc(1,1));
+                kv_append(l, &n, "p3", (unsigned long)rp1usb_portsc(1,2));
+                draw_string_at(xb, yb + line*12, l, 0xFF60E0FFU, bg); line++;
+            }
+
             /* last RX frame's first 14 bytes = dst MAC / src MAC / ethertype */
             extern unsigned int rp1eth_rxlast(int);
             {
@@ -813,9 +838,74 @@ static void serial_io_tick(void)
     }
 }
 
+/* Actors window — lists the built-in HTTP-gateway actors and, when an AIPL
+ * program is resident (POST /actor/load), every actor in its pool with its
+ * class, liveness, idle time, plus the global-GC tallies. */
+static void win_actors(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    extern int          actor_count(void);
+    extern const char  *actor_name(int);
+    extern int          actor_field(int, int);
+    extern int          cc_actor_resident(void);
+    extern int          cc_actor_live_count(void);
+    extern int          cc_actor_pool_size(void);
+    extern int          cc_actor_is_alive(int);
+    extern int          cc_actor_idle_ms(int);
+    extern const char  *cc_actor_classname(int);
+    extern unsigned long cc_gc_run_count(void);
+    extern unsigned long cc_gc_kill_count(void);
+
+    unsigned int fg = 0xFFFFFFFFU, hi = 0xFFFFD060U, dim = 0xFF909090U;
+    unsigned int bg = self->content_bg;
+    int xb = self->x + 8;
+    int yb = self->y + WM_TITLEBAR_H + 6;
+    int line = 0;
+    char l[80]; int n;
+
+    draw_string_at(xb, yb + (line++)*11, "Gateway actors (HTTP /send):", hi, bg);
+    int gc = actor_count();
+    for (int i = 0; i < gc && line < 5; i++) {
+        n = 0;
+        kv_append(l, &n, "#", (unsigned long)i);
+        const char *nm = actor_name(i);
+        while (nm && *nm && n < 28) l[n++] = *nm++;
+        l[n++] = ' '; l[n] = 0;
+        kv_append(l, &n, "v", (unsigned long)actor_field(i, 0));
+        kv_append(l, &n, "msg", (unsigned long)actor_field(i, 1));
+        draw_string_at(xb, yb + (line++)*11, l, fg, bg);
+    }
+
+    line++;
+    n = 0;
+    kv_append(l, &n, "AIPL resident=", (unsigned long)cc_actor_resident());
+    kv_append(l, &n, "live", (unsigned long)cc_actor_live_count());
+    draw_string_at(xb, yb + (line++)*11, l, hi, bg);
+    n = 0;
+    kv_append(l, &n, "global GC runs=", cc_gc_run_count());
+    kv_append(l, &n, "reaped", cc_gc_kill_count());
+    draw_string_at(xb, yb + (line++)*11, l, dim, bg);
+
+    int ps = cc_actor_pool_size();
+    if (ps == 0) {
+        draw_string_at(xb, yb + (line++)*11, "  (no program loaded)", dim, bg);
+    }
+    for (int i = 0; i < ps && line < 84; i++) {
+        int alive = cc_actor_is_alive(i);
+        n = 0;
+        kv_append(l, &n, "#", (unsigned long)i);
+        const char *cn = cc_actor_classname(i);
+        if (cn) { while (*cn && n < 22) l[n++] = *cn++; l[n++] = ' '; l[n] = 0; }
+        else    { const char *d = alive ? "? " : "(dead) "; while (*d) l[n++] = *d++; l[n] = 0; }
+        if (alive) kv_append(l, &n, "idle_ms", (unsigned long)cc_actor_idle_ms(i));
+        draw_string_at(xb, yb + (line++)*11, l, alive ? fg : dim, bg);
+    }
+}
+
 /* Static window descriptors — laid out after video_init() picks the
  * actual screen dimensions in kernel_main(). */
 static window_t banner_win;
+static window_t actors_win;
 static window_t status_win;
 static window_t anim_win;
 static window_t ftree_win;
@@ -973,6 +1063,7 @@ void kernel_main(void)
         extern int rp1eth_probe(void);
         rp1pcie_init();     /* train the PCIe link to the RP1 first */
         rp1eth_probe();
+        { extern void rp1usb_probe(void); rp1usb_probe(); }  /* RP1 DWC3/xHCI host */
     }
 #endif
 
@@ -1135,6 +1226,21 @@ void kernel_main(void)
         mem_win.content_bg   = 0xFF181410U;
         mem_win.draw_content = win_mem;
         wm_add(&mem_win);
+
+        /* Actors window: a third column on the right (panned into view if the
+         * initial viewport is narrower).  Lists gateway + AIPL actors + GC. */
+        actors_win.x = 1344;
+        actors_win.y = 44;
+        actors_win.width  = 568;
+        actors_win.height = 1030;
+        const char *at = "Actors";
+        for (int i = 0; i < WM_TITLE_MAX && at[i]; i++) actors_win.title[i] = at[i];
+        actors_win.chrome_color = 0xFFC080FFU;
+        actors_win.title_bg     = 0xFF402060U;
+        actors_win.title_fg     = 0xFFFFFFFFU;
+        actors_win.content_bg   = 0xFF14101CU;
+        actors_win.draw_content = win_actors;
+        wm_add(&actors_win);
 
         /* Shell window: left half of the *initial* viewport — the
          * boot log lives here and must stay visible without any
