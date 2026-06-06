@@ -175,8 +175,10 @@ static struct gem_desc *g_rxr, *g_txr;
 static unsigned char   *g_rxb, *g_txb;
 static int g_rxhead, g_txi;
 static unsigned long g_rxcnt, g_txcnt;
+static unsigned char g_rxlast[16];               /* first 16 bytes of last RX frame */
 unsigned long rp1eth_rx_count(void) { return g_rxcnt; }
 unsigned long rp1eth_tx_count(void) { return g_txcnt; }
+unsigned int  rp1eth_rxlast(int i) { return (i >= 0 && i < 16) ? g_rxlast[i] : 0; }
 unsigned int  rp1eth_rsr(void)  { return E(0x020); }            /* RX status */
 unsigned int  rp1eth_rxd0(void) { return g_rxr ? g_rxr[0].addr : 0xffffffffu; }
 
@@ -271,8 +273,11 @@ static void rp1eth_rx_rearm(void)   /* hand the whole RX ring back to HW */
         g_rxr[i].ctrl  = 0;
     }
     g_rxhead = 0;
+    unsigned int ncr = E(GEM_NCR);
+    E(GEM_NCR) = ncr & ~NCR_RE;     /* stop RX, reset the queue pointer, restart */
     E(GEM_RBQP) = LO(DA(g_rxr));  E(GEM_RBQPH) = HI(DA(g_rxr));
     E(0x020) = 0x0fu;               /* clear RSR (REC/BNA/OVR) */
+    E(GEM_NCR) = ncr | NCR_RE;
 }
 
 int rp1eth_rx_poll(unsigned char **pkt)
@@ -284,7 +289,9 @@ int rp1eth_rx_poll(unsigned char **pkt)
         return 0;
     }
     int len = (int)(g_rxr[g_rxhead].ctrl & 0xfff);
-    *pkt = g_rxb + g_rxhead*RXBUF;
+    unsigned char *b = g_rxb + g_rxhead*RXBUF;
+    for (int i = 0; i < 16; i++) g_rxlast[i] = b[i];   /* snapshot for HDMI */
+    *pkt = b;
     return len;
 }
 

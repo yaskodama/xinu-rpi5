@@ -359,6 +359,20 @@ static void win_status(window_t *self, unsigned int frame)
             kv_append(l, &n, "Etx", rp1eth_tx_count());
             kv_append(l, &n, "rsr", (unsigned long)rp1eth_rsr());
             draw_string_at(xb, yb + line*12, l, 0xFFFFD060U, bg); line++;
+
+            /* last RX frame's first 14 bytes = dst MAC / src MAC / ethertype */
+            extern unsigned int rp1eth_rxlast(int);
+            {
+                static const char hx[] = "0123456789abcdef";
+                char h[48]; int hi = 0;
+                for (int i = 0; i < 14; i++) {
+                    unsigned int b = rp1eth_rxlast(i);
+                    h[hi++] = hx[(b >> 4) & 0xf]; h[hi++] = hx[b & 0xf];
+                    if (i == 5 || i == 11) h[hi++] = ' ';
+                }
+                h[hi] = 0;
+                draw_string_at(xb, yb + line*12, h, 0xFF80FFFFU, bg); line++;
+            }
         }
 #endif
 
