@@ -63,8 +63,20 @@ extern const char   *tcp_state_str(void);
 
 static int g_rx_log_left = 2;
 static unsigned long g_rx_tick_count = 0;
+static volatile int  g_rx_busy = 0;     /* reentrancy guard: timer ISR vs wm loop */
 static void genet_rx_tick(void)
 {
+    /* This drains the RX ring and runs the protocol stack.  It is now
+     * called from TWO contexts — the slow wm render loop AND the 100 Hz
+     * timer IRQ (so RX is serviced even when the wm loop stalls, which
+     * is what let the GEM hit BNA and freeze).  On a single core the IRQ
+     * fully preempts the wm loop, so a one-shot busy flag makes the two
+     * callers run SEQUENTIALLY (never interleaved on g_rxhead / the TX
+     * ring): if the IRQ fires while the wm loop owns the ring, it sees
+     * g_rx_busy and returns immediately — the wm loop finishes the drain. */
+    if (g_rx_busy) return;
+    g_rx_busy = 1;
+
     /* DHCP retry path disabled — was disrupting the GENET TX ring
      * after repeated DISCOVER bursts.  Code in system/dhcp_client.c
      * stays in place for future re-activation. */
@@ -137,6 +149,19 @@ static void genet_rx_tick(void)
         }
         genet_rx_release();
     }
+
+    g_rx_busy = 0;
+}
+
+/* timer_tick_hook — called from the 100 Hz timer IRQ (overrides the weak
+ * default in device/timer/timer.c).  On the Pi 5 this drains the RP1 GEM
+ * RX ring at a guaranteed 100 Hz so it no longer overruns/BNA-freezes when
+ * the wm render loop is busy.  Empty on Pi 4/QEMU (RX stays on the wm loop). */
+void timer_tick_hook(void)
+{
+#ifdef RP1_ETH_BASE
+    genet_rx_tick();
+#endif
 }
 
 /* USPi is gone (DWC2 only — Pi 4 USB-A keyboards/mice need xHCI).
@@ -359,6 +384,68 @@ static void win_status(window_t *self, unsigned int frame)
             kv_append(l, &n, "Etx", rp1eth_tx_count());
             kv_append(l, &n, "rsr", (unsigned long)rp1eth_rsr());
             draw_string_at(xb, yb + line*12, l, 0xFFFFD060U, bg); line++;
+
+            /* IRQ / drain diagnostics: is the timer IRQ firing (tick), is
+             * genet_rx_tick running (rxt), is the reentrancy guard stuck
+             * (bsy), did HW set the RX descriptor USED bit (rxd0 low bit). */
+            {
+                extern unsigned long timer_irq_count(void);
+                extern unsigned int  rp1eth_rxd0(void);
+                extern unsigned int  rp1eth_rxc0(void);
+                extern unsigned int  rp1eth_rxhead(void);
+                n = 0;
+                kv_append(l, &n, "tick", timer_irq_count());
+                kv_append(l, &n, "rxt",  g_rx_tick_count);
+                kv_append(l, &n, "bsy",  (unsigned long)g_rx_busy);
+                kv_append(l, &n, "rxd0", (unsigned long)rp1eth_rxd0());
+                draw_string_at(xb, yb + line*12, l, 0xFF60FF60U, bg); line++;
+                /* ctrl0 = GEM's status word for RX desc 0 (low 12 bits =
+                 * frame length); head = g_rxhead (which desc rx_poll reads). */
+                extern unsigned long rp1eth_rx_seen(void);
+                extern unsigned long rp1eth_rx_empty(void);
+                extern unsigned int  rp1eth_rx_polladdr(void);
+                extern unsigned int  rp1eth_rx_pollhead(void);
+                n = 0;
+                kv_append(l, &n, "ctrl0", (unsigned long)rp1eth_rxc0());
+                kv_append(l, &n, "head",  (unsigned long)rp1eth_rxhead());
+                kv_append(l, &n, "seen",  rp1eth_rx_seen());
+                kv_append(l, &n, "empt",  rp1eth_rx_empty());
+                draw_string_at(xb, yb + line*12, l, 0xFF60FF60U, bg); line++;
+                /* polladdr = exact addr word rp1eth_rx_poll last read (its
+                 * bit0 = USED as the drain path actually sees it); pollhead =
+                 * g_rxhead it used.  Compare with rxd0/head above: if they
+                 * differ, the drain reads a stale/other descriptor. */
+                extern unsigned int rp1eth_rx_pol0(void);
+                n = 0;
+                kv_append(l, &n, "polad", (unsigned long)rp1eth_rx_polladdr());
+                kv_append(l, &n, "polhd", (unsigned long)rp1eth_rx_pollhead());
+                kv_append(l, &n, "pol0",  (unsigned long)rp1eth_rx_pol0());
+                draw_string_at(xb, yb + line*12, l, 0xFF60FF60U, bg); line++;
+                /* rxr = ring base (low32); rbqp = GEM's live RX pointer (where
+                 * the HW will write next) — if rbqp != rxr + head*16 the GEM and
+                 * our g_rxhead have desynced.  ncfgr bit5 = NBC (broadcast block). */
+                {
+                    extern unsigned int rp1eth_rxrlo(void);
+                    extern unsigned int rp1eth_rbqp(void);
+                    extern unsigned int rp1eth_ncfgr(void);
+                    n = 0;
+                    kv_append(l, &n, "rxr",  (unsigned long)rp1eth_rxrlo());
+                    kv_append(l, &n, "rbqp", (unsigned long)rp1eth_rbqp());
+                    kv_append(l, &n, "ncfg", (unsigned long)rp1eth_ncfgr());
+                    draw_string_at(xb, yb + line*12, l, 0xFF60FF60U, bg); line++;
+                    /* calls = times rp1eth_rx_poll was entered; grxr = g_rxr as
+                     * IT sees it.  If calls climbs but grxr=0 while rxr!=0, the
+                     * drain context reads a different/NULL g_rxr than win_status. */
+                    {
+                        extern unsigned long rp1eth_rx_calls(void);
+                        extern unsigned int  rp1eth_rx_grxr(void);
+                        n = 0;
+                        kv_append(l, &n, "calls", rp1eth_rx_calls());
+                        kv_append(l, &n, "grxr",  (unsigned long)rp1eth_rx_grxr());
+                        draw_string_at(xb, yb + line*12, l, 0xFF60FF60U, bg); line++;
+                    }
+                }
+            }
 
             /* last RX frame's first 14 bytes = dst MAC / src MAC / ethertype */
             extern unsigned int rp1eth_rxlast(int);
@@ -730,11 +817,18 @@ void kernel_main(void)
      *       silently freezing the kernel. */
     exception_init();
 
-    /* Enable the MMU (identity map, caches still off) so the 41-bit GIC
-     * region becomes reachable — prerequisite for interrupts.  A bad mapping
-     * surfaces as a data abort on the (now installed) exception vectors. */
+    /* MMU DISABLED (test): the GIC's real address is 0x107FFF9000, which fits
+     * in the 40-bit flat-addressing range, so it is reachable WITHOUT the MMU —
+     * the original "41-bit GIC" was a typo (0x1007FFF8000).  Enabling the MMU
+     * mapped the GEM DMA rings as Normal (weakly-ordered) memory, which broke
+     * descriptor polling (rx_poll saw a stale USED bit the GEM had set by DMA).
+     * MMU-off keeps that memory strongly-ordered (Device-like) and coherent, so
+     * RX drains and ping can be answered.  We'll re-introduce the MMU later with
+     * the DMA region explicitly mapped Device. */
+#if 0
 #ifdef RP1_ETH_BASE
     { extern void mmu_init(void); mmu_init(); uart_puts("mmu: enabled (identity, caches off)\n"); }
+#endif
 #endif
 
     /* Try to bring up the HDMI framebuffer before printing anything,
@@ -823,8 +917,11 @@ void kernel_main(void)
      * connect_interrupt() will fire. */
     gic_init();
     timer_init();
-    uart_puts("gic+timer: 100 Hz PPI 30 armed; unmasking DAIF.I\n");
-    irq_enable_all();
+    /* NOTE: DAIF.I is unmasked LATER, after rp1eth_probe() has built the GEM
+     * RX ring.  Otherwise the 100 Hz timer ISR (which drains that ring) starts
+     * firing while g_rxr is still NULL / half-initialised — a boot-time race on
+     * g_rxhead and the descriptors that wedged RX. */
+    uart_puts("gic+timer: 100 Hz PPI 30 armed (DAIF.I unmasked after NIC up)\n");
 
     /* XHCI-A — PCIe-1 controller MMIO probe.  Skipped at boot: the
      * controller is clock/power-gated until we implement CPRMAN
@@ -850,6 +947,11 @@ void kernel_main(void)
         rp1eth_probe();
     }
 #endif
+
+    /* NOW it is safe to take interrupts: the GEM RX ring exists, so the timer
+     * ISR's genet_rx_tick can drain it without racing the ring setup. */
+    uart_puts("net: NIC up — unmasking DAIF.I (100 Hz RX drain live)\n");
+    irq_enable_all();
 
     /* Pass our MAC to the responder so ARP replies carry the
      * right source MAC.  d8:3a:dd:a7:fd:bf — confirmed from

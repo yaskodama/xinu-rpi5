@@ -39,6 +39,12 @@ static inline unsigned long cntfrq(void)
     return v;
 }
 
+/* Optional per-tick hook, run inside the timer IRQ.  The default is a
+ * no-op; loader/main.c overrides it to drain the Pi 5 RP1 GEM RX ring at
+ * a guaranteed 100 Hz (the wm render loop was too slow, so RX overran and
+ * BNA-froze).  Weak so Pi 4 / QEMU builds that don't define it still link. */
+__attribute__((weak)) void timer_tick_hook(void) {}
+
 static void timer_irq_handler(void *arg)
 {
     (void)arg;
@@ -46,6 +52,7 @@ static void timer_irq_handler(void *arg)
      * of the handler takes a few μs. */
     cntp_set_tval(timer_interval);
     tick_count++;
+    timer_tick_hook();
 }
 
 void timer_init(void)
@@ -71,6 +78,14 @@ void timer_init(void)
      * the CPU; the free-running CNTPCT counter still drives timer_ticks(). */
     cntp_set_ctl(2);                /* ENABLE=0, IMASK=1 */
 #endif
+}
+
+/* Raw count of timer IRQs actually taken (0 = the PPI is never delivered,
+ * i.e. the GIC/timer IRQ path is dead).  Distinct from timer_ticks(), which
+ * falls back to the polled CNTPCT counter when no IRQ ever fires. */
+unsigned long timer_irq_count(void)
+{
+    return tick_count;
 }
 
 unsigned long timer_ticks(void)

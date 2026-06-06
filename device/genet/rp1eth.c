@@ -181,6 +181,8 @@ unsigned long rp1eth_tx_count(void) { return g_txcnt; }
 unsigned int  rp1eth_rxlast(int i) { return (i >= 0 && i < 16) ? g_rxlast[i] : 0; }
 unsigned int  rp1eth_rsr(void)  { return E(0x020); }            /* RX status */
 unsigned int  rp1eth_rxd0(void) { return g_rxr ? g_rxr[0].addr : 0xffffffffu; }
+unsigned int  rp1eth_rxc0(void) { return g_rxr ? g_rxr[0].ctrl : 0xffffffffu; }
+unsigned int  rp1eth_rxhead(void){ return (unsigned int)g_rxhead; }
 
 unsigned int rp1eth_phy_bmsr(void) { return rp1eth_mdio_read(1, 1); }   /* BMSR */
 int rp1eth_link_up(void) { return (rp1eth_phy_bmsr() & 0x0004) ? 1 : 0; }/* bit2 */
@@ -213,10 +215,11 @@ void rp1eth_start(void)
      * the GEM stays in GMII mode and no frames flow even with the link up. */
     E(0x0c0) = 0x1u;
 
-    /* NCFGR: NO promiscuous — receive only broadcast (ARP) + frames to our MAC,
-     * so the slow wm-loop RX drain isn't swamped by all LAN traffic (which was
-     * overrunning the ring and dropping the ARP request we need). */
-    E(GEM_NCFGR) &= ~(1u << 4);                     /* clear CAF */
+    /* NCFGR: receive broadcast (ARP "who has .101" is a BROADCAST frame) +
+     * frames to our MAC.  Clear CAF (bit4, no promiscuous) AND — critically —
+     * NBC (bit5, "No Broadcast"): if NBC is set the GEM DISCARDS every broadcast,
+     * so the Mac's ARP requests never arrive and ping can never be answered. */
+    E(GEM_NCFGR) &= ~((1u << 4) | (1u << 5));        /* clear CAF + NBC */
 
     E(GEM_NCR) = NCR_RE | NCR_TE | NCR_MPE_B;       /* enable RX + TX */
 
@@ -228,16 +231,16 @@ void rp1eth_start(void)
         if (rp1eth_mdio_read(1, 1) & 0x0004) { up = 1; break; }   /* BMSR link */
     }
 
-    /* Configure NCFGR speed/duplex from the Broadcom aux status (reg 0x19,
-     * bits 10:8 = highest common denominator). */
+    /* Speed/duplex: the Broadcom aux read (reg 0x19) is UNRELIABLE here — it has
+     * returned hcd=7 (1000FD) one boot and hcd=2 (10FD) the next for the same
+     * cable.  A wrong (10/100) setting leaves GBE clear at this gigabit link,
+     * and the GEM's RGMII RX clock then never matches, so it DMAs nothing and
+     * RBQP never advances.  This NIC is wired to a gigabit network (the Pi 4 on
+     * the same switch links at 1000FD), so FORCE gigabit full-duplex. */
+    unsigned int aux = rp1eth_mdio_read(1, 0x19);   /* logged for diagnostics only */
     unsigned int ncfgr = E(GEM_NCFGR);
     ncfgr &= ~((1u<<0) | (1u<<1) | (1u<<10));       /* clear SPD, FD, GBE */
-    unsigned int aux = rp1eth_mdio_read(1, 0x19);
-    unsigned int hcd = (aux >> 8) & 0x7;
-    /* hcd: 7=1000FD 6=1000HD 5=100FD 3=100HD 2=10FD 1=10HD */
-    if (hcd == 7 || hcd == 6) ncfgr |= (1u<<10);                  /* gigabit */
-    else if (hcd == 5 || hcd == 3) ncfgr |= (1u<<0);             /* 100 Mbps */
-    if (hcd == 7 || hcd == 5 || hcd == 2) ncfgr |= (1u<<1);      /* full duplex */
+    ncfgr |= (1u<<10) | (1u<<1);                    /* GBE + FD (forced gigabit) */
     E(GEM_NCFGR) = ncfgr;
 
     uart_puts("rp1eth: aneg "); uart_puts(up ? "UP" : "DOWN");
@@ -280,16 +283,42 @@ static void rp1eth_rx_rearm(void)   /* hand the whole RX ring back to HW */
     E(GEM_NCR) = ncr | NCR_RE;
 }
 
+static unsigned long g_rx_seen, g_rx_empty;
+static unsigned int  g_rx_polladdr;     /* raw addr word rx_poll last read */
+static int           g_rx_pollhead;     /* g_rxhead rx_poll last used      */
+static unsigned int  g_rx_pol0;         /* g_rxr[0].addr as rx_poll sees it */
+unsigned long rp1eth_rx_seen(void)  { return g_rx_seen; }
+unsigned long rp1eth_rx_empty(void) { return g_rx_empty; }
+unsigned int  rp1eth_rx_polladdr(void){ return g_rx_polladdr; }
+unsigned int  rp1eth_rx_pollhead(void){ return (unsigned int)g_rx_pollhead; }
+unsigned int  rp1eth_rx_pol0(void)  { return g_rx_pol0; }
+unsigned int  rp1eth_rxrlo(void)  { return (unsigned int)((unsigned long)g_rxr & 0xffffffffu); }
+unsigned int  rp1eth_rbqp(void)   { return E(GEM_RBQP); }     /* GEM live RX ptr */
+unsigned int  rp1eth_ncfgr(void)  { return E(GEM_NCFGR); }
+
+static unsigned long g_rx_calls;        /* every rp1eth_rx_poll entry */
+static unsigned int  g_rx_grxr;         /* g_rxr as rp1eth_rx_poll sees it */
+unsigned long rp1eth_rx_calls(void) { return g_rx_calls; }
+unsigned int  rp1eth_rx_grxr(void)  { return g_rx_grxr; }
+
 int rp1eth_rx_poll(unsigned char **pkt)
 {
+    g_rx_calls++;
+    g_rx_grxr = (unsigned int)((unsigned long)g_rxr & 0xffffffffu);
+    if (!g_rxr) return 0;                /* GEM ring not built yet (pre-probe) */
+    g_rx_pollhead = g_rxhead;
+    g_rx_polladdr = g_rxr[g_rxhead].addr;
+    g_rx_pol0     = g_rxr[0].addr;       /* same word win_status reads as rxd0 */
     if (!(g_rxr[g_rxhead].addr & 1u)) {
         /* Ring empty.  Just clear the sticky RX status (REC/BNA/OVR) so the GEM
          * keeps receiving into the descriptors we've freed — do NOT reset the
          * ring / toggle RE (that was killing RX every time BNA latched). */
+        g_rx_empty++;
         E(0x020) = 0x0fu;
         (void)rp1eth_rx_rearm;
         return 0;
     }
+    g_rx_seen++;
     int len = (int)(g_rxr[g_rxhead].ctrl & 0xfff);
     unsigned char *b = g_rxb + g_rxhead*RXBUF;
     for (int i = 0; i < 16; i++) g_rxlast[i] = b[i];   /* snapshot for HDMI */
@@ -375,13 +404,11 @@ int rp1eth_probe(void)
         uart_puts(" ctrl=0x");          put_hex32(g_txr[0].ctrl);
         uart_puts("  TBQP=0x");         put_hex32(E(GEM_TBQP)); uart_puts("\n");
 
-        /* briefly poll for any RX */
-        int got = 0; unsigned char *p;
-        for (int t = 0; t < 4000000 && got < 3; t++) {
-            int n = rp1eth_rx_poll(&p);
-            if (n > 0) { got++; uart_puts("rp1eth: RX frame len="); put_hex32((unsigned)n); uart_puts("\n"); rp1eth_rx_release(); }
-        }
-        if (!got) uart_puts("rp1eth: no RX in window\n");
+        /* NO inline RX-poll loop here any more.  The 100 Hz timer IRQ is already
+         * enabled by this point, so its genet_rx_tick drains the SAME ring
+         * concurrently with no mutual exclusion against this loop — that double
+         * drain desynchronised g_rxhead from the GEM's pointer and wedged RX
+         * after ~3 frames.  Leave all RX draining to the (guarded) timer ISR. */
     }
 
     return alive ? 0 : -1;

@@ -60,12 +60,37 @@ int genet_tx_frame(const unsigned char *frame, int length);
 int  genet_link_up(void);
 unsigned int genet_phy_bmsr(void);
 
-#else  /* GENET_BASE not defined (Pi 5 / QEMU) — no built-in GENET MAC */
+#elif defined(RP1_ETH_BASE)  /* Pi 5 — real NIC is the RP1 Cadence GEM */
+
+/* device/genet/rp1eth.c provides REAL global genet_* shims that forward to
+ * the RP1 GEM driver.  These MUST be declared as ordinary prototypes (NOT
+ * static-inline stubs) or main.c/shell.c would silently bind to inert inline
+ * stubs — which is exactly the bug that made genet_rx_poll() always return 0,
+ * so the RX ring was never drained and ping was never answered. */
+void         genet_init(void);
+int          genet_rx_poll(unsigned char **out_pkt);
+void         genet_rx_release(void);
+int          genet_tx_frame(const unsigned char *frame, int length);
+int          genet_link_up(void);
+unsigned int genet_phy_bmsr(void);
+void         genet_get_mac(unsigned char mac[6]);
+
+/* Stats / diagnostics the RP1 GEM driver does not track — inert stubs so the
+ * shared shell `net`/`rxstat` code and the status panel still compile. */
+static inline unsigned int  genet_sys_rev(void)              { return 0; }
+static inline unsigned int  genet_sys_port_ctrl(void)        { return 0; }
+static inline void          genet_rx_recover(void)           {}
+static inline unsigned long genet_rx_packet_count(void)      { return 0; }
+static inline unsigned long genet_rx_byte_count(void)        { return 0; }
+static inline unsigned long genet_rx_overrun_count(void)     { return 0; }
+static inline unsigned long genet_rx_recover_count(void)     { return 0; }
+static inline unsigned long genet_tx_timeout_count(void)     { return 0; }
+
+#else  /* neither GENET_BASE nor RP1_ETH_BASE (QEMU) — no Ethernet at all */
 
 /* main.c, shell.c and the RX dispatcher reference these unconditionally
  * (the calls are not wrapped in #ifdef GENET_BASE), so provide inert
- * stubs for every non-pi4 variant.  Keeping them here is what lets the
- * pi5 and qemu targets compile cleanly. */
+ * stubs.  Keeping them here is what lets the qemu target compile cleanly. */
 static inline void          genet_init(void)                 {}
 static inline unsigned int  genet_sys_rev(void)              { return 0; }
 static inline unsigned int  genet_sys_port_ctrl(void)        { return 0; }
