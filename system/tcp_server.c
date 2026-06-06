@@ -603,6 +603,24 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, " cfgepCC="); bl = s_putdec(body, bl, rp1usb_cfgep_cc());
             bl = s_put(body, bl, " setprotoCC="); bl = s_putdec(body, bl, rp1usb_setproto_cc());
             bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/mousefull")) {
+            extern int rp1usb_mouse_fullsetup(int), rp1usb_full_slot(void), rp1usb_full_speed(void);
+            extern int rp1usb_auto_epaddr(void), rp1usb_auto_dci(void), rp1usb_auto_mps(void),
+                       rp1usb_auto_iface(void), rp1usb_auto_proto(void);
+            extern unsigned int rp1usb_cfgep_cc(void), rp1usb_setproto_cc(void);
+            int port=q_int(req,"port",1);
+            int r = rp1usb_mouse_fullsetup(port);
+            bl = s_put(body, bl, "mousefull r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " slot="); bl = s_putdec(body, bl, rp1usb_full_slot());
+            bl = s_put(body, bl, " speed="); bl = s_putdec(body, bl, rp1usb_full_speed());
+            bl = s_put(body, bl, " epaddr="); bl = s_putdec(body, bl, rp1usb_auto_epaddr());
+            bl = s_put(body, bl, " dci="); bl = s_putdec(body, bl, rp1usb_auto_dci());
+            bl = s_put(body, bl, " mps="); bl = s_putdec(body, bl, rp1usb_auto_mps());
+            bl = s_put(body, bl, " iface="); bl = s_putdec(body, bl, rp1usb_auto_iface());
+            bl = s_put(body, bl, " proto="); bl = s_putdec(body, bl, rp1usb_auto_proto());
+            bl = s_put(body, bl, " cfgepCC="); bl = s_putdec(body, bl, rp1usb_cfgep_cc());
+            bl = s_put(body, bl, " setprotoCC="); bl = s_putdec(body, bl, rp1usb_setproto_cc());
+            bl = s_put(body, bl, "\n");
         } else if (str_starts(rpath, "/usb/pollmode")) {
             extern void rp1usb_set_poll_mode(int); extern int rp1usb_poll_mode_get(void);
             rp1usb_set_poll_mode(q_int(req,"on",1));
@@ -639,12 +657,14 @@ static int http_build(const char *req, char *out, int max)
           bl = s_put(body, bl, " lastdy="); bl = s_putdec(body, bl, rp1usb_last_dy());
           bl = s_put(body, bl, " evtidx="); bl = s_putdec(body, bl, rp1usb_evt_idx());
           bl = s_put(body, bl, " ep1idx="); bl = s_putdec(body, bl, rp1usb_ep1_idx_get()); }
-        { extern unsigned int rp1usb_slot_state(void), rp1usb_ep1_state(void),
-                              rp1usb_ep1_deq_lo(void), rp1usb_ep1_ctx0(void);
+        { extern unsigned int rp1usb_slot_state(void), rp1usb_boundep_state(void),
+                              rp1usb_boundep_deqlo(void), rp1usb_mfindex(void);
+          extern int rp1usb_bound_dci(void);
           bl = s_put(body, bl, "\nepctx: slotstate="); bl = s_putdec(body, bl, rp1usb_slot_state());
-          bl = s_put(body, bl, " ep1state="); bl = s_putdec(body, bl, rp1usb_ep1_state());
-          bl = s_put(body, bl, " ep1deqlo="); bl = s_putdec(body, bl, rp1usb_ep1_deq_lo());
-          bl = s_put(body, bl, " ep1ctx0="); bl = s_putdec(body, bl, rp1usb_ep1_ctx0()); }
+          bl = s_put(body, bl, " bounddci="); bl = s_putdec(body, bl, rp1usb_bound_dci());
+          bl = s_put(body, bl, " bstate="); bl = s_putdec(body, bl, rp1usb_boundep_state());
+          bl = s_put(body, bl, " bdeqlo="); bl = s_putdec(body, bl, rp1usb_boundep_deqlo());
+          bl = s_put(body, bl, " mfindex="); bl = s_putdec(body, bl, rp1usb_mfindex()); }
         bl = s_put(body, bl, "\n");
         }
     } else if (str_starts(rpath, "/api/actors-gc")) {

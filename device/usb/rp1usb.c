@@ -596,6 +596,31 @@ int rp1usb_auto_dci(void)   { return g_auto_dci; }
 int rp1usb_auto_proto(void) { return g_auto_proto; }
 int rp1usb_auto_interval(void){ return g_auto_interval; }
 
+/* One clean call: reset+enable-slot on `port`, auto-detect link speed from
+ * PORTSC, Address Device, then descriptor auto-bind + start the pump.  Avoids
+ * the manual slot/speed juggling that corrupted earlier c0p2 attempts. */
+static int g_full_slot, g_full_speed;
+int rp1usb_mouse_fullsetup(int port)
+{
+    extern int rp1usb_address_device(int,int,int,int);
+    int slot = rp1usb_enum_slot(port);
+    if (slot < 0) return -10;
+    int speed = (int)((g_enum_portsc >> 10) & 0xf);     /* xHCI PORTSC speed id */
+    g_full_slot = slot; g_full_speed = speed;
+    if (rp1usb_address_device(slot, port, speed, 0) != 0) return -20;
+    return rp1usb_hid_autosetup(slot, port, speed);
+}
+int rp1usb_full_slot(void) { return g_full_slot; }
+int rp1usb_full_speed(void){ return g_full_speed; }
+
+/* periodic-schedule clock: if MFINDEX advances, the controller IS running the
+ * (micro)frame timer that drives interrupt endpoints. */
+unsigned int rp1usb_mfindex(void){ return R32(g_rt, 0) & 0x3fff; }
+/* live EP state of whatever DCI the mouse is bound to (vs the old hardcoded 3). */
+unsigned int rp1usb_boundep_state(void){ return ctx_at(g_dev_ctx, g_mouse_dci)[0] & 0x7; }
+unsigned int rp1usb_boundep_deqlo(void){ return ctx_at(g_dev_ctx, g_mouse_dci)[2]; }
+int          rp1usb_bound_dci(void)    { return g_mouse_dci; }
+
 /* Queue one interrupt-IN transfer and wait for the boot-mouse report.  Blocks
  * (deadline-bounded) until the mouse sends data, so move the mouse to get one.
  * Returns the report length, or <=0 on error/timeout. */
