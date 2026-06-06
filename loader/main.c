@@ -730,6 +730,13 @@ void kernel_main(void)
      *       silently freezing the kernel. */
     exception_init();
 
+    /* Enable the MMU (identity map, caches still off) so the 41-bit GIC
+     * region becomes reachable — prerequisite for interrupts.  A bad mapping
+     * surfaces as a data abort on the (now installed) exception vectors. */
+#ifdef RP1_ETH_BASE
+    { extern void mmu_init(void); mmu_init(); uart_puts("mmu: enabled (identity, caches off)\n"); }
+#endif
+
     /* Try to bring up the HDMI framebuffer before printing anything,
      * so the banner appears on both UART and the monitor.  Failure
      * is benign — on QEMU virt and on Pi 5 revisions where the VC
