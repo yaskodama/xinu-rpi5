@@ -818,18 +818,15 @@ void kernel_main(void)
      *       silently freezing the kernel. */
     exception_init();
 
-    /* MMU DISABLED (test): the GIC's real address is 0x107FFF9000, which fits
-     * in the 40-bit flat-addressing range, so it is reachable WITHOUT the MMU —
-     * the original "41-bit GIC" was a typo (0x1007FFF8000).  Enabling the MMU
-     * mapped the GEM DMA rings as Normal (weakly-ordered) memory, which broke
-     * descriptor polling (rx_poll saw a stale USED bit the GEM had set by DMA).
-     * MMU-off keeps that memory strongly-ordered (Device-like) and coherent, so
-     * RX drains and ping can be answered.  We'll re-introduce the MMU later with
-     * the DMA region explicitly mapped Device. */
-#if 0
+    /* Virtual memory: enable the MMU with an identity map, caches OFF.  (The
+     * earlier belief that the MMU broke RX was a red herring — RX was dead
+     * because main.c bound to an inert inline genet_rx_poll stub in genet.h,
+     * not because of memory type; with caches off the Normal-mapped GEM DMA
+     * rings stay coherent.)  Address translation is now live; the GIC at
+     * 0x107FFF9000 sits in the low-512GB Device range, the heap/FB in the low
+     * 4 GB Normal range. */
 #ifdef RP1_ETH_BASE
-    { extern void mmu_init(void); mmu_init(); uart_puts("mmu: enabled (identity, caches off)\n"); }
-#endif
+    { extern void mmu_init(void); mmu_init(); uart_puts("mmu: enabled (identity map, caches off)\n"); }
 #endif
 
     /* Try to bring up the HDMI framebuffer before printing anything,
