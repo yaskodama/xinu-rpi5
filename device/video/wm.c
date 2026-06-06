@@ -146,6 +146,13 @@ void wm_resize_window(int id, int w_, int h_)
     if (h_ >= 24) w->height = h_;
 }
 
+/* The currently focused (selected) window, or NULL. */
+window_t *wm_focused(void)
+{
+    for (window_t *w = wm_head; w; w = w->next) if (w->focused) return w;
+    return 0;
+}
+
 /* Focus + raise the topmost window under a screen-space point (the cursor). */
 window_t *wm_focus_at(int sx, int sy)
 {

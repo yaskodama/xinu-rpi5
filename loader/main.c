@@ -239,7 +239,12 @@ void timer_tick_hook(void)
  * Keyboard input from the future xHCI HID driver will land here. */
 void xhci_keyboard_event(char c)
 {
-    shellwin_handle_key(c);
+    /* Keys only reach the shell while its window is the selected one — click a
+     * different window with the mouse and typing stops going to the shell. */
+    extern struct window *wm_focused(void);
+    extern window_t shell_win;
+    if (wm_focused() == &shell_win)
+        shellwin_handle_key(c);
 }
 
 static int  g_cursor_x = 320;
@@ -1312,6 +1317,7 @@ void kernel_main(void)
         shell_win.title_fg     = 0xFFFFFFFFU;
         shell_win.content_bg   = 0xFF000010U;
         shell_win.draw_content = shellwin_draw;
+        shell_win.focused = 1;          /* shell selected by default so you can type at once */
         wm_add(&shell_win);
         wm_set_tick(serial_io_tick);   /* drain net + debug-UART layout/keys */
 

@@ -320,9 +320,21 @@ unsigned int rp1usb_enum_slotid(void){ return g_enum_slotid; }
 
 /* ---------- Phase 3c: Address Device ---------- */
 static unsigned char g_input_ctx[33*64] __attribute__((aligned(64)));  /* ctrl+slot+up to 31 EPs */
-static unsigned char g_dev_ctx[33*64]  __attribute__((aligned(64)));  /* output context */
+static unsigned char g_dev_ctx[33*64]  __attribute__((aligned(64)));  /* output context (device 0) */
+static unsigned char g_kdevctx[33*64]  __attribute__((aligned(64)));  /* output context (device 1 = kbd) */
+static unsigned char *g_addr_ctx = g_dev_ctx;   /* which output ctx address/configure writes (per-slot) */
 static struct trb    g_ep0_ring[16]    __attribute__((aligned(64)));
 static int           g_ep0_idx, g_ep0_cycle = 1;
+
+/* Second HID device (keyboard): its own interrupt-IN ring + report buffer, polled
+ * alongside the mouse by rp1usb_mouse_pump().  EP0/command/event rings are shared
+ * (binding is sequential), only the persistent output ctx + interrupt ring differ. */
+static struct trb    g_ep2_ring[16]    __attribute__((aligned(64)));
+static int           g_ep2_idx, g_ep2_cycle = 1;
+static unsigned char g_kbd_buf[8]      __attribute__((aligned(64)));
+static unsigned char g_kbd_prev[8];
+static int           g_kbd_slot, g_kbd_dci, g_kbd_active;
+static unsigned long g_kbd_reports;
 static unsigned int  g_addr_cc;
 static int           g_dev_slot, g_dev_speed;
 
@@ -338,8 +350,9 @@ int rp1usb_address_device(int slot, int port, int speed, int bsr)
     g_ep0_ring[15].control = (6u<<10)|(1u<<1)|1u;
     g_ep0_idx=0; g_ep0_cycle=1;
 
+    unsigned char *dctx = g_addr_ctx ? g_addr_ctx : g_dev_ctx;   /* per-slot output ctx */
     for (unsigned i=0;i<sizeof g_input_ctx;i++) g_input_ctx[i]=0;
-    for (unsigned i=0;i<sizeof g_dev_ctx;i++)   g_dev_ctx[i]=0;
+    for (unsigned i=0;i<33*64;i++)              dctx[i]=0;
 
     unsigned int *icc = ctx_at(g_input_ctx, 0);
     icc[1] = (1u<<0)|(1u<<1);                       /* Add slot + EP0 */
@@ -354,7 +367,7 @@ int rp1usb_address_device(int slot, int port, int speed, int bsr)
     ep0[3] = (unsigned int)(trd >> 32);
     ep0[4] = 8;
 
-    g_dcbaa[slot] = XDA(g_dev_ctx);
+    g_dcbaa[slot] = XDA(dctx);
     __asm__ volatile ("dsb sy":::"memory");
 
     unsigned long ic = XDA(g_input_ctx);
@@ -448,6 +461,7 @@ static int            g_mouse_slot, g_mouse_active, g_mouse_dci = 3;  /* defined
 static unsigned long  g_mouse_reports;
 static int            g_last_btn, g_last_dx, g_last_dy;
 static void           ep1_queue_trb(void);
+static void           hid_arm(struct trb *ring, int *idx, int *cyc, unsigned char *buf);
 
 /* EP0 control transfer with NO data stage (SET_CONFIGURATION, SET_PROTOCOL). */
 static int control_nodata(int slot, unsigned int bmReqType, unsigned int bReq,
@@ -557,12 +571,21 @@ int rp1usb_hid_autosetup_if(int slot, int port, int speed, int want_iface)
 
     g_setcfg_cc=(control_nodata(slot,0x00,9,1,0)==0)?1:0;      /* SET_CONFIGURATION(1) */
 
+    /* Route to the mouse device (g_ep1_ring/g_mouse_*) or, for a boot keyboard
+     * (HID protocol 1), the keyboard device (g_ep2_ring/g_kbd_*). */
+    int is_kbd = (g_auto_proto == 1);
+    struct trb *ring = is_kbd ? g_ep2_ring : g_ep1_ring;
+    int *pidx = is_kbd ? &g_ep2_idx : &g_ep1_idx;
+    int *pcyc = is_kbd ? &g_ep2_cycle : &g_ep1_cycle;
+    unsigned char *buf = is_kbd ? g_kbd_buf : g_mouse_buf;
+    unsigned char *dctx = g_addr_ctx ? g_addr_ctx : g_dev_ctx;
+
     int dci=g_auto_dci, in_idx=dci+1, mps=g_auto_mps;
-    for (int i=0;i<16;i++){ g_ep1_ring[i].p0=0;g_ep1_ring[i].p1=0;g_ep1_ring[i].status=0;g_ep1_ring[i].control=0; }
-    g_ep1_ring[15].p0=(unsigned)(XDA(g_ep1_ring)&0xffffffff);
-    g_ep1_ring[15].p1=(unsigned)(XDA(g_ep1_ring)>>32);
-    g_ep1_ring[15].control=(6u<<10)|(1u<<1)|1u;
-    g_ep1_idx=0; g_ep1_cycle=1;
+    for (int i=0;i<16;i++){ ring[i].p0=0;ring[i].p1=0;ring[i].status=0;ring[i].control=0; }
+    ring[15].p0=(unsigned)(XDA(ring)&0xffffffff);
+    ring[15].p1=(unsigned)(XDA(ring)>>32);
+    ring[15].control=(6u<<10)|(1u<<1)|1u;
+    *pidx=0; *pcyc=1;
 
     for (unsigned i=0;i<sizeof g_input_ctx;i++) g_input_ctx[i]=0;
     unsigned int *icc=ctx_at(g_input_ctx,0); icc[1]=(1u<<0)|(1u<<dci);   /* add slot + this EP */
@@ -573,25 +596,25 @@ int rp1usb_hid_autosetup_if(int slot, int port, int speed, int want_iface)
     unsigned iv=3; { int b=g_auto_interval; while (b>1 && iv<10){ b>>=1; iv++; } }  /* ~log2(bInterval)+3 */
     ep[0]=(iv<<16);
     ep[1]=(7u<<3)|(3u<<1)|((unsigned)mps<<16);                 /* Interrupt-IN, CErr=3, MPS */
-    unsigned long trd=XDA(g_ep1_ring)|1u;
+    unsigned long trd=XDA(ring)|1u;
     ep[2]=(unsigned)(trd&0xffffffff); ep[3]=(unsigned)(trd>>32);
     ep[4]=((unsigned)mps<<16)|((unsigned)mps);                 /* Max ESIT Payload + Avg TRB Len */
-    g_dcbaa[slot]=XDA(g_dev_ctx);
+    g_dcbaa[slot]=XDA(dctx);
     __asm__ volatile("dsb sy":::"memory");
     unsigned long ic=XDA(g_input_ctx);
     cmd_submit((unsigned)(ic&0xffffffff),(unsigned)(ic>>32),0,(12u<<10)|((unsigned)slot<<24)); /* Configure Endpoint */
     struct trb ev=event_wait(33);
     g_cfgep_cc=(ev.status>>24)&0xff;
 
-    (void)control_nodata(slot,0x21,0x0A,0,g_auto_iface);        /* SET_IDLE(0) on mouse iface */
-    g_setproto_cc=(control_nodata(slot,0x21,0x0B,0,g_auto_iface)==0)?1:0;  /* SET_PROTOCOL boot */
+    (void)control_nodata(slot,0x21,0x0A,0,g_auto_iface);        /* SET_IDLE(0) on the HID iface */
+    g_setproto_cc=(control_nodata(slot,0x21,0x0B,(unsigned)(is_kbd?0:0),g_auto_iface)==0)?1:0;  /* SET_PROTOCOL boot */
 
     if (g_cfgep_cc==1){
-        g_mouse_slot=slot; g_mouse_dci=dci;
-        ep1_queue_trb(); ep1_queue_trb();
+        hid_arm(ring,pidx,pcyc,buf); hid_arm(ring,pidx,pcyc,buf);
         R32(g_db,slot*4)=(unsigned)dci;
         __asm__ volatile("dsb sy":::"memory");
-        g_mouse_active=1;
+        if (is_kbd){ g_kbd_slot=slot; g_kbd_dci=dci; g_kbd_active=1; }
+        else       { g_mouse_slot=slot; g_mouse_dci=dci; g_mouse_active=1; }
     }
     return (g_cfgep_cc==1)?0:-1;
 }
@@ -627,10 +650,20 @@ int rp1usb_autostart(void)
 {
     rp1usb_select_ctrl(1);
     if (rp1usb_xhci_init() != 0) return -1;
-    for (int p = 1; p <= 3; p++) {
-        if (rp1usb_mouse_fullsetup(p) == 0 && g_mouse_active) return p;
+    extern int rp1usb_address_device(int,int,int,int);
+    unsigned char *ctxs[2] = { g_dev_ctx, g_kdevctx };   /* one output ctx per bound device */
+    int nbound = 0;
+    for (int p = 1; p <= 3 && nbound < 2; p++) {
+        int slot = rp1usb_enum_slot(p);
+        if (slot < 0) continue;
+        int speed = (int)((g_enum_portsc >> 10) & 0xf);
+        g_addr_ctx = ctxs[nbound];                       /* address into the next free ctx */
+        if (rp1usb_address_device(slot, p, speed, 0) != 0) continue;
+        /* autosetup walks the descriptor and routes mouse vs keyboard by proto. */
+        if (rp1usb_hid_autosetup_if(slot, p, speed, -1) == 0) nbound++;
     }
-    return -2;
+    g_addr_ctx = g_dev_ctx;                              /* restore default for manual paths */
+    return nbound;
 }
 
 /* periodic-schedule clock: if MFINDEX advances, the controller IS running the
@@ -672,6 +705,54 @@ unsigned char *rp1usb_mouse_buf_ptr(void){ return g_mouse_buf; }
 
 /* ---------- continuous (non-blocking) mouse pump -> xhci_mouse_event ---------- */
 
+/* Generic: arm one interrupt-IN transfer into `buf` on `ring`. */
+static void hid_arm(struct trb *ring, int *idx, int *cyc, unsigned char *buf)
+{
+    struct trb *t=&ring[*idx];
+    unsigned long ba=XDA(buf);
+    t->p0=(unsigned)(ba&0xffffffff); t->p1=(unsigned)(ba>>32);
+    t->status=8;
+    t->control=(1u<<10)|(1u<<5)|((*cyc)&1u);
+    __asm__ volatile ("dsb sy":::"memory");
+    (*idx)++;
+    if (*idx==15){ ring[15].control=(ring[15].control&~1u)|((*cyc)&1u); __asm__ volatile("dsb sy":::"memory"); *idx=0; *cyc^=1; }
+}
+
+/* HID boot-keyboard report -> ASCII, emitting only newly-pressed keys. */
+static const char g_km[64] = {
+    [0x04]='a',[0x05]='b',[0x06]='c',[0x07]='d',[0x08]='e',[0x09]='f',[0x0a]='g',[0x0b]='h',
+    [0x0c]='i',[0x0d]='j',[0x0e]='k',[0x0f]='l',[0x10]='m',[0x11]='n',[0x12]='o',[0x13]='p',
+    [0x14]='q',[0x15]='r',[0x16]='s',[0x17]='t',[0x18]='u',[0x19]='v',[0x1a]='w',[0x1b]='x',
+    [0x1c]='y',[0x1d]='z',[0x1e]='1',[0x1f]='2',[0x20]='3',[0x21]='4',[0x22]='5',[0x23]='6',
+    [0x24]='7',[0x25]='8',[0x26]='9',[0x27]='0',[0x28]='\n',[0x2a]='\b',[0x2b]='\t',[0x2c]=' ',
+    [0x2d]='-',[0x2e]='=',[0x2f]='[',[0x30]=']',[0x31]='\\',[0x33]=';',[0x34]='\'',[0x35]='`',
+    [0x36]=',',[0x37]='.',[0x38]='/',
+};
+static const char g_kms[64] = {
+    [0x04]='A',[0x05]='B',[0x06]='C',[0x07]='D',[0x08]='E',[0x09]='F',[0x0a]='G',[0x0b]='H',
+    [0x0c]='I',[0x0d]='J',[0x0e]='K',[0x0f]='L',[0x10]='M',[0x11]='N',[0x12]='O',[0x13]='P',
+    [0x14]='Q',[0x15]='R',[0x16]='S',[0x17]='T',[0x18]='U',[0x19]='V',[0x1a]='W',[0x1b]='X',
+    [0x1c]='Y',[0x1d]='Z',[0x1e]='!',[0x1f]='@',[0x20]='#',[0x21]='$',[0x22]='%',[0x23]='^',
+    [0x24]='&',[0x25]='*',[0x26]='(',[0x27]=')',[0x28]='\n',[0x2a]='\b',[0x2b]='\t',[0x2c]=' ',
+    [0x2d]='_',[0x2e]='+',[0x2f]='{',[0x30]='}',[0x31]='|',[0x33]=':',[0x34]='"',[0x35]='~',
+    [0x36]='<',[0x37]='>',[0x38]='?',
+};
+static void kbd_decode(unsigned char *r)
+{
+    extern void xhci_keyboard_event(char);
+    int shift = (r[0] & 0x22) != 0;                /* L/R Shift in modifier byte */
+    for (int i=2;i<8;i++) {
+        unsigned u=r[i];
+        if (u==0 || u>=0x40) continue;
+        int held=0;                                /* already down in the previous report? */
+        for (int j=2;j<8;j++) if (g_kbd_prev[j]==u){ held=1; break; }
+        if (held) continue;
+        char c = shift ? g_kms[u] : g_km[u];
+        if (c) xhci_keyboard_event(c);
+    }
+    for (int i=0;i<8;i++) g_kbd_prev[i]=r[i];
+}
+
 static void ep1_queue_trb(void)            /* arm one interrupt-IN transfer */
 {
     struct trb *t=&g_ep1_ring[g_ep1_idx];
@@ -695,8 +776,8 @@ int  rp1usb_poll_mode_get(void) { return g_poll_mode; }
 
 void rp1usb_mouse_pump(void)
 {
-    if (!g_mouse_active) return;
-    if (g_poll_mode) {                         /* control-pipe polling path */
+    if (!g_mouse_active && !g_kbd_active) return;
+    if (g_mouse_active && g_poll_mode) {       /* control-pipe polling path */
         extern int rp1usb_get_report(int,int);
         int n = rp1usb_get_report(g_mouse_slot, 4);
         if (n >= 3) {
@@ -719,8 +800,10 @@ void rp1usb_mouse_pump(void)
         unsigned long erdp=XDA(&g_evt_ring[g_evt_idx]);
         R32(g_rt, IR0_ERDP)   = (unsigned)((erdp&0xffffffff)|(1u<<3));
         R32(g_rt, IR0_ERDP+4) = (unsigned)(erdp>>32);
-        if (((ev.control>>10)&0x3f) == 32 &&                     /* Transfer Event ... */
-            (int)((ev.control>>16)&0x1f) == g_mouse_dci) {       /* ...for OUR mouse EP */
+        if (((ev.control>>10)&0x3f) != 32) continue;             /* Transfer Event only */
+        int eslot = (int)((ev.control>>24)&0xff);
+        int edci  = (int)((ev.control>>16)&0x1f);
+        if (g_mouse_active && eslot==g_mouse_slot && edci==g_mouse_dci) {
             unsigned btn = g_mouse_buf[0];
             int dx = (int)(signed char)g_mouse_buf[1];
             int dy = (int)(signed char)g_mouse_buf[2];
@@ -728,11 +811,19 @@ void rp1usb_mouse_pump(void)
             g_last_btn=btn; g_last_dx=dx; g_last_dy=dy;
             if (dx || dy || btn) xhci_mouse_event(btn, dx, dy);
             ep1_queue_trb();
-            R32(g_db, g_mouse_slot*4) = (unsigned)g_mouse_dci;   /* re-ring EP doorbell */
+            R32(g_db, g_mouse_slot*4) = (unsigned)g_mouse_dci;   /* re-ring mouse EP doorbell */
+            __asm__ volatile ("dsb sy":::"memory");
+        } else if (g_kbd_active && eslot==g_kbd_slot && edci==g_kbd_dci) {
+            g_kbd_reports++;
+            kbd_decode(g_kbd_buf);
+            hid_arm(g_ep2_ring, &g_ep2_idx, &g_ep2_cycle, g_kbd_buf);
+            R32(g_db, g_kbd_slot*4) = (unsigned)g_kbd_dci;       /* re-ring kbd EP doorbell */
             __asm__ volatile ("dsb sy":::"memory");
         }
     }
 }
+unsigned long rp1usb_kbd_reports(void){ return g_kbd_reports; }
+int           rp1usb_kbd_on(void)     { return g_kbd_active; }
 unsigned long rp1usb_mouse_reports(void){ return g_mouse_reports; }
 int           rp1usb_mouse_on(void)     { return g_mouse_active; }
 int           rp1usb_last_btn(void)     { return g_last_btn; }

@@ -47,6 +47,10 @@ void shellwin_init(void)
     ring_filled = 0;
     inlen = 0;
     inited = 1;
+
+    /* Show a live prompt immediately so the window reads as a running shell.
+     * uart_puts() mirrors into the scrollback ring (see uart_putc). */
+    uart_puts("Embedded Xinu (Pi 5) shell -- type 'help'\nxinu-pi5$ ");
 }
 
 void shellwin_record_char(char c)
