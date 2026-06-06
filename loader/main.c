@@ -245,10 +245,18 @@ void xhci_keyboard_event(char c)
 static int  g_cursor_x = 320;
 static int  g_cursor_y = 240;
 
+/* Pointer sensitivity: the boot mouse streams ~130 reports/s, so raw deltas move
+ * the cursor far too fast.  Divide by MOUSE_DIV, accumulating the remainder so
+ * slow movements aren't lost. */
+#define MOUSE_DIV 3
+static int g_mouse_accx, g_mouse_accy;
 void xhci_mouse_event(unsigned nButtons, int dx, int dy)
 {
-    g_cursor_x += dx;
-    g_cursor_y += dy;
+    g_mouse_accx += dx; g_mouse_accy += dy;
+    int mx = g_mouse_accx / MOUSE_DIV; g_mouse_accx -= mx * MOUSE_DIV;
+    int my = g_mouse_accy / MOUSE_DIV; g_mouse_accy -= my * MOUSE_DIV;
+    g_cursor_x += mx;
+    g_cursor_y += my;
     int sw = (int)video_screen_width();
     int sh = (int)video_screen_height();
     wm_set_autopan(0);
