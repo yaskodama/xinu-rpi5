@@ -820,7 +820,7 @@ void kernel_main(void)
      * pre-reset UMAC read on this Pi 4. */
     {
         extern void net_responder_set_mac(const unsigned char mac[6]);
-        unsigned char mymac[6] = { 0xd8, 0x3a, 0xdd, 0xa7, 0xfd, 0xbf };
+        unsigned char mymac[6] = { 0x02, 0xca, 0xfe, 0xb0, 0x05, 0x01 };  /* Pi 5 GEM */
         net_responder_set_mac(mymac);
     }
     uart_puts("net: ARP+ICMP responder armed; static IP 192.168.3.100\n");
@@ -868,7 +868,7 @@ void kernel_main(void)
      * the first newline.  Dispatch is wired in genet_rx_tick(). */
     {
         extern void actor_init(void);
-        unsigned char mymac[6] = { 0xd8, 0x3a, 0xdd, 0xa7, 0xfd, 0xbf };
+        unsigned char mymac[6] = { 0x02, 0xca, 0xfe, 0xb0, 0x05, 0x01 };  /* Pi 5 GEM */
         actor_init();          /* demo actors: 0=counter, 1=store */
         tcp_set_mac(mymac);
         tcp_listen(80);        /* HTTP actor gateway */

@@ -23,7 +23,7 @@ static unsigned long  htonl(unsigned long v)  { return ntohl(v); }
 #define PI_IP_0  192
 #define PI_IP_1  168
 #define PI_IP_2  3
-#define PI_IP_3  100
+#define PI_IP_3  101   /* Pi 5 (wired); Pi 4 already uses .100 */
 
 /* GENET sends frames via the existing tx-one-frame path; we'd
  * normally call a dedicated genet_tx(packet, length) helper, but

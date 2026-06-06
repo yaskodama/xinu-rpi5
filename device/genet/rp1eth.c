@@ -344,4 +344,24 @@ int rp1eth_probe(void)
     return alive ? 0 : -1;
 }
 
+/* ------------------------------------------------------------------ *
+ * Link-layer shim: on the Pi 5 there is no GENET, so route the stack's *
+ * genet_* link calls (net_responder / tcp / main loop) to the RP1 GEM. *
+ * The GEM is started in rp1eth_probe(), which runs before the stack    *
+ * sends its gratuitous ARP / opens the TCP listener.                   *
+ * ------------------------------------------------------------------ */
+#ifndef GENET_BASE
+void genet_init(void) { }                     /* GEM already brought up in probe */
+int  genet_tx_frame(const unsigned char *f, int len) { return rp1eth_tx_frame(f, len); }
+int  genet_rx_poll(unsigned char **p) { return rp1eth_rx_poll(p); }
+void genet_rx_release(void) { rp1eth_rx_release(); }
+int  genet_link_up(void) { return rp1eth_link_up(); }
+unsigned int genet_phy_bmsr(void) { return rp1eth_phy_bmsr(); }
+void genet_get_mac(unsigned char mac[6])
+{
+    static const unsigned char m[6] = { 0x02, 0xCA, 0xFE, 0xB0, 0x05, 0x01 };
+    for (int i = 0; i < 6; i++) mac[i] = m[i];
+}
+#endif
+
 #endif /* RP1_ETH_BASE */
