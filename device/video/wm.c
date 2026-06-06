@@ -227,6 +227,7 @@ void wm_run(void)
     video_set_viewport(0, 0);
     fill_rect(0, 0, sw, sh, DESKTOP_BG);
 
+    int s_last_vp_x = -999999, s_last_vp_y = -999999;   /* force a wipe on frame 0 */
     for (;;) {
         if (wm_tick) wm_tick();
 
@@ -252,11 +253,17 @@ void wm_run(void)
         }
         clamp_viewport(sw, sh);
 
-        /* Repaint the visible screen with the desktop background
-         * before any windows — the auto-pan shifts the camera so
-         * stale pixels from the previous frame need to be cleared. */
+        /* Repaint the desktop background only when the camera actually moved
+         * (auto-pan).  The cursor is no longer composited into the back buffer
+         * and the windows repaint their own areas every frame, so when the
+         * viewport is static the desktop is unchanged — skipping this full-screen
+         * fill each frame roughly halves compose time (faster frames => lower
+         * keyboard echo latency + smoother pointer). */
         video_set_viewport(0, 0);
-        fill_rect(0, 0, sw, sh, DESKTOP_BG);
+        if (vp_x != s_last_vp_x || vp_y != s_last_vp_y) {
+            fill_rect(0, 0, sw, sh, DESKTOP_BG);
+            s_last_vp_x = vp_x; s_last_vp_y = vp_y;
+        }
 
         /* Now switch to the panned camera and draw all windows in
          * virtual desktop coordinates. */
@@ -273,7 +280,7 @@ void wm_run(void)
         (void)draw_cursor; (void)CURSOR_SUBFRAMES; (void)CURSOR_SUBMS;  /* retained */
         video_present_hole();                    /* flip, keeping the live cursor */
         video_cursor_to_front(cursor_x, cursor_y, cursor_visible);  /* re-stamp after flip */
-        delay_ms(1000 / DEFAULT_FPS);
+        delay_ms(2);   /* the (slow) flip already paces the loop; don't add idle */
         frame++;
     }
 }
