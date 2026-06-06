@@ -211,9 +211,10 @@ void rp1eth_start(void)
      * the GEM stays in GMII mode and no frames flow even with the link up. */
     E(0x0c0) = 0x1u;
 
-    /* NCFGR: copy-all-frames (CAF/promiscuous, bit4) so the RX filter can't be
-     * the reason for Erx=0 while we debug; keep MDC clock. */
-    E(GEM_NCFGR) |= (1u << 4);
+    /* NCFGR: NO promiscuous — receive only broadcast (ARP) + frames to our MAC,
+     * so the slow wm-loop RX drain isn't swamped by all LAN traffic (which was
+     * overrunning the ring and dropping the ARP request we need). */
+    E(GEM_NCFGR) &= ~(1u << 4);                     /* clear CAF */
 
     E(GEM_NCR) = NCR_RE | NCR_TE | NCR_MPE_B;       /* enable RX + TX */
 
