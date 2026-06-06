@@ -444,6 +444,33 @@ static void win_status(window_t *self, unsigned int frame)
         line++;
     }
 
+    /* Mouse cursor position + USB HID report counters (LIVE). */
+    {
+        char tmp[24];
+        unsigned int mfg = 0xFFE0E080U;
+        extern unsigned long rp1usb_mouse_reports(void), rp1usb_kbd_reports(void);
+        extern int rp1usb_mouse_on(void), rp1usb_kbd_on(void);
+        line++;
+        draw_string_at(xb, yb + line*12, "Mouse / Keyboard", 0xFF80FF80U, bg); line++;
+
+        p = u_to_dec((unsigned long)g_cursor_x, tmp, sizeof tmp);
+        draw_string_at(xb, yb + line*12, "cursor:", mfg, bg);
+        draw_string_at(xb + 80, yb + line*12, p, mfg, bg);
+        p = u_to_dec((unsigned long)g_cursor_y, tmp, sizeof tmp);
+        draw_string_at(xb + 140, yb + line*12, ",", mfg, bg);
+        draw_string_at(xb + 152, yb + line*12, p, mfg, bg);
+        line++;
+
+        p = u_to_dec(rp1usb_mouse_reports(), tmp, sizeof tmp);
+        draw_string_at(xb, yb + line*12, "mouse rpt:", mfg, bg);
+        draw_string_at(xb + 96, yb + line*12, rp1usb_mouse_on() ? p : "off", mfg, bg);
+        line++;
+        p = u_to_dec(rp1usb_kbd_reports(), tmp, sizeof tmp);
+        draw_string_at(xb, yb + line*12, "kbd rpt:", mfg, bg);
+        draw_string_at(xb + 96, yb + line*12, rp1usb_kbd_on() ? p : "off", mfg, bg);
+        line++;
+    }
+
     /* ---- Network (LIVE) ----
      * Repainted every frame, so running `nc 192.168.3.101 23` from the
      * Mac makes the counters move here even though there is no USB
@@ -1340,6 +1367,11 @@ void kernel_main(void)
          * virtual desktop) so it stays in view as the viewport
          * pans.  USPi (later) will drive it from mouse reports. */
         wm_cursor_set((int)sw / 2, (int)sh / 2, 1);
+
+        /* All boot logging is done — drop a fresh shell prompt so the shell
+         * window shows a clean, ready prompt at the bottom (the init-time
+         * prompt is buried under the boot log above). */
+        uart_puts("\nxinu-pi5$ ");
 
         wm_run();   /* never returns */
     }

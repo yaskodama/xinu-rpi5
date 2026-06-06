@@ -660,6 +660,9 @@ static int http_build(const char *req, char *out, int max)
           bl = s_put(body, bl, " lastdy="); bl = s_putdec(body, bl, rp1usb_last_dy());
           bl = s_put(body, bl, " evtidx="); bl = s_putdec(body, bl, rp1usb_evt_idx());
           bl = s_put(body, bl, " ep1idx="); bl = s_putdec(body, bl, rp1usb_ep1_idx_get()); }
+        { extern int rp1usb_kbd_on(void); extern unsigned long rp1usb_kbd_reports(void);
+          bl = s_put(body, bl, "\nkbd: active="); bl = s_putdec(body, bl, rp1usb_kbd_on());
+          bl = s_put(body, bl, " reports="); bl = s_putdec(body, bl, (int)rp1usb_kbd_reports()); }
         { extern unsigned int rp1usb_slot_state(void), rp1usb_boundep_state(void),
                               rp1usb_boundep_deqlo(void), rp1usb_mfindex(void);
           extern int rp1usb_bound_dci(void);

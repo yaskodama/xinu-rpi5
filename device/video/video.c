@@ -224,10 +224,19 @@ int video_enable_backbuffer(void)
 void video_present(void)
 {
     if (!fb_ready || fb_draw == fb_base) return;   /* nothing to flip */
-    volatile unsigned int *dst = (volatile unsigned int *)fb_base;
-    volatile unsigned int *src = (volatile unsigned int *)fb_draw;
-    unsigned int n = (fb_height * fb_pitch) / 4;
-    for (unsigned int i = 0; i < n; i++) dst[i] = src[i];
+    /* 64-bit, 8x-unrolled copy.  Memory is uncached on this port, so the
+     * full-frame flip dominates frame time; wider bursts + fewer loop
+     * iterations roughly halve it, which is what the mouse cursor needs to
+     * look smooth (the flip rate caps how often cursor motion reaches HDMI). */
+    volatile unsigned long *dst = (volatile unsigned long *)fb_base;
+    volatile unsigned long *src = (volatile unsigned long *)fb_draw;
+    unsigned int n = (fb_height * fb_pitch) / 8;
+    unsigned int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        dst[i+0]=src[i+0]; dst[i+1]=src[i+1]; dst[i+2]=src[i+2]; dst[i+3]=src[i+3];
+        dst[i+4]=src[i+4]; dst[i+5]=src[i+5]; dst[i+6]=src[i+6]; dst[i+7]=src[i+7];
+    }
+    for (; i < n; i++) dst[i] = src[i];
 }
 
 /* Viewport offset: subtracted from every virtual-coord input
