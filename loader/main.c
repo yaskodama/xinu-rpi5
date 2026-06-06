@@ -48,10 +48,45 @@ extern unsigned char dhcp_state(void);
 extern unsigned long dhcp_discover_count(void);
 extern unsigned long dhcp_offer_count(void);
 extern unsigned long dhcp_ack_count(void);
+extern void dhcp_get_ip(unsigned char out[4]);
 extern int  tcp_handle_packet(const unsigned char *frame, int len);
 extern void tcp_set_mac(const unsigned char mac[6]);
 extern void tcp_set_ip(const unsigned char ip[4]);
 extern void tcp_listen(unsigned short port);
+extern void net_responder_set_ip(const unsigned char ip[4]);
+extern void net_responder_get_ip(unsigned char out[4]);
+extern void net_responder_send_gratuitous_arp(void);
+extern unsigned long timer_ticks(void);
+
+/* DHCP state machine driver.  Called once per genet_rx_tick() (inside its
+ * reentrancy guard, so it never races the RX/TX path).  While unbound it
+ * re-sends DISCOVER every ~3 s (rate-limited; a DISCOVER burst once wedged
+ * the Pi 4 GENET TX ring) up to a cap, then gives up and keeps the static
+ * fallback IP.  On the BOUND edge it adopts the leased IP for ARP/ICMP +
+ * TCP and announces it with a gratuitous ARP. */
+static int g_dhcp_started, g_dhcp_applied, g_dhcp_tries;
+static unsigned long g_dhcp_last_tick;
+static void dhcp_drive(void)
+{
+    if (!g_dhcp_started) return;            /* not kicked off yet */
+    if (dhcp_is_bound()) {
+        if (!g_dhcp_applied) {
+            g_dhcp_applied = 1;
+            unsigned char ip[4];
+            dhcp_get_ip(ip);
+            net_responder_set_ip(ip);
+            tcp_set_ip(ip);
+            net_responder_send_gratuitous_arp();   /* announce the lease */
+        }
+        return;
+    }
+    if (g_dhcp_tries >= 10) return;         /* gave up — static IP stands */
+    unsigned long now = timer_ticks();      /* ~100 Hz */
+    if (g_dhcp_tries > 0 && now - g_dhcp_last_tick < 300) return;  /* ~3 s between retries */
+    g_dhcp_last_tick = now;
+    g_dhcp_tries++;
+    dhcp_send_discover();                    /* sent here (guarded), not at boot */
+}
 /* TCP listener live counters for the on-screen Network panel (the Pi
  * has no USB keyboard yet, so the shell `tcpstat` is unreachable). */
 extern unsigned long tcp_any_count(void);
@@ -151,6 +186,7 @@ static void genet_rx_tick(void)
         genet_rx_release();
     }
 
+    dhcp_drive();          /* run the DHCP state machine (rate-limited inside) */
     g_rx_busy = 0;
 }
 
@@ -385,6 +421,30 @@ static void win_status(window_t *self, unsigned int frame)
             kv_append(l, &n, "Etx", rp1eth_tx_count());
             kv_append(l, &n, "rsr", (unsigned long)rp1eth_rsr());
             draw_string_at(xb, yb + line*12, l, 0xFFFFD060U, bg); line++;
+
+            /* Current effective IP (DHCP lease once BOUND, else static .101)
+             * + DHCP progress, so the user can see which address to reach. */
+            {
+                unsigned char ip[4];
+                net_responder_get_ip(ip);
+                n = 0;
+                l[n++] = 'I'; l[n++] = 'P'; l[n++] = ' ';
+                for (int oct = 0; oct < 4; oct++) {
+                    unsigned int v = ip[oct];
+                    if (v >= 100) l[n++] = (char)('0' + v / 100);
+                    if (v >= 10)  l[n++] = (char)('0' + (v / 10) % 10);
+                    l[n++] = (char)('0' + v % 10);
+                    l[n++] = (oct < 3) ? '.' : ' ';
+                }
+                l[n] = 0;
+                static const char *st[] = { "init", "disc", "req", "BOUND" };
+                unsigned s = dhcp_state();
+                { const char *lbl = " dhcp="; while (*lbl) l[n++] = *lbl++; }
+                { const char *p = (s < 4) ? st[s] : "?"; while (*p) l[n++] = *p++; l[n++] = ' '; l[n] = 0; }
+                kv_append(l, &n, "of", dhcp_offer_count());
+                kv_append(l, &n, "ak", dhcp_ack_count());
+                draw_string_at(xb, yb + line*12, l, 0xFF80FF80U, bg); line++;
+            }
 
             /* last RX frame's first 14 bytes = dst MAC / src MAC / ethertype */
             extern unsigned int rp1eth_rxlast(int);
@@ -896,8 +956,14 @@ void kernel_main(void)
         extern void net_responder_set_mac(const unsigned char mac[6]);
         unsigned char mymac[6] = { 0x02, 0xca, 0xfe, 0xb0, 0x05, 0x01 };  /* Pi 5 GEM */
         net_responder_set_mac(mymac);
+        /* Arm DHCP: dhcp_drive() (in genet_rx_tick, inside the RX/TX guard)
+         * sends the first DISCOVER on its next tick and retries + adopts the
+         * lease.  Until it binds, the static .101 fallback answers, so the box
+         * is reachable either way.  We don't TX here (unguarded) on purpose. */
+        dhcp_set_mac(mymac);
+        g_dhcp_started = 1;
     }
-    uart_puts("net: ARP+ICMP responder armed; static IP 192.168.3.101\n");
+    uart_puts("net: ARP+ICMP responder armed; DHCP started (static .101 fallback)\n");
     /* Re-read link status here so it shows up at the *end* of the
      * boot log (after the shell-window ring has scrolled past the
      * original PHY-init lines). */

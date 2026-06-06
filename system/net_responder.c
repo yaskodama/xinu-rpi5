@@ -48,6 +48,18 @@ void net_responder_set_mac(const unsigned char mac[6])
     for (int i = 0; i < 6; i++) g_my_mac[i] = mac[i];
 }
 
+/* Override the static IP — called once DHCP binds so ARP/ICMP answer on the
+ * leased address instead of the compiled-in fallback. */
+void net_responder_set_ip(const unsigned char ip[4])
+{
+    for (int i = 0; i < 4; i++) g_my_ip[i] = ip[i];
+}
+
+void net_responder_get_ip(unsigned char out[4])
+{
+    for (int i = 0; i < 4; i++) out[i] = g_my_ip[i];
+}
+
 /* Send a gratuitous ARP (request with src IP == target IP) so any
  * peer on the broadcast domain can update its ARP cache.  Useful
  * when the router's WiFi-LAN bridge forwards broadcast in one
