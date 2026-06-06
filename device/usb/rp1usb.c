@@ -306,7 +306,7 @@ unsigned int rp1usb_enum_cc(void)    { return g_enum_cc; }
 unsigned int rp1usb_enum_slotid(void){ return g_enum_slotid; }
 
 /* ---------- Phase 3c: Address Device ---------- */
-static unsigned char g_input_ctx[3*64] __attribute__((aligned(64)));  /* ctrl+slot+ep0 */
+static unsigned char g_input_ctx[33*64] __attribute__((aligned(64)));  /* ctrl+slot+up to 31 EPs */
 static unsigned char g_dev_ctx[33*64]  __attribute__((aligned(64)));  /* output context */
 static struct trb    g_ep0_ring[16]    __attribute__((aligned(64)));
 static int           g_ep0_idx, g_ep0_cycle = 1;
@@ -401,12 +401,37 @@ unsigned int rp1usb_desc_cc(void)    { return g_desc_cc; }
 unsigned int rp1usb_desc_len(void)   { return g_desc_len; }
 unsigned int rp1usb_desc_byte(int i) { return (i>=0&&i<256)?g_xfer_buf[i]:0; }
 
+/* HID class GET_REPORT(Input) on EP0 -> latest mouse report into g_mouse_buf.
+ * Bypasses the (currently silent) interrupt endpoint entirely; control transfers
+ * are proven working, so this reliably reads the device's current report. */
+static unsigned int g_grep_cc, g_grep_len;
+int rp1usb_get_report(int slot, int len)
+{
+    extern unsigned char *rp1usb_mouse_buf_ptr(void);
+    unsigned char *mb = rp1usb_mouse_buf_ptr();
+    if (len > 8) len = 8;
+    for (int i=0;i<len;i++) mb[i]=0;
+    /* Setup: bmReqType=0xA1, bReq=0x01(GET_REPORT), wValue=0x0100(Input,id0), wIndex=0 */
+    ep0_push(0xA1u | (0x01u<<8) | (0x0100u<<16), ((unsigned)len<<16), 8, (2u<<10)|(1u<<6)|(3u<<16));
+    unsigned long ba = XDA(mb);
+    ep0_push((unsigned)(ba&0xffffffff), (unsigned)(ba>>32), (unsigned)len, (3u<<10)|(1u<<16));
+    ep0_push(0,0,0, (4u<<10)|(1u<<5));
+    R32(g_db, slot*4) = 1;
+    __asm__ volatile ("dsb sy":::"memory");
+    struct trb ev = event_wait(32);
+    g_grep_cc  = (ev.status>>24)&0xff;
+    g_grep_len = (unsigned)len - (ev.status & 0xffffff);
+    return (g_grep_cc==1||g_grep_cc==13)?(int)g_grep_len:-(int)g_grep_cc;
+}
+unsigned int rp1usb_grep_cc(void)  { return g_grep_cc; }
+unsigned int rp1usb_grep_len(void) { return g_grep_len; }
+
 /* ---------- Phase 3e: SET_CONFIGURATION + Configure Endpoint + HID poll ---------- */
 static struct trb     g_ep1_ring[16] __attribute__((aligned(64)));
 static int            g_ep1_idx, g_ep1_cycle = 1;
 static unsigned char  g_mouse_buf[8] __attribute__((aligned(64)));
 static unsigned int   g_setcfg_cc, g_cfgep_cc, g_setproto_cc;
-static int            g_mouse_slot, g_mouse_active;   /* defined below; fwd for hid_setup */
+static int            g_mouse_slot, g_mouse_active, g_mouse_dci = 3;  /* defined below; fwd for hid_setup */
 static unsigned long  g_mouse_reports;
 static int            g_last_btn, g_last_dx, g_last_dy;
 static void           ep1_queue_trb(void);
@@ -465,7 +490,7 @@ int rp1usb_hid_setup(int slot, int port, int speed, int mps)
     /* Arm the continuous pump: queue a couple of interrupt-IN transfers and let
      * rp1usb_mouse_pump() (in genet_rx_tick) deliver reports to the cursor. */
     if (g_cfgep_cc == 1) {
-        g_mouse_slot = slot;
+        g_mouse_slot = slot; g_mouse_dci = 3;
         ep1_queue_trb(); ep1_queue_trb();
         R32(g_db, slot*4) = 3;
         __asm__ volatile ("dsb sy":::"memory");
@@ -473,6 +498,92 @@ int rp1usb_hid_setup(int slot, int port, int speed, int mps)
     }
     return (g_cfgep_cc==1)?0:-1;
 }
+
+/* ---------- Pi3-style auto-bind: walk the config descriptor, find the real
+ * mouse interrupt-IN endpoint, configure IT (not a hardcoded EP), start pump.
+ * Mirrors xinu-raz usbMouseBindDevice: pick the HID interface whose interrupt-IN
+ * endpoint is most mouse-like (boot mouse proto 2 > generic report proto 0 >
+ * keyboard proto 1) and use the descriptor's real epaddr / wMaxPacketSize /
+ * bInterval / interface number. ---------- */
+static int g_auto_epaddr, g_auto_mps, g_auto_interval, g_auto_iface, g_auto_dci, g_auto_found, g_auto_proto;
+int rp1usb_hid_autosetup(int slot, int port, int speed)
+{
+    int got = rp1usb_get_descriptor(slot, 2, 0, 9);            /* config header first */
+    if (got < 4) return -1;
+    int wtot = g_xfer_buf[2] | (g_xfer_buf[3]<<8);
+    if (wtot > (int)sizeof g_xfer_buf) wtot = sizeof g_xfer_buf;
+    if (rp1usb_get_descriptor(slot, 2, 0, wtot) < wtot) { /* keep going with what we have */ }
+
+    int pos=0, cur_class=-1, cur_proto=-1, cur_iface=-1, best=-1;
+    g_auto_found=0;
+    while (pos+2 <= wtot) {
+        int blen=g_xfer_buf[pos], btype=g_xfer_buf[pos+1];
+        if (blen<2) break;
+        if (btype==4) {                                        /* interface */
+            cur_iface=g_xfer_buf[pos+2]; cur_class=g_xfer_buf[pos+5]; cur_proto=g_xfer_buf[pos+7];
+        } else if (btype==5 && cur_class==3) {                 /* endpoint of a HID interface */
+            int epaddr=g_xfer_buf[pos+2], attr=g_xfer_buf[pos+3];
+            int mps=g_xfer_buf[pos+4]|(g_xfer_buf[pos+5]<<8), interval=g_xfer_buf[pos+6];
+            if ((attr&3)==3 && (epaddr&0x80)) {                /* interrupt IN */
+                int score=(cur_proto==2)?3:(cur_proto==0)?2:1; /* mouse > generic > keyboard */
+                if (score>best) {
+                    best=score;
+                    g_auto_epaddr=epaddr; g_auto_mps=mps; g_auto_interval=interval;
+                    g_auto_iface=cur_iface; g_auto_proto=cur_proto;
+                    g_auto_dci=(epaddr&0xf)*2+1; g_auto_found=1;
+                }
+            }
+        }
+        pos+=blen;
+    }
+    if (!g_auto_found) return -2;
+
+    g_setcfg_cc=(control_nodata(slot,0x00,9,1,0)==0)?1:0;      /* SET_CONFIGURATION(1) */
+
+    int dci=g_auto_dci, in_idx=dci+1, mps=g_auto_mps;
+    for (int i=0;i<16;i++){ g_ep1_ring[i].p0=0;g_ep1_ring[i].p1=0;g_ep1_ring[i].status=0;g_ep1_ring[i].control=0; }
+    g_ep1_ring[15].p0=(unsigned)(XDA(g_ep1_ring)&0xffffffff);
+    g_ep1_ring[15].p1=(unsigned)(XDA(g_ep1_ring)>>32);
+    g_ep1_ring[15].control=(6u<<10)|(1u<<1)|1u;
+    g_ep1_idx=0; g_ep1_cycle=1;
+
+    for (unsigned i=0;i<sizeof g_input_ctx;i++) g_input_ctx[i]=0;
+    unsigned int *icc=ctx_at(g_input_ctx,0); icc[1]=(1u<<0)|(1u<<dci);   /* add slot + this EP */
+    unsigned int *sc=ctx_at(g_input_ctx,1);
+    sc[0]=((unsigned)dci<<27)|((unsigned)speed<<20);          /* context entries = dci */
+    sc[1]=((unsigned)port&0xff)<<16;
+    unsigned int *ep=ctx_at(g_input_ctx,in_idx);
+    unsigned iv=3; { int b=g_auto_interval; while (b>1 && iv<10){ b>>=1; iv++; } }  /* ~log2(bInterval)+3 */
+    ep[0]=(iv<<16);
+    ep[1]=(7u<<3)|(3u<<1)|((unsigned)mps<<16);                 /* Interrupt-IN, CErr=3, MPS */
+    unsigned long trd=XDA(g_ep1_ring)|1u;
+    ep[2]=(unsigned)(trd&0xffffffff); ep[3]=(unsigned)(trd>>32);
+    ep[4]=((unsigned)mps<<16)|((unsigned)mps);                 /* Max ESIT Payload + Avg TRB Len */
+    g_dcbaa[slot]=XDA(g_dev_ctx);
+    __asm__ volatile("dsb sy":::"memory");
+    unsigned long ic=XDA(g_input_ctx);
+    cmd_submit((unsigned)(ic&0xffffffff),(unsigned)(ic>>32),0,(12u<<10)|((unsigned)slot<<24)); /* Configure Endpoint */
+    struct trb ev=event_wait(33);
+    g_cfgep_cc=(ev.status>>24)&0xff;
+
+    (void)control_nodata(slot,0x21,0x0A,0,g_auto_iface);        /* SET_IDLE(0) on mouse iface */
+    g_setproto_cc=(control_nodata(slot,0x21,0x0B,0,g_auto_iface)==0)?1:0;  /* SET_PROTOCOL boot */
+
+    if (g_cfgep_cc==1){
+        g_mouse_slot=slot; g_mouse_dci=dci;
+        ep1_queue_trb(); ep1_queue_trb();
+        R32(g_db,slot*4)=(unsigned)dci;
+        __asm__ volatile("dsb sy":::"memory");
+        g_mouse_active=1;
+    }
+    return (g_cfgep_cc==1)?0:-1;
+}
+int rp1usb_auto_epaddr(void){ return g_auto_epaddr; }
+int rp1usb_auto_mps(void)   { return g_auto_mps; }
+int rp1usb_auto_iface(void) { return g_auto_iface; }
+int rp1usb_auto_dci(void)   { return g_auto_dci; }
+int rp1usb_auto_proto(void) { return g_auto_proto; }
+int rp1usb_auto_interval(void){ return g_auto_interval; }
 
 /* Queue one interrupt-IN transfer and wait for the boot-mouse report.  Blocks
  * (deadline-bounded) until the mouse sends data, so move the mouse to get one.
@@ -501,6 +612,7 @@ unsigned int rp1usb_setcfg_cc(void) { return g_setcfg_cc; }
 unsigned int rp1usb_cfgep_cc(void)  { return g_cfgep_cc; }
 unsigned int rp1usb_setproto_cc(void){ return g_setproto_cc; }
 unsigned int rp1usb_mouse_byte(int i){ return (i>=0&&i<8)?g_mouse_buf[i]:0; }
+unsigned char *rp1usb_mouse_buf_ptr(void){ return g_mouse_buf; }
 
 /* ---------- continuous (non-blocking) mouse pump -> xhci_mouse_event ---------- */
 
@@ -521,9 +633,26 @@ extern void xhci_mouse_event(unsigned nButtons, int dx, int dy);
 /* Called every genet_rx_tick (100 Hz).  Non-blocking: drains any pending xHCI
  * events; for each EP1 transfer event, hands the boot-mouse report to
  * xhci_mouse_event (moves the HDMI cursor) and re-arms a transfer. */
+static int g_poll_mode;     /* 1 = poll mouse via EP0 GET_REPORT instead of EP1 IRQ */
+void rp1usb_set_poll_mode(int on){ g_poll_mode = on?1:0; }
+int  rp1usb_poll_mode_get(void) { return g_poll_mode; }
+
 void rp1usb_mouse_pump(void)
 {
     if (!g_mouse_active) return;
+    if (g_poll_mode) {                         /* control-pipe polling path */
+        extern int rp1usb_get_report(int,int);
+        int n = rp1usb_get_report(g_mouse_slot, 4);
+        if (n >= 3) {
+            unsigned btn = g_mouse_buf[0];
+            int dx = (int)(signed char)g_mouse_buf[1];
+            int dy = (int)(signed char)g_mouse_buf[2];
+            g_mouse_reports++;
+            g_last_btn=btn; g_last_dx=dx; g_last_dy=dy;
+            if (dx || dy || btn) xhci_mouse_event(btn, dx, dy);
+        }
+        return;
+    }
     for (int guard=0; guard<32; guard++) {
         struct trb *e=&g_evt_ring[g_evt_idx];
         __asm__ volatile ("dsb sy":::"memory");
@@ -542,7 +671,7 @@ void rp1usb_mouse_pump(void)
             g_last_btn=btn; g_last_dx=dx; g_last_dy=dy;
             if (dx || dy || btn) xhci_mouse_event(btn, dx, dy);
             ep1_queue_trb();
-            R32(g_db, g_mouse_slot*4) = 3;          /* re-ring EP1 doorbell */
+            R32(g_db, g_mouse_slot*4) = (unsigned)g_mouse_dci;   /* re-ring EP doorbell */
             __asm__ volatile ("dsb sy":::"memory");
         }
     }

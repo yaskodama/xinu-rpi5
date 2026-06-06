@@ -555,7 +555,7 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, " len=");    bl = s_putdec(body, bl, rp1usb_desc_len());
             bl = s_put(body, bl, " bytes:");
             int dl = (int)rp1usb_desc_len();
-            for (int i=0;i<dl && i<48 && bl<600;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_desc_byte(i)); }
+            for (int i=0;i<dl && i<64 && bl<700;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_desc_byte(i)); }
             bl = s_put(body, bl, "\n");
         } else if (str_starts(rpath, "/usb/hidsetup")) {
             extern int rp1usb_hid_setup(int,int,int,int);
@@ -575,6 +575,38 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "mouse report len="); bl = s_putdec(body, bl, n);
             bl = s_put(body, bl, " bytes:");
             for (int i=0;i<4;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_mouse_byte(i)); }
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/getreport")) {
+            extern int rp1usb_get_report(int,int);
+            extern unsigned int rp1usb_mouse_byte(int), rp1usb_grep_cc(void);
+            int slot=q_int(req,"slot",1), len=q_int(req,"len",4);
+            int n = rp1usb_get_report(slot, len);
+            bl = s_put(body, bl, "getreport cc="); bl = s_putdec(body, bl, rp1usb_grep_cc());
+            bl = s_put(body, bl, " len="); bl = s_putdec(body, bl, n);
+            bl = s_put(body, bl, " bytes:");
+            for (int i=0;i<4;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_mouse_byte(i)); }
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/automouse")) {
+            extern int rp1usb_hid_autosetup(int,int,int);
+            extern int rp1usb_auto_epaddr(void), rp1usb_auto_mps(void), rp1usb_auto_iface(void),
+                       rp1usb_auto_dci(void), rp1usb_auto_proto(void), rp1usb_auto_interval(void);
+            extern unsigned int rp1usb_cfgep_cc(void), rp1usb_setproto_cc(void);
+            int slot=q_int(req,"slot",1), port=q_int(req,"port",1), speed=q_int(req,"speed",1);
+            int r = rp1usb_hid_autosetup(slot, port, speed);
+            bl = s_put(body, bl, "automouse r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " epaddr="); bl = s_putdec(body, bl, rp1usb_auto_epaddr());
+            bl = s_put(body, bl, " dci="); bl = s_putdec(body, bl, rp1usb_auto_dci());
+            bl = s_put(body, bl, " mps="); bl = s_putdec(body, bl, rp1usb_auto_mps());
+            bl = s_put(body, bl, " interval="); bl = s_putdec(body, bl, rp1usb_auto_interval());
+            bl = s_put(body, bl, " iface="); bl = s_putdec(body, bl, rp1usb_auto_iface());
+            bl = s_put(body, bl, " proto="); bl = s_putdec(body, bl, rp1usb_auto_proto());
+            bl = s_put(body, bl, " cfgepCC="); bl = s_putdec(body, bl, rp1usb_cfgep_cc());
+            bl = s_put(body, bl, " setprotoCC="); bl = s_putdec(body, bl, rp1usb_setproto_cc());
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/pollmode")) {
+            extern void rp1usb_set_poll_mode(int); extern int rp1usb_poll_mode_get(void);
+            rp1usb_set_poll_mode(q_int(req,"on",1));
+            bl = s_put(body, bl, "poll_mode="); bl = s_putdec(body, bl, rp1usb_poll_mode_get());
             bl = s_put(body, bl, "\n");
         } else {
         bl = s_put(body, bl, "hciver=");   bl = s_putdec(body, bl, rp1usb_ver(0));
