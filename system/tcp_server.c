@@ -607,6 +607,12 @@ static int http_build(const char *req, char *out, int max)
           bl = s_put(body, bl, " lastdy="); bl = s_putdec(body, bl, rp1usb_last_dy());
           bl = s_put(body, bl, " evtidx="); bl = s_putdec(body, bl, rp1usb_evt_idx());
           bl = s_put(body, bl, " ep1idx="); bl = s_putdec(body, bl, rp1usb_ep1_idx_get()); }
+        { extern unsigned int rp1usb_slot_state(void), rp1usb_ep1_state(void),
+                              rp1usb_ep1_deq_lo(void), rp1usb_ep1_ctx0(void);
+          bl = s_put(body, bl, "\nepctx: slotstate="); bl = s_putdec(body, bl, rp1usb_slot_state());
+          bl = s_put(body, bl, " ep1state="); bl = s_putdec(body, bl, rp1usb_ep1_state());
+          bl = s_put(body, bl, " ep1deqlo="); bl = s_putdec(body, bl, rp1usb_ep1_deq_lo());
+          bl = s_put(body, bl, " ep1ctx0="); bl = s_putdec(body, bl, rp1usb_ep1_ctx0()); }
         bl = s_put(body, bl, "\n");
         }
     } else if (str_starts(rpath, "/api/actors-gc")) {

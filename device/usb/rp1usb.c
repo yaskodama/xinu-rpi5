@@ -555,6 +555,11 @@ int           rp1usb_last_dy(void)      { return g_last_dy; }
 /* live snapshot of the ring cursors so we can see whether events arrive */
 int           rp1usb_evt_idx(void)      { return g_evt_idx; }
 int           rp1usb_ep1_idx_get(void)  { return g_ep1_idx; }
+/* OUTPUT device-context introspection: did the controller actually run EP1? */
+unsigned int  rp1usb_slot_state(void)   { return (ctx_at(g_dev_ctx,0)[3]>>27)&0x1f; }
+unsigned int  rp1usb_ep1_state(void)    { return ctx_at(g_dev_ctx,3)[0]&0x7; }
+unsigned int  rp1usb_ep1_deq_lo(void)   { return ctx_at(g_dev_ctx,3)[2]; }     /* TR dequeue ptr lo */
+unsigned int  rp1usb_ep1_ctx0(void)     { return ctx_at(g_dev_ctx,3)[0]; }
 
 /* Read-only register offsets (for diagnosing the xHCI init alignment fault). */
 unsigned int rp1usb_rtsoff(void){ return R32(RP1_USB0, CAP_RTSOFF); }
