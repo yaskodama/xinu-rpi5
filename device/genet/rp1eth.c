@@ -309,6 +309,14 @@ int rp1eth_probe(void)
         for (int i = 14; i < 64; i++) tf[i] = (unsigned char)i;
         int tx = rp1eth_tx_frame(tf, 64);
         uart_puts(tx == 0 ? "rp1eth: TX test frame sent\n" : "rp1eth: TX timeout\n");
+        /* diagnose where the DMA stalls */
+        uart_puts("rp1eth: TSR=0x");    put_hex32(E(0x014));
+        uart_puts(" RSR=0x");           put_hex32(E(0x020));
+        uart_puts(" NCR=0x");           put_hex32(E(GEM_NCR));
+        uart_puts(" DMACFG=0x");        put_hex32(E(GEM_DMACFG)); uart_puts("\n");
+        uart_puts("rp1eth: txdesc[0] addr=0x"); put_hex32(g_txr[0].addr);
+        uart_puts(" ctrl=0x");          put_hex32(g_txr[0].ctrl);
+        uart_puts("  TBQP=0x");         put_hex32(E(GEM_TBQP)); uart_puts("\n");
 
         /* briefly poll for any RX */
         int got = 0; unsigned char *p;
