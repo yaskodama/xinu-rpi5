@@ -327,11 +327,38 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "}");
         }
         bl = s_put(body, bl, "]}\n");
+    } else if ((req[0]=='P'&&req[1]=='O'&&req[2]=='S'&&req[3]=='T'&&
+                req[5]=='/'&&req[6]=='c'&&req[7]=='c') ||
+               (req[0]=='G'&&req[1]=='E'&&req[2]=='T'&&
+                req[4]=='/'&&req[5]=='c'&&req[6]=='c')) {
+        /* C JIT: POST /cc with C source as the body -> compile to AArch64,
+         * run main() in place, return its output + return value. */
+        extern int cc_run_source(const char *src, int srclen,
+                                 char *out, int outcap, long *retval);
+        ctype = "text/plain";
+        /* Body starts after the blank line (CRLFCRLF). */
+        const char *bodyp = 0; int reqn = 0;
+        while (req[reqn]) reqn++;
+        for (int i = 0; i + 3 < reqn; i++)
+            if (req[i]=='\r'&&req[i+1]=='\n'&&req[i+2]=='\r'&&req[i+3]=='\n') { bodyp = req + i + 4; break; }
+        if (!bodyp || !*bodyp) {
+            bl = s_put(body, bl, "usage: curl --data-binary @prog.c http://<ip>/cc\n"
+                                 "C subset: int/char/ptr/array, +-*/%, if/while/for, "
+                                 "functions, recursion; builtins print/putchar/puts/actor_send.\n");
+        } else {
+            int srclen = 0; while (bodyp[srclen]) srclen++;
+            static char ccout[512];
+            long rv = 0;
+            int rc = cc_run_source(bodyp, srclen, ccout, (int)sizeof ccout, &rv);
+            bl = s_put(body, bl, ccout);
+            if (rc == 0) { bl = s_put(body, bl, "=> "); bl = s_putdec(body, bl, rv); bl = s_put(body, bl, "\n"); }
+        }
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";
         bl = s_put(body, bl, "xinu-rpi5 (Pi 5) actor HTTP gateway\n"
                              "GET /api/actors\n"
-                             "GET /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n");
+                             "GET /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n"
+                             "POST /cc  (C source in body) -> JIT compile & run\n");
     } else {
         ctype = "text/plain";
         bl = s_put(body, bl, "404 not found\n");
@@ -458,7 +485,7 @@ int tcp_handle_packet(const unsigned char *frame, int len)
              * out of the (volatile) rx buffer, route it through the
              * actor layer, send the response, then close.  A simple GET
              * fits in one segment, which is all we handle here. */
-            static char http_req[600];
+            static char http_req[1400];   /* room for a POST /cc body (1 MSS) */
             static char http_resp[1400];
             int n = data_len < (int)sizeof(http_req) - 1
                   ? data_len : (int)sizeof(http_req) - 1;
