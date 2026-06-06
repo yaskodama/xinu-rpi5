@@ -263,10 +263,18 @@ void fill_rect(int x, int y, int w, int h, unsigned int color)
     if (sy + h > (int)fb_height) h = (int)fb_height - sy;
     if (w <= 0 || h <= 0) return;
 
+    /* 64-bit pair writes (two pixels at a time) — halves the store count for
+     * big fills like the per-frame desktop wipe (memory is uncached here). */
+    unsigned long pair = ((unsigned long)color << 32) | color;
     for (int dy = 0; dy < h; dy++) {
         unsigned int *row =
             (unsigned int *)(fb_draw + (sy + dy) * fb_pitch + sx * 4);
-        for (int dx = 0; dx < w; dx++) row[dx] = color;
+        int dx = 0;
+        if (((unsigned long)row & 7) && dx < w) { row[dx] = color; dx++; }  /* align to 8 */
+        unsigned long *p = (unsigned long *)(row + dx);
+        int pairs = (w - dx) >> 1;
+        for (int i = 0; i < pairs; i++) p[i] = pair;
+        for (dx += pairs * 2; dx < w; dx++) row[dx] = color;
     }
 }
 

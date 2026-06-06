@@ -142,21 +142,58 @@ struct trb { unsigned int p0, p1, status, control; };
 #define EVT_RING_N   64
 #define NSCRATCH_MAX 64
 
+/* Per-controller ring memory + saved register/cursor state.  We run BOTH RP1
+ * DWC3/xHCI controllers at once (mouse on one, keyboard on the other), so each
+ * needs its own DCBAA / command ring / event ring / scratchpad — they can't
+ * share.  xhci_switch() points the loose working-set globals at one controller's
+ * memory and restores its cursors; binding and the pump operate on whichever is
+ * current. */
+struct ctrlmem {
+    unsigned long long dcbaa[256]                 __attribute__((aligned(64)));
+    struct trb         cmd_ring[CMD_RING_N]       __attribute__((aligned(64)));
+    struct trb         evt_ring[EVT_RING_N]       __attribute__((aligned(64)));
+    unsigned long long erst[4]                    __attribute__((aligned(64)));
+    unsigned long long scratch_arr[NSCRATCH_MAX]  __attribute__((aligned(64)));
+    unsigned char      scratch_buf[NSCRATCH_MAX][4096] __attribute__((aligned(4096)));
+    unsigned long base, oper, rt, db;
+    int   ctx_stride, cmd_idx, cmd_cycle, evt_idx, evt_cycle, inited;
+} __attribute__((aligned(4096)));
+static struct ctrlmem g_cm[2];
+static int            g_active_ctrl = 0;
+
 static unsigned long  g_xhci_base;
 static unsigned long  g_sel_base = RP1_USB0;   /* which DWC3/xHCI controller to init */
 static unsigned long  g_oper, g_rt, g_db;
-void rp1usb_select_ctrl(int which){ g_sel_base = (which==1)?RP1_USB1:RP1_USB0; }
-static unsigned long long g_dcbaa[256]      __attribute__((aligned(64)));
-static struct trb     g_cmd_ring[CMD_RING_N] __attribute__((aligned(64)));
-static struct trb     g_evt_ring[EVT_RING_N] __attribute__((aligned(64)));
-static unsigned long long g_erst[4]         __attribute__((aligned(64)));
-static unsigned long long g_scratch_arr[NSCRATCH_MAX] __attribute__((aligned(64)));
-static unsigned char  g_scratch_buf[NSCRATCH_MAX][4096] __attribute__((aligned(4096)));
+/* loose working-set buffer pointers -> the active controller's ctrlmem */
+static unsigned long long *g_dcbaa       = g_cm[0].dcbaa;
+static struct trb         *g_cmd_ring    = g_cm[0].cmd_ring;
+static struct trb         *g_evt_ring    = g_cm[0].evt_ring;
+static unsigned long long *g_erst        = g_cm[0].erst;
+static unsigned long long *g_scratch_arr = g_cm[0].scratch_arr;
+static unsigned char     (*g_scratch_buf)[4096] = g_cm[0].scratch_buf;
 static int            g_cmd_idx, g_cmd_cycle = 1;
 static int            g_evt_idx, g_evt_cycle = 1;
 static unsigned int   g_xhci_usbsts_after;
 static int            g_xhci_running;
 static int            g_ctx_stride = 32;   /* 64 if HCCPARAMS1.CSZ=1 */
+
+/* Make controller `i` current: save the active controller's cursors, then load
+ * controller i's registers/cursors and point the buffer globals at its memory. */
+static void xhci_switch(int i)
+{
+    if (i == g_active_ctrl &&
+        g_evt_ring == g_cm[i].evt_ring) return;     /* already current */
+    struct ctrlmem *a = &g_cm[g_active_ctrl];
+    a->oper=g_oper; a->rt=g_rt; a->db=g_db; a->base=g_xhci_base; a->ctx_stride=g_ctx_stride;
+    a->cmd_idx=g_cmd_idx; a->cmd_cycle=g_cmd_cycle; a->evt_idx=g_evt_idx; a->evt_cycle=g_evt_cycle;
+    struct ctrlmem *n = &g_cm[i];
+    g_active_ctrl=i;
+    g_oper=n->oper; g_rt=n->rt; g_db=n->db; g_xhci_base=n->base; g_ctx_stride=n->ctx_stride;
+    g_cmd_idx=n->cmd_idx; g_cmd_cycle=n->cmd_cycle; g_evt_idx=n->evt_idx; g_evt_cycle=n->evt_cycle;
+    g_dcbaa=n->dcbaa; g_cmd_ring=n->cmd_ring; g_evt_ring=n->evt_ring; g_erst=n->erst;
+    g_scratch_arr=n->scratch_arr; g_scratch_buf=n->scratch_buf;
+}
+void rp1usb_select_ctrl(int which){ which=(which==1)?1:0; xhci_switch(which); g_sel_base=which?RP1_USB1:RP1_USB0; }
 
 static void xdelay(unsigned long us)
 {
@@ -234,6 +271,13 @@ int rp1usb_xhci_init(void)
 
     g_xhci_usbsts_after = R32(g_oper, OP_USBSTS);
     g_xhci_running = !(g_xhci_usbsts_after & USBSTS_HCH);
+
+    /* Persist this controller's registers/cursors so xhci_switch() can restore
+     * them when we hop back here to drain its event ring. */
+    { struct ctrlmem *c=&g_cm[g_active_ctrl];
+      c->base=g_xhci_base; c->oper=g_oper; c->rt=g_rt; c->db=g_db; c->ctx_stride=g_ctx_stride;
+      c->cmd_idx=g_cmd_idx; c->cmd_cycle=g_cmd_cycle; c->evt_idx=g_evt_idx; c->evt_cycle=g_evt_cycle;
+      c->inited = g_xhci_running ? 1 : 0; }
 
     uart_puts("rp1usb: xHCI init; USBSTS=0x");
     { static const char hx[]="0123456789abcdef"; char b[9]; for(int i=0;i<8;i++)b[i]=hx[(g_xhci_usbsts_after>>((7-i)*4))&0xF]; b[8]=0; uart_puts(b);}
@@ -335,6 +379,7 @@ static unsigned char g_kbd_buf[8]      __attribute__((aligned(64)));
 static unsigned char g_kbd_prev[8];
 static int           g_kbd_slot, g_kbd_dci, g_kbd_active;
 static unsigned long g_kbd_reports;
+static int           g_mouse_ctrl, g_kbd_ctrl;   /* which controller each is bound on */
 static unsigned int  g_addr_cc;
 static int           g_dev_slot, g_dev_speed;
 
@@ -613,8 +658,8 @@ int rp1usb_hid_autosetup_if(int slot, int port, int speed, int want_iface)
         hid_arm(ring,pidx,pcyc,buf); hid_arm(ring,pidx,pcyc,buf);
         R32(g_db,slot*4)=(unsigned)dci;
         __asm__ volatile("dsb sy":::"memory");
-        if (is_kbd){ g_kbd_slot=slot; g_kbd_dci=dci; g_kbd_active=1; }
-        else       { g_mouse_slot=slot; g_mouse_dci=dci; g_mouse_active=1; }
+        if (is_kbd){ g_kbd_slot=slot; g_kbd_dci=dci; g_kbd_ctrl=g_active_ctrl; g_kbd_active=1; }
+        else       { g_mouse_slot=slot; g_mouse_dci=dci; g_mouse_ctrl=g_active_ctrl; g_mouse_active=1; }
     }
     return (g_cfgep_cc==1)?0:-1;
 }
@@ -642,28 +687,38 @@ int rp1usb_mouse_fullsetup(int port)
 int rp1usb_full_slot(void) { return g_full_slot; }
 int rp1usb_full_speed(void){ return g_full_speed; }
 
-/* One-shot boot auto-bind: bring up usb1 (where the mouse lives) and scan its
- * ports for a HID mouse, binding the first one found.  Called once from
- * genet_rx_tick a few seconds into boot (after networking settles).  Returns the
- * usb1 port the mouse bound on, or <0 if none. */
-int rp1usb_autostart(void)
+/* One-shot boot auto-bind: bring up BOTH RP1 controllers and scan every port for
+ * HID devices, binding the mouse and keyboard wherever they are (they can be on
+ * different controllers).  Called once from genet_rx_tick a few seconds into boot.
+ * Returns the number of HID devices bound. */
+static unsigned char *g_bind_ctxs[2];   /* output ctx per bound device */
+static int            g_nbound;
+static void autostart_scan_current_ctrl(void)
 {
-    rp1usb_select_ctrl(1);
-    if (rp1usb_xhci_init() != 0) return -1;
     extern int rp1usb_address_device(int,int,int,int);
-    unsigned char *ctxs[2] = { g_dev_ctx, g_kdevctx };   /* one output ctx per bound device */
-    int nbound = 0;
-    for (int p = 1; p <= 3 && nbound < 2; p++) {
+    for (int p = 1; p <= 3 && g_nbound < 2; p++) {
         int slot = rp1usb_enum_slot(p);
         if (slot < 0) continue;
         int speed = (int)((g_enum_portsc >> 10) & 0xf);
-        g_addr_ctx = ctxs[nbound];                       /* address into the next free ctx */
+        g_addr_ctx = g_bind_ctxs[g_nbound];              /* address into the next free ctx */
         if (rp1usb_address_device(slot, p, speed, 0) != 0) continue;
         /* autosetup walks the descriptor and routes mouse vs keyboard by proto. */
-        if (rp1usb_hid_autosetup_if(slot, p, speed, -1) == 0) nbound++;
+        if (rp1usb_hid_autosetup_if(slot, p, speed, -1) == 0) g_nbound++;
     }
+}
+int rp1usb_autostart(void)
+{
+    g_bind_ctxs[0] = g_dev_ctx; g_bind_ctxs[1] = g_kdevctx;
+    g_nbound = 0;
+    /* usb1 first (commonly the mouse), then usb0 (keyboard + the boot stick).
+     * Each controller has its own ring memory, so initialising the second does
+     * not disturb a device already bound on the first. */
+    rp1usb_select_ctrl(1);
+    if (rp1usb_xhci_init() == 0) autostart_scan_current_ctrl();
+    rp1usb_select_ctrl(0);
+    if (rp1usb_xhci_init() == 0) autostart_scan_current_ctrl();
     g_addr_ctx = g_dev_ctx;                              /* restore default for manual paths */
-    return nbound;
+    return g_nbound;
 }
 
 /* periodic-schedule clock: if MFINDEX advances, the controller IS running the
@@ -779,6 +834,7 @@ void rp1usb_mouse_pump(void)
     if (!g_mouse_active && !g_kbd_active) return;
     if (g_mouse_active && g_poll_mode) {       /* control-pipe polling path */
         extern int rp1usb_get_report(int,int);
+        xhci_switch(g_mouse_ctrl);
         int n = rp1usb_get_report(g_mouse_slot, 4);
         if (n >= 3) {
             unsigned btn = g_mouse_buf[0];
@@ -790,35 +846,42 @@ void rp1usb_mouse_pump(void)
         }
         return;
     }
-    for (int guard=0; guard<32; guard++) {
-        struct trb *e=&g_evt_ring[g_evt_idx];
-        __asm__ volatile ("dsb sy":::"memory");
-        if ((e->control & 1u) != (unsigned)g_evt_cycle) return;   /* no more events */
-        struct trb ev=*e;
-        g_evt_idx++;
-        if (g_evt_idx==EVT_RING_N){ g_evt_idx=0; g_evt_cycle^=1; }
-        unsigned long erdp=XDA(&g_evt_ring[g_evt_idx]);
-        R32(g_rt, IR0_ERDP)   = (unsigned)((erdp&0xffffffff)|(1u<<3));
-        R32(g_rt, IR0_ERDP+4) = (unsigned)(erdp>>32);
-        if (((ev.control>>10)&0x3f) != 32) continue;             /* Transfer Event only */
-        int eslot = (int)((ev.control>>24)&0xff);
-        int edci  = (int)((ev.control>>16)&0x1f);
-        if (g_mouse_active && eslot==g_mouse_slot && edci==g_mouse_dci) {
-            unsigned btn = g_mouse_buf[0];
-            int dx = (int)(signed char)g_mouse_buf[1];
-            int dy = (int)(signed char)g_mouse_buf[2];
-            g_mouse_reports++;
-            g_last_btn=btn; g_last_dx=dx; g_last_dy=dy;
-            if (dx || dy || btn) xhci_mouse_event(btn, dx, dy);
-            ep1_queue_trb();
-            R32(g_db, g_mouse_slot*4) = (unsigned)g_mouse_dci;   /* re-ring mouse EP doorbell */
+    /* Drain each controller that hosts a bound HID device (mouse and keyboard
+     * may live on different RP1 controllers, each with its own event ring). */
+    for (int ci=0; ci<2; ci++) {
+        if (!g_cm[ci].inited) continue;
+        if (!((g_mouse_active && g_mouse_ctrl==ci) || (g_kbd_active && g_kbd_ctrl==ci))) continue;
+        xhci_switch(ci);
+        for (int guard=0; guard<32; guard++) {
+            struct trb *e=&g_evt_ring[g_evt_idx];
             __asm__ volatile ("dsb sy":::"memory");
-        } else if (g_kbd_active && eslot==g_kbd_slot && edci==g_kbd_dci) {
-            g_kbd_reports++;
-            kbd_decode(g_kbd_buf);
-            hid_arm(g_ep2_ring, &g_ep2_idx, &g_ep2_cycle, g_kbd_buf);
-            R32(g_db, g_kbd_slot*4) = (unsigned)g_kbd_dci;       /* re-ring kbd EP doorbell */
-            __asm__ volatile ("dsb sy":::"memory");
+            if ((e->control & 1u) != (unsigned)g_evt_cycle) break;   /* no more events */
+            struct trb ev=*e;
+            g_evt_idx++;
+            if (g_evt_idx==EVT_RING_N){ g_evt_idx=0; g_evt_cycle^=1; }
+            unsigned long erdp=XDA(&g_evt_ring[g_evt_idx]);
+            R32(g_rt, IR0_ERDP)   = (unsigned)((erdp&0xffffffff)|(1u<<3));
+            R32(g_rt, IR0_ERDP+4) = (unsigned)(erdp>>32);
+            if (((ev.control>>10)&0x3f) != 32) continue;             /* Transfer Event only */
+            int eslot = (int)((ev.control>>24)&0xff);
+            int edci  = (int)((ev.control>>16)&0x1f);
+            if (g_mouse_active && g_mouse_ctrl==ci && eslot==g_mouse_slot && edci==g_mouse_dci) {
+                unsigned btn = g_mouse_buf[0];
+                int dx = (int)(signed char)g_mouse_buf[1];
+                int dy = (int)(signed char)g_mouse_buf[2];
+                g_mouse_reports++;
+                g_last_btn=btn; g_last_dx=dx; g_last_dy=dy;
+                if (dx || dy || btn) xhci_mouse_event(btn, dx, dy);
+                ep1_queue_trb();
+                R32(g_db, g_mouse_slot*4) = (unsigned)g_mouse_dci;   /* re-ring mouse EP doorbell */
+                __asm__ volatile ("dsb sy":::"memory");
+            } else if (g_kbd_active && g_kbd_ctrl==ci && eslot==g_kbd_slot && edci==g_kbd_dci) {
+                g_kbd_reports++;
+                kbd_decode(g_kbd_buf);
+                hid_arm(g_ep2_ring, &g_ep2_idx, &g_ep2_cycle, g_kbd_buf);
+                R32(g_db, g_kbd_slot*4) = (unsigned)g_kbd_dci;       /* re-ring kbd EP doorbell */
+                __asm__ volatile ("dsb sy":::"memory");
+            }
         }
     }
 }
