@@ -128,6 +128,94 @@ void rp1eth_get_mac(unsigned char mac[6])
 
 unsigned int rp1eth_module_id(void) { return E(GEM_MID); }
 
+/* ------------------------------------------------------------------ *
+ * Cadence GEM DMA driver — descriptor rings + TX/RX.  DMA is coherent *
+ * (MMU off => uncached), and RC_BAR2 maps PCIe addr 0 -> host RAM 1:1, *
+ * so the GEM's DMA addresses are just our physical (== virtual) addrs.*
+ * ------------------------------------------------------------------ */
+extern void *getmem(unsigned long nbytes);
+
+#define GEM_NCR     0x000
+#define GEM_DMACFG  0x010
+#define GEM_RBQP    0x018
+#define GEM_TBQP    0x01c
+
+#define NCR_RE      (1u<<2)
+#define NCR_TE      (1u<<3)
+#define NCR_MPE_B   (1u<<4)
+#define NCR_TSTART  (1u<<9)
+
+#define RXN   8
+#define TXN   2
+#define RXBUF 2048
+
+struct gem_desc { volatile unsigned int addr; volatile unsigned int ctrl; };
+static struct gem_desc *g_rxr, *g_txr;
+static unsigned char   *g_rxb, *g_txb;
+static int g_rxhead, g_txi;
+
+unsigned int rp1eth_phy_bmsr(void) { return rp1eth_mdio_read(1, 1); }   /* BMSR */
+int rp1eth_link_up(void) { return (rp1eth_phy_bmsr() & 0x0004) ? 1 : 0; }/* bit2 */
+
+void rp1eth_start(void)
+{
+    g_rxr = (struct gem_desc *)getmem(RXN * sizeof(struct gem_desc));
+    g_txr = (struct gem_desc *)getmem(TXN * sizeof(struct gem_desc));
+    g_rxb = (unsigned char *)getmem(RXN * RXBUF);
+    g_txb = (unsigned char *)getmem(RXBUF);
+
+    for (int i = 0; i < RXN; i++) {
+        g_rxr[i].addr = ((unsigned int)(unsigned long)(g_rxb + i*RXBUF) & ~3u)
+                      | (i == RXN-1 ? 2u : 0u);     /* WRAP on last; USED=0 */
+        g_rxr[i].ctrl = 0;
+    }
+    for (int i = 0; i < TXN; i++) {
+        g_txr[i].addr = 0;
+        g_txr[i].ctrl = (1u<<31) | (i == TXN-1 ? (1u<<30) : 0u);  /* USED|WRAP */
+    }
+    g_rxhead = 0; g_txi = 0;
+
+    /* DMACFG: RX buf 2048/64=32 (RXBS<<16), RXBMS=3, TXPBMS, burst 16 */
+    E(GEM_DMACFG) = (32u<<16) | (3u<<8) | (1u<<10) | 0x10u;
+    E(GEM_RBQP)   = (unsigned int)(unsigned long)g_rxr;
+    E(GEM_TBQP)   = (unsigned int)(unsigned long)g_txr;
+
+    /* NCFGR: keep MDC clk; full-duplex + gigabit */
+    E(GEM_NCFGR) |= (1u<<1) | (1u<<10);
+
+    E(GEM_NCR) = NCR_RE | NCR_TE | NCR_MPE_B;       /* enable RX + TX */
+}
+
+int rp1eth_tx_frame(const unsigned char *f, int len)
+{
+    if (len > RXBUF) len = RXBUF;
+    for (int i = 0; i < len; i++) g_txb[i] = f[i];
+    int ti = g_txi;
+    g_txr[ti].addr = (unsigned int)(unsigned long)g_txb;
+    g_txr[ti].ctrl = ((unsigned)len & 0x3fff) | (1u<<15)        /* LAST */
+                   | (ti == TXN-1 ? (1u<<30) : 0u);             /* WRAP, USED=0 */
+    E(GEM_NCR) |= NCR_TSTART;
+    int ok = 0;
+    for (int t = 0; t < 1000000; t++)
+        if (g_txr[ti].ctrl & (1u<<31)) { ok = 1; break; }       /* USED set = done */
+    g_txi = (g_txi + 1) % TXN;
+    return ok ? 0 : -1;
+}
+
+int rp1eth_rx_poll(unsigned char **pkt)
+{
+    if (!(g_rxr[g_rxhead].addr & 1u)) return 0;                  /* not filled */
+    int len = (int)(g_rxr[g_rxhead].ctrl & 0xfff);
+    *pkt = g_rxb + g_rxhead*RXBUF;
+    return len;
+}
+
+void rp1eth_rx_release(void)
+{
+    g_rxr[g_rxhead].addr &= ~1u;                                /* give back to HW */
+    g_rxhead = (g_rxhead + 1) % RXN;
+}
+
 /* Returns 0 if a Cadence GEM answered at RP1_ETH_BASE (PCIe path alive). */
 int rp1eth_probe(void)
 {
@@ -174,6 +262,31 @@ int rp1eth_probe(void)
     unsigned int id2 = rp1eth_mdio_read(1, 3);    /* PHY ID reg 3 */
     uart_puts("rp1eth: PHY@1 id = 0x"); put_hex32((id1 << 16) | id2);
     uart_puts((id1 == 0xffff && id2 == 0xffff) ? "  (no MDIO response)\n" : "\n");
+
+    if (alive && !(id1 == 0xffff && id2 == 0xffff)) {
+        rp1eth_start();
+        unsigned int bmsr = rp1eth_phy_bmsr();
+        uart_puts("rp1eth: GEM started, link ");
+        uart_puts((bmsr & 0x0004) ? "UP" : "down");
+        uart_puts(" (BMSR=0x"); put_hex32(bmsr); uart_puts(")\n");
+
+        /* send one broadcast test frame (experimental ethertype 0x88b5) */
+        unsigned char tf[64];
+        for (int i = 0; i < 6; i++) tf[i] = 0xff;
+        tf[6]=0x02; tf[7]=0xca; tf[8]=0xfe; tf[9]=0xb0; tf[10]=0x05; tf[11]=0x01;
+        tf[12]=0x88; tf[13]=0xb5;
+        for (int i = 14; i < 64; i++) tf[i] = (unsigned char)i;
+        int tx = rp1eth_tx_frame(tf, 64);
+        uart_puts(tx == 0 ? "rp1eth: TX test frame sent\n" : "rp1eth: TX timeout\n");
+
+        /* briefly poll for any RX */
+        int got = 0; unsigned char *p;
+        for (int t = 0; t < 4000000 && got < 3; t++) {
+            int n = rp1eth_rx_poll(&p);
+            if (n > 0) { got++; uart_puts("rp1eth: RX frame len="); put_hex32((unsigned)n); uart_puts("\n"); rp1eth_rx_release(); }
+        }
+        if (!got) uart_puts("rp1eth: no RX in window\n");
+    }
 
     return alive ? 0 : -1;
 }
