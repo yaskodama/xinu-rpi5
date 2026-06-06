@@ -386,68 +386,6 @@ static void win_status(window_t *self, unsigned int frame)
             kv_append(l, &n, "rsr", (unsigned long)rp1eth_rsr());
             draw_string_at(xb, yb + line*12, l, 0xFFFFD060U, bg); line++;
 
-            /* IRQ / drain diagnostics: is the timer IRQ firing (tick), is
-             * genet_rx_tick running (rxt), is the reentrancy guard stuck
-             * (bsy), did HW set the RX descriptor USED bit (rxd0 low bit). */
-            {
-                extern unsigned long timer_irq_count(void);
-                extern unsigned int  rp1eth_rxd0(void);
-                extern unsigned int  rp1eth_rxc0(void);
-                extern unsigned int  rp1eth_rxhead(void);
-                n = 0;
-                kv_append(l, &n, "tick", timer_irq_count());
-                kv_append(l, &n, "rxt",  g_rx_tick_count);
-                kv_append(l, &n, "bsy",  (unsigned long)g_rx_busy);
-                kv_append(l, &n, "rxd0", (unsigned long)rp1eth_rxd0());
-                draw_string_at(xb, yb + line*12, l, 0xFF60FF60U, bg); line++;
-                /* ctrl0 = GEM's status word for RX desc 0 (low 12 bits =
-                 * frame length); head = g_rxhead (which desc rx_poll reads). */
-                extern unsigned long rp1eth_rx_seen(void);
-                extern unsigned long rp1eth_rx_empty(void);
-                extern unsigned int  rp1eth_rx_polladdr(void);
-                extern unsigned int  rp1eth_rx_pollhead(void);
-                n = 0;
-                kv_append(l, &n, "ctrl0", (unsigned long)rp1eth_rxc0());
-                kv_append(l, &n, "head",  (unsigned long)rp1eth_rxhead());
-                kv_append(l, &n, "seen",  rp1eth_rx_seen());
-                kv_append(l, &n, "empt",  rp1eth_rx_empty());
-                draw_string_at(xb, yb + line*12, l, 0xFF60FF60U, bg); line++;
-                /* polladdr = exact addr word rp1eth_rx_poll last read (its
-                 * bit0 = USED as the drain path actually sees it); pollhead =
-                 * g_rxhead it used.  Compare with rxd0/head above: if they
-                 * differ, the drain reads a stale/other descriptor. */
-                extern unsigned int rp1eth_rx_pol0(void);
-                n = 0;
-                kv_append(l, &n, "polad", (unsigned long)rp1eth_rx_polladdr());
-                kv_append(l, &n, "polhd", (unsigned long)rp1eth_rx_pollhead());
-                kv_append(l, &n, "pol0",  (unsigned long)rp1eth_rx_pol0());
-                draw_string_at(xb, yb + line*12, l, 0xFF60FF60U, bg); line++;
-                /* rxr = ring base (low32); rbqp = GEM's live RX pointer (where
-                 * the HW will write next) — if rbqp != rxr + head*16 the GEM and
-                 * our g_rxhead have desynced.  ncfgr bit5 = NBC (broadcast block). */
-                {
-                    extern unsigned int rp1eth_rxrlo(void);
-                    extern unsigned int rp1eth_rbqp(void);
-                    extern unsigned int rp1eth_ncfgr(void);
-                    n = 0;
-                    kv_append(l, &n, "rxr",  (unsigned long)rp1eth_rxrlo());
-                    kv_append(l, &n, "rbqp", (unsigned long)rp1eth_rbqp());
-                    kv_append(l, &n, "ncfg", (unsigned long)rp1eth_ncfgr());
-                    draw_string_at(xb, yb + line*12, l, 0xFF60FF60U, bg); line++;
-                    /* calls = times rp1eth_rx_poll was entered; grxr = g_rxr as
-                     * IT sees it.  If calls climbs but grxr=0 while rxr!=0, the
-                     * drain context reads a different/NULL g_rxr than win_status. */
-                    {
-                        extern unsigned long rp1eth_rx_calls(void);
-                        extern unsigned int  rp1eth_rx_grxr(void);
-                        n = 0;
-                        kv_append(l, &n, "calls", rp1eth_rx_calls());
-                        kv_append(l, &n, "grxr",  (unsigned long)rp1eth_rx_grxr());
-                        draw_string_at(xb, yb + line*12, l, 0xFF60FF60U, bg); line++;
-                    }
-                }
-            }
-
             /* last RX frame's first 14 bytes = dst MAC / src MAC / ethertype */
             extern unsigned int rp1eth_rxlast(int);
             {

@@ -329,7 +329,7 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "]}\n");
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";
-        bl = s_put(body, bl, "xinu-rpi5 (Pi 4) actor HTTP gateway\n"
+        bl = s_put(body, bl, "xinu-rpi5 (Pi 5) actor HTTP gateway\n"
                              "GET /api/actors\n"
                              "GET /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n");
     } else {
