@@ -158,7 +158,7 @@ extern void *getmem(unsigned long nbytes);
 #define NCR_MPE_B   (1u<<4)
 #define NCR_TSTART  (1u<<9)
 
-#define RXN   8
+#define RXN   32
 #define TXN   2
 #define RXBUF 2048
 
@@ -263,7 +263,11 @@ int rp1eth_tx_frame(const unsigned char *f, int len)
 
 int rp1eth_rx_poll(unsigned char **pkt)
 {
-    if (!(g_rxr[g_rxhead].addr & 1u)) return 0;                  /* not filled */
+    if (!(g_rxr[g_rxhead].addr & 1u)) {
+        /* ring drained — clear RX BNA/overrun so the GEM resumes receiving */
+        if (E(0x020) & 0x05u) E(0x020) = 0x05u;
+        return 0;
+    }
     int len = (int)(g_rxr[g_rxhead].ctrl & 0xfff);
     *pkt = g_rxb + g_rxhead*RXBUF;
     return len;
