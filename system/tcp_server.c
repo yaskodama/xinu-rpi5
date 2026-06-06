@@ -509,7 +509,15 @@ static int http_build(const char *req, char *out, int max)
         extern int rp1usb_ctx_stride(void);
         ctype = "text/plain";
         /* Re-triggerable bring-up steps (iterate without reflashing): */
-        if (str_starts(rpath, "/usb/init")) {
+        if (str_starts(rpath, "/usb/probe")) {
+            extern void rp1usb_probe(void);
+            rp1usb_probe();
+            bl = s_put(body, bl, "probe done: hciver="); bl = s_putdec(body, bl, rp1usb_ver(0));
+            bl = s_put(body, bl, " ports="); bl = s_putdec(body, bl, rp1usb_ports(0));
+            bl = s_put(body, bl, " c0p1="); bl = s_putdec(body, bl, rp1usb_portsc(0,0));
+            bl = s_put(body, bl, " c0p2="); bl = s_putdec(body, bl, rp1usb_portsc(0,1));
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/init")) {
             extern int rp1usb_xhci_init(void);
             int r = rp1usb_xhci_init();
             bl = s_put(body, bl, "xhci_init -> "); bl = s_putdec(body, bl, r);

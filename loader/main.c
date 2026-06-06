@@ -1083,11 +1083,10 @@ void kernel_main(void)
         extern int rp1eth_probe(void);
         rp1pcie_init();     /* train the PCIe link to the RP1 first */
         rp1eth_probe();
-        /* USB: only the READ-ONLY probe at boot (safe).  The xHCI init / enum /
-         * address / descriptor steps are driven over HTTP (/usb/init, /usb/reset,
-         * /usb/addr, /usb/desc) so a bring-up bug can't fault the boot path and
-         * each step can be iterated by curl without reflashing. */
-        { extern void rp1usb_probe(void); rp1usb_probe(); }
+        /* USB: NOTHING at boot (an MMIO access to 0x1F002004AD faulted even from
+         * the read-only probe).  The whole bring-up is driven over HTTP — GET
+         * /usb/probe, /usb/init, /usb/reset, /usb/addr, /usb/desc — so the box
+         * always boots and each step is isolated. */
     }
 #endif
 
