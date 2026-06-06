@@ -517,7 +517,10 @@ int rp1usb_hid_setup(int slot, int port, int speed, int mps)
  * keyboard proto 1) and use the descriptor's real epaddr / wMaxPacketSize /
  * bInterval / interface number. ---------- */
 static int g_auto_epaddr, g_auto_mps, g_auto_interval, g_auto_iface, g_auto_dci, g_auto_found, g_auto_proto;
-int rp1usb_hid_autosetup(int slot, int port, int speed)
+int rp1usb_hid_autosetup(int slot, int port, int speed){ extern int rp1usb_hid_autosetup_if(int,int,int,int); return rp1usb_hid_autosetup_if(slot,port,speed,-1); }
+/* want_iface >=0 forces binding that interface's interrupt-IN EP (e.g. 0=keyboard,
+ * 1=touchpad); -1 = auto-pick the most mouse-like. */
+int rp1usb_hid_autosetup_if(int slot, int port, int speed, int want_iface)
 {
     int got = rp1usb_get_descriptor(slot, 2, 0, 9);            /* config header first */
     if (got < 4) return -1;
@@ -535,7 +538,8 @@ int rp1usb_hid_autosetup(int slot, int port, int speed)
         } else if (btype==5 && cur_class==3) {                 /* endpoint of a HID interface */
             int epaddr=g_xfer_buf[pos+2], attr=g_xfer_buf[pos+3];
             int mps=g_xfer_buf[pos+4]|(g_xfer_buf[pos+5]<<8), interval=g_xfer_buf[pos+6];
-            if ((attr&3)==3 && (epaddr&0x80)) {                /* interrupt IN */
+            if ((attr&3)==3 && (epaddr&0x80) &&                 /* interrupt IN ... */
+                (want_iface<0 || cur_iface==want_iface)) {     /* ...on the wanted iface */
                 int score=(cur_proto==2)?3:(cur_proto==0)?2:1; /* mouse > generic > keyboard */
                 if (score>best) {
                     best=score;

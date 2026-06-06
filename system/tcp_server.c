@@ -567,7 +567,7 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, " cfgepCC=");  bl = s_putdec(body, bl, rp1usb_cfgep_cc());
             bl = s_put(body, bl, " setprotoCC="); bl = s_putdec(body, bl, rp1usb_setproto_cc());
             bl = s_put(body, bl, "\n");
-        } else if (str_starts(rpath, "/usb/mouse")) {
+        } else if (str_starts(rpath, "/usb/mouse?")) {
             extern int rp1usb_poll_mouse(int);
             extern unsigned int rp1usb_mouse_byte(int);
             int slot=q_int(req,"slot",2);
@@ -587,12 +587,13 @@ static int http_build(const char *req, char *out, int max)
             for (int i=0;i<4;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_mouse_byte(i)); }
             bl = s_put(body, bl, "\n");
         } else if (str_starts(rpath, "/usb/automouse")) {
-            extern int rp1usb_hid_autosetup(int,int,int);
+            extern int rp1usb_hid_autosetup_if(int,int,int,int);
             extern int rp1usb_auto_epaddr(void), rp1usb_auto_mps(void), rp1usb_auto_iface(void),
                        rp1usb_auto_dci(void), rp1usb_auto_proto(void), rp1usb_auto_interval(void);
             extern unsigned int rp1usb_cfgep_cc(void), rp1usb_setproto_cc(void);
             int slot=q_int(req,"slot",1), port=q_int(req,"port",1), speed=q_int(req,"speed",1);
-            int r = rp1usb_hid_autosetup(slot, port, speed);
+            int wif=q_int(req,"iface",-1);
+            int r = rp1usb_hid_autosetup_if(slot, port, speed, wif);
             bl = s_put(body, bl, "automouse r="); bl = s_putdec(body, bl, r);
             bl = s_put(body, bl, " epaddr="); bl = s_putdec(body, bl, rp1usb_auto_epaddr());
             bl = s_put(body, bl, " dci="); bl = s_putdec(body, bl, rp1usb_auto_dci());
