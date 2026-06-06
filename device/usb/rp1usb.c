@@ -447,7 +447,11 @@ int rp1usb_hid_setup(int slot, int port, int speed, int mps)
     ep[1]=(7u<<3)|(3u<<1)|((unsigned)mps<<16);      /* Interrupt-IN, CErr=3, MPS */
     unsigned long trd=XDA(g_ep1_ring)|1u;
     ep[2]=(unsigned)(trd&0xffffffff); ep[3]=(unsigned)(trd>>32);
-    ep[4]=(unsigned)mps;
+    /* ep[4]: [15:0]=Average TRB Length, [31:16]=Max ESIT Payload Lo.
+     * Max ESIT Payload MUST be non-zero or the periodic scheduler allocates 0
+     * bandwidth and never issues a transfer (interrupt EP -> no events).
+     * For an interrupt EP with MaxBurst=0 it is just MaxPacketSize. */
+    ep[4]=((unsigned)mps<<16)|((unsigned)mps);
     g_dcbaa[slot]=XDA(g_dev_ctx);
     __asm__ volatile ("dsb sy":::"memory");
     unsigned long ic=XDA(g_input_ctx);
@@ -455,6 +459,7 @@ int rp1usb_hid_setup(int slot, int port, int speed, int mps)
     struct trb ev=event_wait(33);
     g_cfgep_cc=(ev.status>>24)&0xff;
 
+    (void)control_nodata(slot, 0x21, 0x0A, 0, 0);                            /* SET_IDLE(0) = report on change */
     g_setproto_cc = (control_nodata(slot, 0x21, 0x0B, 0, 0) == 0) ? 1 : 0;  /* SET_PROTOCOL boot */
 
     /* Arm the continuous pump: queue a couple of interrupt-IN transfers and let
