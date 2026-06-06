@@ -145,6 +145,44 @@ int vfs_write_str(vfs_node_t *file, const char *s)
     return vfs_write(file, s, n);
 }
 
+/* Walk an absolute path creating any missing components.  Intermediate
+ * components are always directories; the final one is a file when
+ * `last_is_file` is set, else a directory.  Returns the final node, or
+ * NULL on OOM / a component that already exists with the wrong kind
+ * (e.g. a file used as a directory).  Idempotent: an existing final node
+ * of the right kind is returned as-is. */
+static vfs_node_t *resolve_create(const char *path, int last_is_file)
+{
+    if (path == 0 || path[0] != '/') return 0;
+    vfs_node_t *cur = &g_root;
+    const char *p = path + 1;
+    while (*p) {
+        char name[VFS_NAME_MAX + 1];
+        int i = 0;
+        while (*p && *p != '/' && i < VFS_NAME_MAX) name[i++] = *p++;
+        name[i] = 0;
+        /* last component? (nothing but slashes remain) */
+        int is_last = 1;
+        for (const char *q = p; *q; q++) if (*q != '/') { is_last = 0; break; }
+        if (i > 0) {
+            vfs_node_t *child = find_child(cur, name);
+            if (child == 0) {
+                vfs_kind_t k = (is_last && last_is_file) ? VFS_FILE : VFS_DIR;
+                child = new_node(k, name, cur);
+                if (child == 0) return 0;
+            } else if (!is_last && child->kind != VFS_DIR) {
+                return 0;                 /* path goes through a file */
+            }
+            cur = child;
+        }
+        if (*p == '/') p++;
+    }
+    return cur;
+}
+
+vfs_node_t *vfs_mkdir_p(const char *path)     { return resolve_create(path, 0); }
+vfs_node_t *vfs_create_path(const char *path) { return resolve_create(path, 1); }
+
 vfs_node_t *vfs_lookup(const char *path)
 {
     if (path == 0 || path[0] != '/') return 0;

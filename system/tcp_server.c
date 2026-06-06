@@ -15,6 +15,7 @@
 #include "uart.h"
 #include "genet.h"
 #include "actor.h"
+#include "vfs.h"
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
@@ -247,6 +248,48 @@ static int s_putdec(char *b, int pos, long v)
     return pos;
 }
 
+/* ---------- /fs/* hierarchical-filesystem HTTP helpers ---------- */
+
+/* Copy the request-line path (after "METHOD ", up to ' ' or '?') into pbuf. */
+static int http_path(const char *req, char *pbuf, int max)
+{
+    int s = 0;
+    while (req[s] && req[s] != ' ') s++;          /* skip the method */
+    if (req[s] == ' ') s++;
+    int i = 0;
+    while (req[s] && req[s] != ' ' && req[s] != '?' && i < max - 1) pbuf[i++] = req[s++];
+    pbuf[i] = 0;
+    return i;
+}
+
+static int str_starts(const char *s, const char *pfx)
+{
+    while (*pfx) { if (*s != *pfx) return 0; s++; pfx++; }
+    return 1;
+}
+
+/* HTTP body (after the blank CRLFCRLF line), or NULL. */
+static const char *http_body(const char *req)
+{
+    int n = 0; while (req[n]) n++;
+    for (int i = 0; i + 3 < n; i++)
+        if (req[i]=='\r'&&req[i+1]=='\n'&&req[i+2]=='\r'&&req[i+3]=='\n') return req + i + 4;
+    return 0;
+}
+
+/* vfs_walk callback: render an indented tree into a capped buffer. */
+struct treectx { char *b; int bl; int max; };
+static void tree_visit(int depth, vfs_node_t *n, void *c)
+{
+    struct treectx *t = (struct treectx *)c;
+    if (t->bl >= t->max - 48) return;
+    for (int d = 0; d < depth && t->bl < t->max - 4; d++) t->bl = s_put(t->b, t->bl, "  ");
+    t->bl = s_put(t->b, t->bl, n->name[0] ? n->name : "/");
+    if (n->kind == VFS_DIR) t->b[t->bl++] = '/';
+    else { t->bl = s_put(t->b, t->bl, "  ("); t->bl = s_putdec(t->b, t->bl, (long)n->size); t->bl = s_put(t->b, t->bl, "B)"); }
+    t->b[t->bl++] = '\n';
+}
+
 /* Locate "key=" in NUL-terminated `req` and copy its value (up to the
  * next '&', ' ' or end) into out[0..max-1].  Returns 1 if found. */
 static int q_param(const char *req, const char *key, char *out, int max)
@@ -295,6 +338,9 @@ static int http_build(const char *req, char *out, int max)
     const char *ctype = "application/json";
     (void)max;
 
+    char rpath[300];
+    http_path(req, rpath, sizeof rpath);          /* request path, for /fs/* */
+
     if (path_eq(req, "/send")) {
         int  to  = q_int(req, "to", -1);
         int  arg = q_int(req, "arg", 0);
@@ -327,6 +373,44 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "}");
         }
         bl = s_put(body, bl, "]}\n");
+    } else if (str_starts(rpath, "/fs")) {
+        /* Hierarchical in-memory filesystem (fs/vfs.c) over HTTP:
+         *   GET  /fs   or  /fs/tree        -> indented tree of the whole FS
+         *   GET  /fs/ls/<dir>              -> one directory's entries
+         *   GET  /fs/cat/<file>            -> a file's contents
+         *   POST /fs/mkdir/<dir>           -> create dir + intermediates
+         *   POST /fs/write/<file> (body)   -> create file + write the body  */
+        ctype = "text/plain";
+        if (str_starts(rpath, "/fs/cat/")) {
+            vfs_node_t *n = vfs_lookup(rpath + 7);
+            if (n && n->kind == VFS_FILE) bl = vfs_read(n, body, sizeof body - 1);
+            else bl = s_put(body, bl, "cat: no such file\n");
+            if (bl < 0) bl = 0;
+        } else if (str_starts(rpath, "/fs/ls/")) {
+            vfs_node_t *n = vfs_lookup(rpath + 6);
+            if (n && n->kind == VFS_DIR) {
+                for (vfs_node_t *c = n->children; c && bl < (int)sizeof body - 40; c = c->next) {
+                    bl = s_put(body, bl, c->name);
+                    bl = s_put(body, bl, c->kind == VFS_DIR ? "/\n" : "\n");
+                }
+                if (!n->children) bl = s_put(body, bl, "(empty)\n");
+            } else bl = s_put(body, bl, "ls: no such directory\n");
+        } else if (str_starts(rpath, "/fs/mkdir/")) {
+            vfs_node_t *n = vfs_mkdir_p(rpath + 9);
+            bl = s_put(body, bl, n ? "mkdir: ok\n" : "mkdir: failed\n");
+        } else if (str_starts(rpath, "/fs/write/")) {
+            vfs_node_t *n = vfs_create_path(rpath + 9);
+            const char *b = http_body(req);
+            if (n && n->kind == VFS_FILE && b) {
+                int blen = 0; while (b[blen]) blen++;
+                vfs_write(n, b, (unsigned long)blen);
+                bl = s_put(body, bl, "write: "); bl = s_putdec(body, bl, blen); bl = s_put(body, bl, " bytes\n");
+            } else bl = s_put(body, bl, "write: failed (bad path or empty body)\n");
+        } else {                              /* /fs or /fs/tree */
+            struct treectx t; t.b = body; t.bl = bl; t.max = (int)sizeof body;
+            vfs_walk(vfs_root(), 0, tree_visit, &t);
+            bl = t.bl;
+        }
     } else if ((req[0]=='P'&&req[1]=='O'&&req[2]=='S'&&req[3]=='T'&&
                 req[5]=='/'&&req[6]=='c'&&req[7]=='c') ||
                (req[0]=='G'&&req[1]=='E'&&req[2]=='T'&&
@@ -358,7 +442,9 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "xinu-rpi5 (Pi 5) actor HTTP gateway\n"
                              "GET /api/actors\n"
                              "GET /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n"
-                             "POST /cc  (C source in body) -> JIT compile & run\n");
+                             "POST /cc  (C source in body) -> JIT compile & run\n"
+                             "GET /fs | /fs/ls/<dir> | /fs/cat/<file>\n"
+                             "POST /fs/mkdir/<dir> | /fs/write/<file> (body)\n");
     } else {
         ctype = "text/plain";
         bl = s_put(body, bl, "404 not found\n");

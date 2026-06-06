@@ -40,6 +40,13 @@ vfs_node_t *vfs_root(void);
 vfs_node_t *vfs_mkdir(vfs_node_t *parent, const char *name);
 vfs_node_t *vfs_create_file(vfs_node_t *parent, const char *name);
 
+/* Path-based creation with automatic intermediate directories ("mkdir -p").
+ * vfs_mkdir_p makes the final component a directory; vfs_create_path makes it
+ * a regular file.  Both return the final node (the existing one if already
+ * present with the right kind), or NULL on OOM / a file used as a directory. */
+vfs_node_t *vfs_mkdir_p(const char *path);
+vfs_node_t *vfs_create_path(const char *path);
+
 /* Write/read raw bytes to/from a regular file.  vfs_write replaces
  * the existing contents (the file is grown via kmalloc as needed).
  * vfs_read copies up to `max` bytes from offset 0 into `buf` and
