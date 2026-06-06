@@ -578,6 +578,7 @@ int rp1usb_hid_setup(int slot, int port, int speed, int mps)
  * keyboard proto 1) and use the descriptor's real epaddr / wMaxPacketSize /
  * bInterval / interface number. ---------- */
 static int g_auto_epaddr, g_auto_mps, g_auto_interval, g_auto_iface, g_auto_dci, g_auto_found, g_auto_proto;
+static int g_autostart_active;   /* 1 while boot auto-scan runs (defined here for autosetup) */
 int rp1usb_hid_autosetup(int slot, int port, int speed){ extern int rp1usb_hid_autosetup_if(int,int,int,int); return rp1usb_hid_autosetup_if(slot,port,speed,-1); }
 /* want_iface >=0 forces binding that interface's interrupt-IN EP (e.g. 0=keyboard,
  * 1=touchpad); -1 = auto-pick the most mouse-like. */
@@ -705,7 +706,6 @@ int rp1usb_full_speed(void){ return g_full_speed; }
  * Returns the number of HID devices bound. */
 static unsigned char *g_bind_ctxs[2];   /* output ctx per bound device */
 static int            g_nbound;
-static int            g_autostart_active;   /* 1 while boot auto-scan runs */
 static void autostart_scan_current_ctrl(void)
 {
     extern int rp1usb_address_device(int,int,int,int);
