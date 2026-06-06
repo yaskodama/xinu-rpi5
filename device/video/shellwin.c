@@ -74,8 +74,6 @@ void shellwin_record_char(char c)
 
 void shellwin_draw(window_t *self, unsigned int frame)
 {
-    (void)frame;
-
     int cx = self->x + 4;
     int cy = self->y + WM_TITLEBAR_H + 4;
     const int line_h = FONT_HEIGHT + 1;
@@ -99,6 +97,14 @@ void shellwin_draw(window_t *self, unsigned int frame)
         int r = (start + i) % SHELLWIN_ROWS;
         draw_string_at(cx, cy + i * line_h,
                        ring[r], 0xFFCCE0FFU, self->content_bg);
+    }
+
+    /* Blinking input caret at the current write position (end of the prompt
+     * line, which is always the newest displayed row).  ~2 Hz blink off `frame`. */
+    if ((frame >> 4) & 1) {
+        int caret_x = cx + cur_col * FONT_WIDTH;
+        int caret_y = cy + (rows - 1) * line_h;
+        fill_rect(caret_x, caret_y, FONT_WIDTH, FONT_HEIGHT, 0xFFCCE0FFU);
     }
 }
 
