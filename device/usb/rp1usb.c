@@ -601,7 +601,10 @@ int rp1usb_hid_autosetup_if(int slot, int port, int speed, int want_iface)
             int mps=g_xfer_buf[pos+4]|(g_xfer_buf[pos+5]<<8), interval=g_xfer_buf[pos+6];
             if ((attr&3)==3 && (epaddr&0x80) &&                 /* interrupt IN ... */
                 (want_iface<0 || cur_iface==want_iface)) {     /* ...on the wanted iface */
-                int score=(cur_proto==2)?3:(cur_proto==0)?2:1; /* mouse > generic > keyboard */
+                /* boot mouse > boot keyboard > generic (proto 0 is often a
+                 * multimedia/consumer interface on a keyboard — don't mistake it
+                 * for a mouse and skip the real keyboard interface). */
+                int score=(cur_proto==2)?3:(cur_proto==1)?2:1;
                 if (score>best) {
                     best=score;
                     g_auto_epaddr=epaddr; g_auto_mps=mps; g_auto_interval=interval;
