@@ -205,6 +205,10 @@ void rp1eth_start(void)
     E(GEM_RBQP)   = LO(DA(g_rxr));  E(GEM_RBQPH) = HI(DA(g_rxr));
     E(GEM_TBQP)   = LO(DA(g_txr));  E(GEM_TBQPH) = HI(DA(g_txr));
 
+    /* USRIO: select the RGMII interface (GEM_BIT(RGMII) = bit0).  Without this
+     * the GEM stays in GMII mode and no frames flow even with the link up. */
+    E(0x0c0) = 0x1u;
+
     E(GEM_NCR) = NCR_RE | NCR_TE | NCR_MPE_B;       /* enable RX + TX */
 
     /* Bring the link up: restart autonegotiation, wait for it to complete. */
