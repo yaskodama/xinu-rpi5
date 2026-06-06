@@ -197,6 +197,17 @@ static void pcie_enumerate(void)
 /* Returns 0 if the link to the RP1 came up. */
 int rp1pcie_init(void)
 {
+    /* Idempotency for network kexec (/chainload): the firmware resets the PCIe
+     * link before OS handoff, so on a normal boot pcie_link_up() is false and we
+     * do the full bring-up.  But after a chainload the PREVIOUS kernel left the
+     * link trained + the RP1 enumerated + the outbound window programmed (none of
+     * which a chainload touches), so re-running the bring-up here would PERST-
+     * reset the RP1 and kill the GEM/xHCI.  If the link is already up, skip it. */
+    if (pcie_link_up()) {
+        uart_puts("pcie: link already up (chainload) — skipping bring-up\n");
+        return 0;
+    }
+
     uart_puts("pcie: RC @0x1000120000 bring-up ...\n");
 
     if (rescal_deassert() != 0)

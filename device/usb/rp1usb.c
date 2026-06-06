@@ -349,6 +349,51 @@ int rp1usb_address_device(int slot, int port, int speed, int bsr)
 unsigned int rp1usb_addr_cc(void){ return g_addr_cc; }
 int          rp1usb_ctx_stride(void){ return g_ctx_stride; }
 
+/* ---------- Phase 3d: EP0 control transfer (GET_DESCRIPTOR) ---------- */
+static unsigned char g_xfer_buf[256] __attribute__((aligned(64)));
+static unsigned int  g_desc_cc, g_desc_len;
+
+static void ep0_push(unsigned int p0, unsigned int p1, unsigned int status, unsigned int control)
+{
+    struct trb *t = &g_ep0_ring[g_ep0_idx];
+    t->p0=p0; t->p1=p1; t->status=status;
+    t->control = (control & ~1u) | (g_ep0_cycle & 1u);
+    __asm__ volatile ("dsb sy":::"memory");
+    g_ep0_idx++;
+    if (g_ep0_idx == 15) {                  /* link TRB slot: wrap */
+        g_ep0_ring[15].control = (g_ep0_ring[15].control & ~1u) | (g_ep0_cycle & 1u);
+        __asm__ volatile ("dsb sy":::"memory");
+        g_ep0_idx = 0; g_ep0_cycle ^= 1;
+    }
+}
+
+/* Standard device-to-host GET_DESCRIPTOR on EP0 of `slot`; data into g_xfer_buf. */
+int rp1usb_get_descriptor(int slot, int dtype, int dindex, int len)
+{
+    if (len > (int)sizeof g_xfer_buf) len = sizeof g_xfer_buf;
+    for (int i=0;i<len;i++) g_xfer_buf[i]=0;
+    unsigned int wValue = ((unsigned)dtype<<8) | (unsigned)dindex;
+    /* Setup stage (IDT immediate 8-byte setup packet, TRT=IN). */
+    ep0_push(0x80u | (6u<<8) | (wValue<<16), ((unsigned)len<<16), 8, (2u<<10)|(1u<<6)|(3u<<16));
+    /* Data stage IN. */
+    unsigned long ba = XDA(g_xfer_buf);
+    ep0_push((unsigned)(ba&0xffffffff), (unsigned)(ba>>32), (unsigned)len, (3u<<10)|(1u<<16));
+    /* Status stage OUT + IOC. */
+    ep0_push(0,0,0, (4u<<10)|(1u<<5));
+    /* Ring the slot's EP0 doorbell (DCI 1). */
+    R32(g_db, slot*4) = 1;
+    __asm__ volatile ("dsb sy":::"memory");
+    struct trb ev = event_wait(32);          /* Transfer Event */
+    g_desc_cc  = (ev.status>>24)&0xff;
+    g_desc_len = (unsigned)len - (ev.status & 0xffffff);   /* len - residual */
+    uart_puts("rp1usb: get-descriptor cc=");
+    uart_putc((char)('0'+g_desc_cc/10%10)); uart_putc((char)('0'+g_desc_cc%10)); uart_puts("\n");
+    return (g_desc_cc==1)?(int)g_desc_len:-1;
+}
+unsigned int rp1usb_desc_cc(void)    { return g_desc_cc; }
+unsigned int rp1usb_desc_len(void)   { return g_desc_len; }
+unsigned int rp1usb_desc_byte(int i) { return (i>=0&&i<256)?g_xfer_buf[i]:0; }
+
 /* On-screen accessors (HDMI, since serial is unreliable). */
 unsigned int rp1usb_caplen(int i){ return (i>=0&&i<2)?g_usb_caplen[i]:0; }
 unsigned int rp1usb_ver(int i)   { return (i>=0&&i<2)?g_usb_ver[i]:0; }

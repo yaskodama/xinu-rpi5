@@ -1102,14 +1102,15 @@ void kernel_main(void)
         extern void net_responder_set_mac(const unsigned char mac[6]);
         unsigned char mymac[6] = { 0x02, 0xca, 0xfe, 0xb0, 0x05, 0x01 };  /* Pi 5 GEM */
         net_responder_set_mac(mymac);
-        /* Arm DHCP: dhcp_drive() (in genet_rx_tick, inside the RX/TX guard)
-         * sends the first DISCOVER on its next tick and retries + adopts the
-         * lease.  Until it binds, the static .101 fallback answers, so the box
-         * is reachable either way.  We don't TX here (unguarded) on purpose. */
+        /* STATIC IP .101 (DHCP disabled by request): keeps a predictable address
+         * across reboots/chainloads — net_responder + tcp_server both already
+         * default to 192.168.3.101 at boot, so we simply don't arm DHCP.  (To
+         * re-enable a dynamic lease, set g_dhcp_started=1 + dhcp_set_mac.) */
         dhcp_set_mac(mymac);
-        g_dhcp_started = 1;
+        g_dhcp_started = 0;
+        (void)0;
     }
-    uart_puts("net: ARP+ICMP responder armed; DHCP started (static .101 fallback)\n");
+    uart_puts("net: ARP+ICMP responder armed; static IP 192.168.3.101 (DHCP off)\n");
     /* Re-read link status here so it shows up at the *end* of the
      * boot log (after the shell-window ring has scrolled past the
      * original PHY-init lines). */

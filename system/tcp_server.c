@@ -529,6 +529,19 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, " bsr="); bl = s_putdec(body, bl, bsr);
             bl = s_put(body, bl, " -> cc="); bl = s_putdec(body, bl, rp1usb_addr_cc());
             bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/desc")) {
+            extern int rp1usb_get_descriptor(int,int,int,int);
+            extern unsigned int rp1usb_desc_cc(void); extern unsigned int rp1usb_desc_len(void);
+            extern unsigned int rp1usb_desc_byte(int);
+            int slot=q_int(req,"slot",1), type=q_int(req,"type",1);
+            int index=q_int(req,"index",0), len=q_int(req,"len",18);
+            rp1usb_get_descriptor(slot, type, index, len);
+            bl = s_put(body, bl, "desc cc="); bl = s_putdec(body, bl, rp1usb_desc_cc());
+            bl = s_put(body, bl, " len=");    bl = s_putdec(body, bl, rp1usb_desc_len());
+            bl = s_put(body, bl, " bytes:");
+            int dl = (int)rp1usb_desc_len();
+            for (int i=0;i<dl && i<48 && bl<600;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_desc_byte(i)); }
+            bl = s_put(body, bl, "\n");
         } else {
         bl = s_put(body, bl, "hciver=");   bl = s_putdec(body, bl, rp1usb_ver(0));
         bl = s_put(body, bl, " ports=");   bl = s_putdec(body, bl, rp1usb_ports(0));
