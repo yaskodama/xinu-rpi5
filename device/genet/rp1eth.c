@@ -283,9 +283,11 @@ static void rp1eth_rx_rearm(void)   /* hand the whole RX ring back to HW */
 int rp1eth_rx_poll(unsigned char **pkt)
 {
     if (!(g_rxr[g_rxhead].addr & 1u)) {
-        /* ring empty.  If the GEM halted on buffer-not-available, fully re-arm
-         * the ring so it resumes (the slow cooperative drain lets it fill). */
-        if (E(0x020) & 0x01u) rp1eth_rx_rearm();
+        /* Ring empty.  Just clear the sticky RX status (REC/BNA/OVR) so the GEM
+         * keeps receiving into the descriptors we've freed — do NOT reset the
+         * ring / toggle RE (that was killing RX every time BNA latched). */
+        E(0x020) = 0x0fu;
+        (void)rp1eth_rx_rearm;
         return 0;
     }
     int len = (int)(g_rxr[g_rxhead].ctrl & 0xfff);
