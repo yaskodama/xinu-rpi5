@@ -584,7 +584,8 @@ int rp1usb_hid_autosetup(int slot, int port, int speed){ extern int rp1usb_hid_a
 int rp1usb_hid_autosetup_if(int slot, int port, int speed, int want_iface)
 {
     int got = rp1usb_get_descriptor(slot, 2, 0, 9);            /* config header first */
-    if (got < 4) return -1;
+    if (got < 4 || g_xfer_buf[0] != 9 || g_xfer_buf[1] != 2)   /* must be a real CONFIG desc */
+        return -1;
     int wtot = g_xfer_buf[2] | (g_xfer_buf[3]<<8);
     if (wtot > (int)sizeof g_xfer_buf) wtot = sizeof g_xfer_buf;
     if (rp1usb_get_descriptor(slot, 2, 0, wtot) < wtot) { /* keep going with what we have */ }
@@ -616,6 +617,14 @@ int rp1usb_hid_autosetup_if(int slot, int port, int speed, int want_iface)
         pos+=blen;
     }
     if (!g_auto_found) return -2;
+
+    /* During boot auto-scan, never let a second device of a type we've already
+     * bound overwrite it — a flaky mass-storage port (the boot stick) can mis-
+     * enumerate and produce a phantom "mouse"/"keyboard" that would clobber the
+     * real one.  Manual /usb paths (autostart flag clear) always allow re-bind. */
+    if (g_autostart_active &&
+        (((g_auto_proto==1) && g_kbd_active) || ((g_auto_proto!=1) && g_mouse_active)))
+        return -4;
 
     g_setcfg_cc=(control_nodata(slot,0x00,9,1,0)==0)?1:0;      /* SET_CONFIGURATION(1) */
 
@@ -696,6 +705,7 @@ int rp1usb_full_speed(void){ return g_full_speed; }
  * Returns the number of HID devices bound. */
 static unsigned char *g_bind_ctxs[2];   /* output ctx per bound device */
 static int            g_nbound;
+static int            g_autostart_active;   /* 1 while boot auto-scan runs */
 static void autostart_scan_current_ctrl(void)
 {
     extern int rp1usb_address_device(int,int,int,int);
@@ -713,6 +723,7 @@ int rp1usb_autostart(void)
 {
     g_bind_ctxs[0] = g_dev_ctx; g_bind_ctxs[1] = g_kdevctx;
     g_nbound = 0;
+    g_autostart_active = 1;
     /* usb1 first (commonly the mouse), then usb0 (keyboard + the boot stick).
      * Each controller has its own ring memory, so initialising the second does
      * not disturb a device already bound on the first. */
@@ -721,6 +732,7 @@ int rp1usb_autostart(void)
     rp1usb_select_ctrl(0);
     if (rp1usb_xhci_init() == 0) autostart_scan_current_ctrl();
     g_addr_ctx = g_dev_ctx;                              /* restore default for manual paths */
+    g_autostart_active = 0;
     return g_nbound;
 }
 
