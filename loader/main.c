@@ -205,6 +205,9 @@ static void genet_rx_tick(void)
 
     dhcp_drive();          /* run the DHCP state machine (rate-limited inside) */
     gc_drive();            /* periodic global actor GC (rate-limited inside)   */
+#ifdef RP1_ETH_BASE
+    { extern void rp1usb_mouse_pump(void); rp1usb_mouse_pump(); }  /* USB mouse -> cursor */
+#endif
     g_rx_busy = 0;
 }
 

@@ -406,6 +406,9 @@ static struct trb     g_ep1_ring[16] __attribute__((aligned(64)));
 static int            g_ep1_idx, g_ep1_cycle = 1;
 static unsigned char  g_mouse_buf[8] __attribute__((aligned(64)));
 static unsigned int   g_setcfg_cc, g_cfgep_cc, g_setproto_cc;
+static int            g_mouse_slot, g_mouse_active;   /* defined below; fwd for hid_setup */
+static unsigned long  g_mouse_reports;
+static void           ep1_queue_trb(void);
 
 /* EP0 control transfer with NO data stage (SET_CONFIGURATION, SET_PROTOCOL). */
 static int control_nodata(int slot, unsigned int bmReqType, unsigned int bReq,
@@ -452,6 +455,16 @@ int rp1usb_hid_setup(int slot, int port, int speed, int mps)
     g_cfgep_cc=(ev.status>>24)&0xff;
 
     g_setproto_cc = (control_nodata(slot, 0x21, 0x0B, 0, 0) == 0) ? 1 : 0;  /* SET_PROTOCOL boot */
+
+    /* Arm the continuous pump: queue a couple of interrupt-IN transfers and let
+     * rp1usb_mouse_pump() (in genet_rx_tick) deliver reports to the cursor. */
+    if (g_cfgep_cc == 1) {
+        g_mouse_slot = slot;
+        ep1_queue_trb(); ep1_queue_trb();
+        R32(g_db, slot*4) = 3;
+        __asm__ volatile ("dsb sy":::"memory");
+        g_mouse_active = 1;
+    }
     return (g_cfgep_cc==1)?0:-1;
 }
 
@@ -460,7 +473,9 @@ int rp1usb_hid_setup(int slot, int port, int speed, int mps)
  * Returns the report length, or <=0 on error/timeout. */
 int rp1usb_poll_mouse(int slot)
 {
-    for (int i=0;i<8;i++) g_mouse_buf[i]=0;
+    /* Do NOT zero g_mouse_buf: the controller DMAs each completed report here,
+     * so the buffer always holds the latest report even if event_wait returns
+     * an earlier TRB's completion event (we share one buffer across TRBs). */
     struct trb *t=&g_ep1_ring[g_ep1_idx];
     unsigned long ba=XDA(g_mouse_buf);
     t->p0=(unsigned)(ba&0xffffffff); t->p1=(unsigned)(ba>>32);
@@ -480,6 +495,53 @@ unsigned int rp1usb_setcfg_cc(void) { return g_setcfg_cc; }
 unsigned int rp1usb_cfgep_cc(void)  { return g_cfgep_cc; }
 unsigned int rp1usb_setproto_cc(void){ return g_setproto_cc; }
 unsigned int rp1usb_mouse_byte(int i){ return (i>=0&&i<8)?g_mouse_buf[i]:0; }
+
+/* ---------- continuous (non-blocking) mouse pump -> xhci_mouse_event ---------- */
+
+static void ep1_queue_trb(void)            /* arm one interrupt-IN transfer */
+{
+    struct trb *t=&g_ep1_ring[g_ep1_idx];
+    unsigned long ba=XDA(g_mouse_buf);
+    t->p0=(unsigned)(ba&0xffffffff); t->p1=(unsigned)(ba>>32);
+    t->status=8;
+    t->control=(1u<<10)|(1u<<5)|(g_ep1_cycle&1u);
+    __asm__ volatile ("dsb sy":::"memory");
+    g_ep1_idx++;
+    if (g_ep1_idx==15){ g_ep1_ring[15].control=(g_ep1_ring[15].control&~1u)|(g_ep1_cycle&1u); __asm__ volatile("dsb sy":::"memory"); g_ep1_idx=0; g_ep1_cycle^=1; }
+}
+
+extern void xhci_mouse_event(unsigned nButtons, int dx, int dy);
+
+/* Called every genet_rx_tick (100 Hz).  Non-blocking: drains any pending xHCI
+ * events; for each EP1 transfer event, hands the boot-mouse report to
+ * xhci_mouse_event (moves the HDMI cursor) and re-arms a transfer. */
+void rp1usb_mouse_pump(void)
+{
+    if (!g_mouse_active) return;
+    for (int guard=0; guard<32; guard++) {
+        struct trb *e=&g_evt_ring[g_evt_idx];
+        __asm__ volatile ("dsb sy":::"memory");
+        if ((e->control & 1u) != (unsigned)g_evt_cycle) return;   /* no more events */
+        struct trb ev=*e;
+        g_evt_idx++;
+        if (g_evt_idx==EVT_RING_N){ g_evt_idx=0; g_evt_cycle^=1; }
+        unsigned long erdp=XDA(&g_evt_ring[g_evt_idx]);
+        R32(g_rt, IR0_ERDP)   = (unsigned)((erdp&0xffffffff)|(1u<<3));
+        R32(g_rt, IR0_ERDP+4) = (unsigned)(erdp>>32);
+        if (((ev.control>>10)&0x3f) == 32) {       /* Transfer Event */
+            unsigned btn = g_mouse_buf[0];
+            int dx = (int)(signed char)g_mouse_buf[1];
+            int dy = (int)(signed char)g_mouse_buf[2];
+            g_mouse_reports++;
+            if (dx || dy || btn) xhci_mouse_event(btn, dx, dy);
+            ep1_queue_trb();
+            R32(g_db, g_mouse_slot*4) = 3;          /* re-ring EP1 doorbell */
+            __asm__ volatile ("dsb sy":::"memory");
+        }
+    }
+}
+unsigned long rp1usb_mouse_reports(void){ return g_mouse_reports; }
+int           rp1usb_mouse_on(void)     { return g_mouse_active; }
 
 /* Read-only register offsets (for diagnosing the xHCI init alignment fault). */
 unsigned int rp1usb_rtsoff(void){ return R32(RP1_USB0, CAP_RTSOFF); }
