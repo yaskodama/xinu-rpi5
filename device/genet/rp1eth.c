@@ -149,6 +149,9 @@ extern void *getmem(unsigned long nbytes);
 #define GEM_DMACFG  0x010
 #define GEM_RBQP    0x018
 #define GEM_TBQP    0x01c
+#define GEM_TBQPH   0x4c8
+#define GEM_RBQPH   0x4d4
+#define DMACFG_ADDR64 (1u<<30)
 
 #define NCR_RE      (1u<<2)
 #define NCR_TE      (1u<<3)
@@ -159,7 +162,15 @@ extern void *getmem(unsigned long nbytes);
 #define TXN   2
 #define RXBUF 2048
 
-struct gem_desc { volatile unsigned int addr; volatile unsigned int ctrl; };
+/* Pi 5: devices DMA to host phys P via PCIe address P + 0x1000000000 (the RC
+ * RC_BAR2 inbound window).  That is > 32 bits, so use the GEM's 64-bit
+ * descriptor format (addr-lo, ctrl, addr-hi, reserved) + ADDR64. */
+#define DMA_OFFSET  0x1000000000UL
+#define DA(p)  ((unsigned long)(p) + DMA_OFFSET)
+#define LO(x)  ((unsigned int)((unsigned long)(x) & 0xffffffffu))
+#define HI(x)  ((unsigned int)((unsigned long)(x) >> 32))
+
+struct gem_desc { volatile unsigned int addr, ctrl, addrh, resvd; };
 static struct gem_desc *g_rxr, *g_txr;
 static unsigned char   *g_rxb, *g_txb;
 static int g_rxhead, g_txi;
@@ -175,20 +186,21 @@ void rp1eth_start(void)
     g_txb = (unsigned char *)getmem(RXBUF);
 
     for (int i = 0; i < RXN; i++) {
-        g_rxr[i].addr = ((unsigned int)(unsigned long)(g_rxb + i*RXBUF) & ~3u)
-                      | (i == RXN-1 ? 2u : 0u);     /* WRAP on last; USED=0 */
-        g_rxr[i].ctrl = 0;
+        unsigned long ba = DA(g_rxb + i*RXBUF);
+        g_rxr[i].addr  = (LO(ba) & ~3u) | (i == RXN-1 ? 2u : 0u);  /* WRAP; USED=0 */
+        g_rxr[i].addrh = HI(ba);
+        g_rxr[i].ctrl  = 0;
     }
     for (int i = 0; i < TXN; i++) {
-        g_txr[i].addr = 0;
-        g_txr[i].ctrl = (1u<<31) | (i == TXN-1 ? (1u<<30) : 0u);  /* USED|WRAP */
+        g_txr[i].addr  = 0; g_txr[i].addrh = 0;
+        g_txr[i].ctrl  = (1u<<31) | (i == TXN-1 ? (1u<<30) : 0u);  /* USED|WRAP */
     }
     g_rxhead = 0; g_txi = 0;
 
-    /* DMACFG: RX buf 2048/64=32 (RXBS<<16), RXBMS=3, TXPBMS, burst 16 */
-    E(GEM_DMACFG) = (32u<<16) | (3u<<8) | (1u<<10) | 0x10u;
-    E(GEM_RBQP)   = (unsigned int)(unsigned long)g_rxr;
-    E(GEM_TBQP)   = (unsigned int)(unsigned long)g_txr;
+    /* DMACFG: RX buf 2048/64=32 (RXBS<<16), RXBMS=3, TXPBMS, burst 16, ADDR64 */
+    E(GEM_DMACFG) = (32u<<16) | (3u<<8) | (1u<<10) | 0x10u | DMACFG_ADDR64;
+    E(GEM_RBQP)   = LO(DA(g_rxr));  E(GEM_RBQPH) = HI(DA(g_rxr));
+    E(GEM_TBQP)   = LO(DA(g_txr));  E(GEM_TBQPH) = HI(DA(g_txr));
 
     E(GEM_NCR) = NCR_RE | NCR_TE | NCR_MPE_B;       /* enable RX + TX */
 
@@ -222,9 +234,11 @@ int rp1eth_tx_frame(const unsigned char *f, int len)
     if (len > RXBUF) len = RXBUF;
     for (int i = 0; i < len; i++) g_txb[i] = f[i];
     int ti = g_txi;
-    g_txr[ti].addr = (unsigned int)(unsigned long)g_txb;
-    g_txr[ti].ctrl = ((unsigned)len & 0x3fff) | (1u<<15)        /* LAST */
-                   | (ti == TXN-1 ? (1u<<30) : 0u);             /* WRAP, USED=0 */
+    unsigned long ba = DA(g_txb);
+    g_txr[ti].addr  = LO(ba);
+    g_txr[ti].addrh = HI(ba);
+    g_txr[ti].ctrl  = ((unsigned)len & 0x3fff) | (1u<<15)       /* LAST */
+                    | (ti == TXN-1 ? (1u<<30) : 0u);            /* WRAP, USED=0 */
     E(GEM_NCR) |= NCR_TSTART;
     int ok = 0;
     for (int t = 0; t < 1000000; t++)

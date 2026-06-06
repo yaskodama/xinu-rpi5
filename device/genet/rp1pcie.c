@@ -228,10 +228,12 @@ int rp1pcie_init(void)
       t &= ~0xf8000000u; t |= ((u32)17 << 27) & 0xf8000000u;
       P(MISC_CTRL) = t; }
 
-    /* inbound view (RC_BAR2): map 4GB of system RAM at PCIe addr 0 */
-    P(MISC_RC_BAR2_LO) = 0u | (u32)encode_ibar(0x100000000UL);
-    P(MISC_RC_BAR2_HI) = 0u;
-    P(MISC_UBUS_BAR2_REMAP) |= 1u;          /* ACCESS_ENABLE */
+    /* inbound view (RC_BAR2): Pi 5 maps host RAM at PCIe addr 0x10_00000000
+     * (dtb dma-ranges: host 0 -> PCIe 0x1000000000).  So a device DMAs to
+     * host P using PCIe address P + 0x1000000000. */
+    P(MISC_RC_BAR2_LO) = (u32)(0x1000000000UL & 0xffffffffu) | (u32)encode_ibar(0x100000000UL);
+    P(MISC_RC_BAR2_HI) = (u32)(0x1000000000UL >> 32);     /* = 0x10 */
+    P(MISC_UBUS_BAR2_REMAP) |= 1u;          /* ACCESS_ENABLE (remap host base 0) */
 
     /* suppress AXI error responses; return 1s on read failure */
     P(MISC_UBUS_CTRL) |= (1u<<13) | (1u<<19);
