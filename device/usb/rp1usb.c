@@ -145,6 +145,7 @@ static int            g_cmd_idx, g_cmd_cycle = 1;
 static int            g_evt_idx, g_evt_cycle = 1;
 static unsigned int   g_xhci_usbsts_after;
 static int            g_xhci_running;
+static int            g_ctx_stride = 32;   /* 64 if HCCPARAMS1.CSZ=1 */
 
 static void xdelay(unsigned long us)
 {
@@ -162,6 +163,7 @@ int rp1usb_xhci_init(void)
     g_oper = base + caplen;
     g_rt   = base + (R32(base, CAP_RTSOFF) & ~0x1Fu);
     g_db   = base + (R32(base, CAP_DBOFF)  & ~0x3u);
+    g_ctx_stride = (R32(base, XHCI_HCCPARAMS1) & (1u<<2)) ? 64 : 32;   /* CSZ */
 
     /* 1. Stop, then reset the controller. */
     R32(g_oper, OP_USBCMD) &= ~USBCMD_RS;
@@ -295,6 +297,55 @@ int rp1usb_enum_slot(int p)
 unsigned int rp1usb_enum_portsc(void){ return g_enum_portsc; }
 unsigned int rp1usb_enum_cc(void)    { return g_enum_cc; }
 unsigned int rp1usb_enum_slotid(void){ return g_enum_slotid; }
+
+/* ---------- Phase 3c: Address Device ---------- */
+static unsigned char g_input_ctx[3*64] __attribute__((aligned(64)));  /* ctrl+slot+ep0 */
+static unsigned char g_dev_ctx[33*64]  __attribute__((aligned(64)));  /* output context */
+static struct trb    g_ep0_ring[16]    __attribute__((aligned(64)));
+static int           g_ep0_idx, g_ep0_cycle = 1;
+static unsigned int  g_addr_cc;
+static int           g_dev_slot, g_dev_speed;
+
+static unsigned int *ctx_at(unsigned char *p, int idx){ return (unsigned int *)(p + idx*g_ctx_stride); }
+
+int rp1usb_address_device(int slot, int port, int speed)
+{
+    g_dev_slot = slot; g_dev_speed = speed;
+    /* EP0 transfer ring + link TRB. */
+    for (int i=0;i<16;i++){ g_ep0_ring[i].p0=0;g_ep0_ring[i].p1=0;g_ep0_ring[i].status=0;g_ep0_ring[i].control=0; }
+    g_ep0_ring[15].p0 = (unsigned int)(XDA(g_ep0_ring)&0xffffffff);
+    g_ep0_ring[15].p1 = (unsigned int)(XDA(g_ep0_ring)>>32);
+    g_ep0_ring[15].control = (6u<<10)|(1u<<1)|1u;
+    g_ep0_idx=0; g_ep0_cycle=1;
+
+    for (unsigned i=0;i<sizeof g_input_ctx;i++) g_input_ctx[i]=0;
+    for (unsigned i=0;i<sizeof g_dev_ctx;i++)   g_dev_ctx[i]=0;
+
+    unsigned int *icc = ctx_at(g_input_ctx, 0);
+    icc[1] = (1u<<0)|(1u<<1);                       /* Add slot + EP0 */
+    unsigned int *sc = ctx_at(g_input_ctx, 1);
+    sc[0] = (1u<<27) | ((unsigned)speed << 20);     /* ctx entries=1, speed */
+    sc[1] = ((unsigned)port & 0xff) << 16;          /* root hub port */
+    int mps = (speed==4)?512:(speed==3)?64:8;       /* SS/HS / FS/LS */
+    unsigned int *ep0 = ctx_at(g_input_ctx, 2);
+    ep0[1] = (4u<<3) | (3u<<1) | ((unsigned)mps<<16);  /* Control EP, CErr=3, MPS */
+    unsigned long trd = XDA(g_ep0_ring) | 1u;       /* DCS=1 */
+    ep0[2] = (unsigned int)(trd & 0xffffffff);
+    ep0[3] = (unsigned int)(trd >> 32);
+    ep0[4] = 8;
+
+    g_dcbaa[slot] = XDA(g_dev_ctx);
+    __asm__ volatile ("dsb sy":::"memory");
+
+    unsigned long ic = XDA(g_input_ctx);
+    cmd_submit((unsigned)(ic&0xffffffff), (unsigned)(ic>>32), 0, (11u<<10)|((unsigned)slot<<24));
+    struct trb ev = event_wait(33);
+    g_addr_cc = (ev.status>>24)&0xff;
+    uart_puts("rp1usb: address-device cc=");
+    uart_putc((char)('0'+g_addr_cc/10%10)); uart_putc((char)('0'+g_addr_cc%10)); uart_puts("\n");
+    return (g_addr_cc==1)?0:-1;
+}
+unsigned int rp1usb_addr_cc(void){ return g_addr_cc; }
 
 /* On-screen accessors (HDMI, since serial is unreliable). */
 unsigned int rp1usb_caplen(int i){ return (i>=0&&i<2)?g_usb_caplen[i]:0; }
