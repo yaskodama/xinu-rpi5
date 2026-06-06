@@ -1083,10 +1083,11 @@ void kernel_main(void)
         extern int rp1eth_probe(void);
         rp1pcie_init();     /* train the PCIe link to the RP1 first */
         rp1eth_probe();
-        { extern void rp1usb_probe(void); rp1usb_probe(); }  /* RP1 DWC3/xHCI host */
-        { extern int rp1usb_xhci_init(void); rp1usb_xhci_init(); }  /* take over + run */
-        { extern int rp1usb_enum_slot(int); rp1usb_enum_slot(2); }  /* reset c0p2 + enable slot */
-        { extern int rp1usb_address_device(int,int,int,int); rp1usb_address_device(1, 2, 3, 0); }  /* slot1 port2 (High) */
+        /* USB: only the READ-ONLY probe at boot (safe).  The xHCI init / enum /
+         * address / descriptor steps are driven over HTTP (/usb/init, /usb/reset,
+         * /usb/addr, /usb/desc) so a bring-up bug can't fault the boot path and
+         * each step can be iterated by curl without reflashing. */
+        { extern void rp1usb_probe(void); rp1usb_probe(); }
     }
 #endif
 

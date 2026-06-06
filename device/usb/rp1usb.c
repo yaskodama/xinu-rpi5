@@ -24,6 +24,13 @@
 #define R16(base,off)  (*(volatile unsigned short *)((base) + (off)))
 #define R32(base,off)  (*(volatile unsigned int   *)((base) + (off)))
 
+/* The RP1/DWC3 USB MMIO is 32-bit-access-only: a byte (R8) read of CAPLENGTH or
+ * a half-word (R16) read of HCIVERSION returns garbage, and a garbage CAPLENGTH
+ * then makes the PORTSC offsets unaligned -> Device-memory alignment fault.  So
+ * always read the 32-bit word at offset 0 and slice it. */
+static unsigned int xcaplen(unsigned long base){ return (*(volatile unsigned int *)(base)) & 0xffu; }
+static unsigned int xhciver(unsigned long base){ return ((*(volatile unsigned int *)(base)) >> 16) & 0xffffu; }
+
 /* xHCI capability registers (offset 0 from the controller base). */
 #define XHCI_CAPLENGTH    0x00   /* 8-bit: bytes to the operational regs */
 #define XHCI_HCIVERSION   0x02   /* 16-bit: BCD, expect 0x0100 / 0x0110   */
@@ -41,7 +48,7 @@ static int          g_usb_probed;
  * operational base = base + CAPLENGTH; port registers at +0x400 + (p-1)*0x10. */
 static unsigned int portsc(unsigned long base, int p)
 {
-    unsigned int caplen = R8(base, XHCI_CAPLENGTH);
+    unsigned int caplen = xcaplen(base);
     return R32(base, caplen + 0x400 + (p - 1) * 0x10);
 }
 
@@ -56,8 +63,8 @@ static void puts_hex(const char *tag, unsigned int v)
 
 static void probe_one(int idx, unsigned long base)
 {
-    unsigned int caplen = R8 (base, XHCI_CAPLENGTH);
-    unsigned int ver    = R16(base, XHCI_HCIVERSION);
+    unsigned int caplen = xcaplen(base);
+    unsigned int ver    = xhciver(base);
     unsigned int hcs1   = R32(base, XHCI_HCSPARAMS1);
     unsigned int snpsid = R32(base, DWC3_GSNPSID);
     g_usb_caplen[idx] = caplen; g_usb_ver[idx] = ver;
@@ -159,7 +166,7 @@ int rp1usb_xhci_init(void)
 {
     unsigned long base = RP1_USB0;
     g_xhci_base = base;
-    unsigned int caplen = R8(base, XHCI_CAPLENGTH);
+    unsigned int caplen = xcaplen(base);
     g_oper = base + caplen;
     g_rt   = base + (R32(base, CAP_RTSOFF) & ~0x1Fu);
     g_db   = base + (R32(base, CAP_DBOFF)  & ~0x3u);
@@ -393,6 +400,11 @@ int rp1usb_get_descriptor(int slot, int dtype, int dindex, int len)
 unsigned int rp1usb_desc_cc(void)    { return g_desc_cc; }
 unsigned int rp1usb_desc_len(void)   { return g_desc_len; }
 unsigned int rp1usb_desc_byte(int i) { return (i>=0&&i<256)?g_xfer_buf[i]:0; }
+
+/* Read-only register offsets (for diagnosing the xHCI init alignment fault). */
+unsigned int rp1usb_rtsoff(void){ return R32(RP1_USB0, CAP_RTSOFF); }
+unsigned int rp1usb_dboff(void) { return R32(RP1_USB0, CAP_DBOFF);  }
+unsigned int rp1usb_hccp1(void) { return R32(RP1_USB0, XHCI_HCCPARAMS1); }
 
 /* On-screen accessors (HDMI, since serial is unreliable). */
 unsigned int rp1usb_caplen(int i){ return (i>=0&&i<2)?g_usb_caplen[i]:0; }

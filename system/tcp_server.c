@@ -509,7 +509,14 @@ static int http_build(const char *req, char *out, int max)
         extern int rp1usb_ctx_stride(void);
         ctype = "text/plain";
         /* Re-triggerable bring-up steps (iterate without reflashing): */
-        if (str_starts(rpath, "/usb/reset")) {
+        if (str_starts(rpath, "/usb/init")) {
+            extern int rp1usb_xhci_init(void);
+            int r = rp1usb_xhci_init();
+            bl = s_put(body, bl, "xhci_init -> "); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " USBSTS="); bl = s_putdec(body, bl, rp1usb_usbsts());
+            bl = s_put(body, bl, " running="); bl = s_putdec(body, bl, rp1usb_running());
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/reset")) {
             extern int rp1usb_enum_slot(int);
             int p = q_int(req, "port", 2);
             int r = rp1usb_enum_slot(p);
@@ -548,6 +555,10 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " caplen=");  bl = s_putdec(body, bl, rp1usb_caplen(0));
         bl = s_put(body, bl, " dwc3id=");  bl = s_putdec(body, bl, rp1usb_snpsid(0));
         bl = s_put(body, bl, " ctxstride="); bl = s_putdec(body, bl, rp1usb_ctx_stride());
+        { extern unsigned int rp1usb_rtsoff(void), rp1usb_dboff(void), rp1usb_hccp1(void);
+          bl = s_put(body, bl, " rtsoff="); bl = s_putdec(body, bl, rp1usb_rtsoff());
+          bl = s_put(body, bl, " dboff=");  bl = s_putdec(body, bl, rp1usb_dboff());
+          bl = s_put(body, bl, " hccp1=");  bl = s_putdec(body, bl, rp1usb_hccp1()); }
         bl = s_put(body, bl, "\nUSBSTS="); bl = s_putdec(body, bl, rp1usb_usbsts());
         bl = s_put(body, bl, " running="); bl = s_putdec(body, bl, rp1usb_running());
         bl = s_put(body, bl, " connected="); bl = s_putdec(body, bl, rp1usb_connected());
