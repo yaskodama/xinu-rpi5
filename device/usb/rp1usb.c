@@ -408,6 +408,7 @@ static unsigned char  g_mouse_buf[8] __attribute__((aligned(64)));
 static unsigned int   g_setcfg_cc, g_cfgep_cc, g_setproto_cc;
 static int            g_mouse_slot, g_mouse_active;   /* defined below; fwd for hid_setup */
 static unsigned long  g_mouse_reports;
+static int            g_last_btn, g_last_dx, g_last_dy;
 static void           ep1_queue_trb(void);
 
 /* EP0 control transfer with NO data stage (SET_CONFIGURATION, SET_PROTOCOL). */
@@ -533,6 +534,7 @@ void rp1usb_mouse_pump(void)
             int dx = (int)(signed char)g_mouse_buf[1];
             int dy = (int)(signed char)g_mouse_buf[2];
             g_mouse_reports++;
+            g_last_btn=btn; g_last_dx=dx; g_last_dy=dy;
             if (dx || dy || btn) xhci_mouse_event(btn, dx, dy);
             ep1_queue_trb();
             R32(g_db, g_mouse_slot*4) = 3;          /* re-ring EP1 doorbell */
@@ -542,6 +544,12 @@ void rp1usb_mouse_pump(void)
 }
 unsigned long rp1usb_mouse_reports(void){ return g_mouse_reports; }
 int           rp1usb_mouse_on(void)     { return g_mouse_active; }
+int           rp1usb_last_btn(void)     { return g_last_btn; }
+int           rp1usb_last_dx(void)      { return g_last_dx; }
+int           rp1usb_last_dy(void)      { return g_last_dy; }
+/* live snapshot of the ring cursors so we can see whether events arrive */
+int           rp1usb_evt_idx(void)      { return g_evt_idx; }
+int           rp1usb_ep1_idx_get(void)  { return g_ep1_idx; }
 
 /* Read-only register offsets (for diagnosing the xHCI init alignment fault). */
 unsigned int rp1usb_rtsoff(void){ return R32(RP1_USB0, CAP_RTSOFF); }

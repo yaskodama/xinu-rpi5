@@ -597,6 +597,16 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " slotCC=");  bl = s_putdec(body, bl, rp1usb_enum_cc());
         bl = s_put(body, bl, " slot=");    bl = s_putdec(body, bl, rp1usb_enum_slotid());
         bl = s_put(body, bl, " addrDevCC="); bl = s_putdec(body, bl, rp1usb_addr_cc());
+        { extern unsigned long rp1usb_mouse_reports(void);
+          extern int rp1usb_mouse_on(void), rp1usb_last_btn(void), rp1usb_last_dx(void),
+                     rp1usb_last_dy(void), rp1usb_evt_idx(void), rp1usb_ep1_idx_get(void);
+          bl = s_put(body, bl, "\nmouse: active="); bl = s_putdec(body, bl, rp1usb_mouse_on());
+          bl = s_put(body, bl, " reports="); bl = s_putdec(body, bl, (int)rp1usb_mouse_reports());
+          bl = s_put(body, bl, " lastbtn="); bl = s_putdec(body, bl, rp1usb_last_btn());
+          bl = s_put(body, bl, " lastdx="); bl = s_putdec(body, bl, rp1usb_last_dx());
+          bl = s_put(body, bl, " lastdy="); bl = s_putdec(body, bl, rp1usb_last_dy());
+          bl = s_put(body, bl, " evtidx="); bl = s_putdec(body, bl, rp1usb_evt_idx());
+          bl = s_put(body, bl, " ep1idx="); bl = s_putdec(body, bl, rp1usb_ep1_idx_get()); }
         bl = s_put(body, bl, "\n");
         }
     } else if (str_starts(rpath, "/api/actors-gc")) {
