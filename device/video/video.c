@@ -239,6 +239,79 @@ void video_present(void)
     for (; i < n; i++) dst[i] = src[i];
 }
 
+/* ---- decoupled hardware-style cursor ----------------------------------------
+ * The slow full-frame flip caps how often the cursor reaches HDMI.  Instead we
+ * keep the cursor OUT of the composited back buffer and stamp it straight onto
+ * the visible framebuffer many times between flips, erasing its old spot by
+ * copying the composited pixels back from the off-screen buffer.  This makes the
+ * pointer move at the (fast) cursor-redraw rate, not the (slow) flip rate. */
+#define VID_CURW 12
+#define VID_CURH 12
+static const unsigned char vid_cursor[VID_CURH][VID_CURW] = {
+    {1,2,0,0,0,0,0,0,0,0,0,0},{1,1,2,0,0,0,0,0,0,0,0,0},
+    {1,1,1,2,0,0,0,0,0,0,0,0},{1,1,1,1,2,0,0,0,0,0,0,0},
+    {1,1,1,1,1,2,0,0,0,0,0,0},{1,1,1,1,1,1,2,0,0,0,0,0},
+    {1,1,1,1,1,1,1,2,0,0,0,0},{1,1,1,1,1,1,1,1,2,0,0,0},
+    {1,1,1,1,1,2,2,2,2,0,0,0},{1,1,2,1,1,2,0,0,0,0,0,0},
+    {1,2,0,2,1,1,2,0,0,0,0,0},{2,0,0,0,2,1,1,2,0,0,0,0},
+};
+static int vid_cur_x = -10000, vid_cur_y = -10000;   /* where it's currently stamped */
+static int vid_cur_vis = 0;
+
+static void vid_restore(int x, int y)                /* back-buffer pixels -> front */
+{
+    if (!fb_back) return;
+    for (int r = 0; r < VID_CURH; r++) {
+        int yy = y + r; if (yy < 0 || yy >= (int)fb_height) continue;
+        for (int c = 0; c < VID_CURW; c++) {
+            int xx = x + c; if (xx < 0 || xx >= (int)fb_width) continue;
+            *(volatile unsigned int *)(fb_base + yy*fb_pitch + xx*4) =
+            *(volatile unsigned int *)(fb_back + yy*fb_pitch + xx*4);
+        }
+    }
+}
+
+/* Stamp the cursor at (x,y) on the visible buffer, erasing the previous spot. */
+void video_cursor_to_front(int x, int y, int visible)
+{
+    if (!fb_ready || !fb_back) return;
+    if (vid_cur_x > -10000) vid_restore(vid_cur_x, vid_cur_y);   /* erase old */
+    vid_cur_vis = visible;
+    if (visible) {
+        for (int r = 0; r < VID_CURH; r++) {
+            int yy = y + r; if (yy < 0 || yy >= (int)fb_height) continue;
+            for (int c = 0; c < VID_CURW; c++) {
+                int xx = x + c; if (xx < 0 || xx >= (int)fb_width) continue;
+                unsigned char p = vid_cursor[r][c];
+                if (!p) continue;
+                *(volatile unsigned int *)(fb_base + yy*fb_pitch + xx*4) =
+                    p == 1 ? 0xFFFFFFFFu : 0xFF000000u;
+            }
+        }
+    }
+    vid_cur_x = x; vid_cur_y = y;
+}
+
+/* Flip the composed frame to HDMI but leave the live cursor rect untouched so a
+ * directly-stamped cursor survives the flip (no per-frame cursor flicker). */
+void video_present_hole(void)
+{
+    if (!fb_ready || fb_draw == fb_base) return;
+    int hx = vid_cur_x, hy = vid_cur_y, hw = VID_CURW, hh = VID_CURH;
+    int has_hole = vid_cur_vis && vid_cur_x > -10000;
+    for (unsigned int y = 0; y < fb_height; y++) {
+        unsigned int *d = (unsigned int *)(fb_base + y*fb_pitch);
+        unsigned int *s = (unsigned int *)(fb_draw + y*fb_pitch);
+        if (!has_hole || (int)y < hy || (int)y >= hy + hh) {
+            for (unsigned int x = 0; x < fb_width; x++) d[x] = s[x];   /* whole row */
+        } else {
+            int x0 = hx < 0 ? 0 : hx, x1 = hx + hw > (int)fb_width ? (int)fb_width : hx + hw;
+            for (int x = 0; x < x0; x++) d[x] = s[x];
+            for (unsigned int x = x1; x < fb_width; x++) d[x] = s[x];   /* skip the cursor */
+        }
+    }
+}
+
 /* Viewport offset: subtracted from every virtual-coord input
  * before it touches the framebuffer.  All primitives also clip
  * to [0, fb_width) × [0, fb_height) so off-screen geometry

@@ -7,6 +7,11 @@
 #define DEFAULT_FPS    60            /* cap; the loop runs as fast as the
                                        * redraw allows so the 100 Hz mouse pump
                                        * shows up smoothly (was 20 = choppy)   */
+/* Between each (slow) full-frame flip, re-stamp the decoupled cursor this many
+ * times at this spacing — the cursor then tracks the 100 Hz mouse pump instead
+ * of the much slower window-compose rate. */
+#define CURSOR_SUBFRAMES 8
+#define CURSOR_SUBMS     2
 
 static window_t *wm_head;
 static void    (*wm_tick)(void);
@@ -261,9 +266,17 @@ void wm_run(void)
             if (w->draw_content) w->draw_content(w, frame);
         }
 
-        draw_cursor();   /* screen-space overlay, always on top */
-        video_present(); /* flip the finished off-screen frame to HDMI */
-        delay_ms(1000 / DEFAULT_FPS);
+        /* Cursor is NOT baked into the back buffer (no draw_cursor here): flip
+         * the composed frame keeping the live cursor rect intact, then stamp the
+         * cursor straight onto HDMI several times before the next slow flip so it
+         * tracks the mouse smoothly instead of at the flip rate. */
+        (void)draw_cursor;                       /* retained for reference */
+        video_present_hole();
+        for (int k = 0; k < CURSOR_SUBFRAMES; k++) {
+            extern void video_cursor_to_front(int, int, int);
+            video_cursor_to_front(cursor_x, cursor_y, cursor_visible);
+            delay_ms(CURSOR_SUBMS);
+        }
         frame++;
     }
 }

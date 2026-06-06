@@ -53,6 +53,10 @@ unsigned int video_screen_height(void);
  * enable once, then present() at the end of every rendered frame. */
 int  video_enable_backbuffer(void);
 void video_present(void);
+/* Flip everything except the live cursor rect (so a directly-stamped cursor
+ * survives the flip), and stamp the decoupled cursor straight onto HDMI. */
+void video_present_hole(void);
+void video_cursor_to_front(int x, int y, int visible);
 
 /* Viewport (camera) on a larger virtual desktop.  All drawing
  * primitives below (fill_rect / draw_rect / draw_string_at /
