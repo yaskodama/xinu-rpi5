@@ -557,6 +557,25 @@ static int http_build(const char *req, char *out, int max)
             int dl = (int)rp1usb_desc_len();
             for (int i=0;i<dl && i<48 && bl<600;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_desc_byte(i)); }
             bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/hidsetup")) {
+            extern int rp1usb_hid_setup(int,int,int,int);
+            extern unsigned int rp1usb_setcfg_cc(void), rp1usb_cfgep_cc(void), rp1usb_setproto_cc(void);
+            int slot=q_int(req,"slot",2), port=q_int(req,"port",1);
+            int speed=q_int(req,"speed",1), mps=q_int(req,"mps",8);
+            rp1usb_hid_setup(slot, port, speed, mps);
+            bl = s_put(body, bl, "hidsetup setcfgCC="); bl = s_putdec(body, bl, rp1usb_setcfg_cc());
+            bl = s_put(body, bl, " cfgepCC=");  bl = s_putdec(body, bl, rp1usb_cfgep_cc());
+            bl = s_put(body, bl, " setprotoCC="); bl = s_putdec(body, bl, rp1usb_setproto_cc());
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/mouse")) {
+            extern int rp1usb_poll_mouse(int);
+            extern unsigned int rp1usb_mouse_byte(int);
+            int slot=q_int(req,"slot",2);
+            int n = rp1usb_poll_mouse(slot);
+            bl = s_put(body, bl, "mouse report len="); bl = s_putdec(body, bl, n);
+            bl = s_put(body, bl, " bytes:");
+            for (int i=0;i<4;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_mouse_byte(i)); }
+            bl = s_put(body, bl, "\n");
         } else {
         bl = s_put(body, bl, "hciver=");   bl = s_putdec(body, bl, rp1usb_ver(0));
         bl = s_put(body, bl, " ports=");   bl = s_putdec(body, bl, rp1usb_ports(0));

@@ -401,6 +401,86 @@ unsigned int rp1usb_desc_cc(void)    { return g_desc_cc; }
 unsigned int rp1usb_desc_len(void)   { return g_desc_len; }
 unsigned int rp1usb_desc_byte(int i) { return (i>=0&&i<256)?g_xfer_buf[i]:0; }
 
+/* ---------- Phase 3e: SET_CONFIGURATION + Configure Endpoint + HID poll ---------- */
+static struct trb     g_ep1_ring[16] __attribute__((aligned(64)));
+static int            g_ep1_idx, g_ep1_cycle = 1;
+static unsigned char  g_mouse_buf[8] __attribute__((aligned(64)));
+static unsigned int   g_setcfg_cc, g_cfgep_cc, g_setproto_cc;
+
+/* EP0 control transfer with NO data stage (SET_CONFIGURATION, SET_PROTOCOL). */
+static int control_nodata(int slot, unsigned int bmReqType, unsigned int bReq,
+                          unsigned int wValue, unsigned int wIndex)
+{
+    ep0_push(bmReqType | (bReq<<8) | (wValue<<16), wIndex, 8, (2u<<10)|(1u<<6)|(0u<<16));
+    ep0_push(0,0,0, (4u<<10)|(1u<<16)|(1u<<5));    /* Status IN + IOC */
+    R32(g_db, slot*4) = 1;                          /* EP0 = DCI 1 */
+    __asm__ volatile ("dsb sy":::"memory");
+    struct trb ev = event_wait(32);
+    return ((ev.status>>24)&0xff) == 1 ? 0 : -1;
+}
+
+/* SET_CONFIGURATION(1) + Configure-Endpoint to add the interrupt-IN EP1 (DCI 3)
+ * + SET_PROTOCOL(boot).  `mps` = the HID endpoint's wMaxPacketSize. */
+int rp1usb_hid_setup(int slot, int port, int speed, int mps)
+{
+    g_setcfg_cc = (control_nodata(slot, 0x00, 9, 1, 0) == 0) ? 1 : 0;  /* SET_CONFIG 1 */
+
+    /* EP1 IN transfer ring + link TRB. */
+    for (int i=0;i<16;i++){ g_ep1_ring[i].p0=0;g_ep1_ring[i].p1=0;g_ep1_ring[i].status=0;g_ep1_ring[i].control=0; }
+    g_ep1_ring[15].p0=(unsigned)(XDA(g_ep1_ring)&0xffffffff);
+    g_ep1_ring[15].p1=(unsigned)(XDA(g_ep1_ring)>>32);
+    g_ep1_ring[15].control=(6u<<10)|(1u<<1)|1u;
+    g_ep1_idx=0; g_ep1_cycle=1;
+
+    /* Input context: Add slot (A0) + EP1-IN/DCI3 (A3). */
+    for (unsigned i=0;i<sizeof g_input_ctx;i++) g_input_ctx[i]=0;
+    unsigned int *icc=ctx_at(g_input_ctx,0); icc[1]=(1u<<0)|(1u<<3);
+    unsigned int *sc=ctx_at(g_input_ctx,1);
+    sc[0]=(3u<<27)|((unsigned)speed<<20);          /* context entries = 3 */
+    sc[1]=((unsigned)port&0xff)<<16;
+    unsigned int *ep=ctx_at(g_input_ctx,4);        /* DCI 3 -> input index 4 */
+    ep[0]=(7u<<16);                                 /* Interval ~ (2^7 * 125us = 16ms) */
+    ep[1]=(7u<<3)|(3u<<1)|((unsigned)mps<<16);      /* Interrupt-IN, CErr=3, MPS */
+    unsigned long trd=XDA(g_ep1_ring)|1u;
+    ep[2]=(unsigned)(trd&0xffffffff); ep[3]=(unsigned)(trd>>32);
+    ep[4]=(unsigned)mps;
+    g_dcbaa[slot]=XDA(g_dev_ctx);
+    __asm__ volatile ("dsb sy":::"memory");
+    unsigned long ic=XDA(g_input_ctx);
+    cmd_submit((unsigned)(ic&0xffffffff),(unsigned)(ic>>32),0,(12u<<10)|((unsigned)slot<<24)); /* Configure Endpoint */
+    struct trb ev=event_wait(33);
+    g_cfgep_cc=(ev.status>>24)&0xff;
+
+    g_setproto_cc = (control_nodata(slot, 0x21, 0x0B, 0, 0) == 0) ? 1 : 0;  /* SET_PROTOCOL boot */
+    return (g_cfgep_cc==1)?0:-1;
+}
+
+/* Queue one interrupt-IN transfer and wait for the boot-mouse report.  Blocks
+ * (deadline-bounded) until the mouse sends data, so move the mouse to get one.
+ * Returns the report length, or <=0 on error/timeout. */
+int rp1usb_poll_mouse(int slot)
+{
+    for (int i=0;i<8;i++) g_mouse_buf[i]=0;
+    struct trb *t=&g_ep1_ring[g_ep1_idx];
+    unsigned long ba=XDA(g_mouse_buf);
+    t->p0=(unsigned)(ba&0xffffffff); t->p1=(unsigned)(ba>>32);
+    t->status=8;
+    t->control=(1u<<10)|(1u<<5)|(g_ep1_cycle&1u);  /* Normal TRB + IOC */
+    __asm__ volatile ("dsb sy":::"memory");
+    g_ep1_idx++;
+    if (g_ep1_idx==15){ g_ep1_ring[15].control=(g_ep1_ring[15].control&~1u)|(g_ep1_cycle&1u); __asm__ volatile("dsb sy":::"memory"); g_ep1_idx=0; g_ep1_cycle^=1; }
+    R32(g_db, slot*4)=3;                            /* EP1 IN = DCI 3 */
+    __asm__ volatile ("dsb sy":::"memory");
+    struct trb ev=event_wait(32);
+    unsigned cc=(ev.status>>24)&0xff;
+    unsigned residual=ev.status&0xffffff;
+    return (cc==1||cc==13)?(int)(8-residual):-(int)cc;   /* 13 = short packet (fine) */
+}
+unsigned int rp1usb_setcfg_cc(void) { return g_setcfg_cc; }
+unsigned int rp1usb_cfgep_cc(void)  { return g_cfgep_cc; }
+unsigned int rp1usb_setproto_cc(void){ return g_setproto_cc; }
+unsigned int rp1usb_mouse_byte(int i){ return (i>=0&&i<8)?g_mouse_buf[i]:0; }
+
 /* Read-only register offsets (for diagnosing the xHCI init alignment fault). */
 unsigned int rp1usb_rtsoff(void){ return R32(RP1_USB0, CAP_RTSOFF); }
 unsigned int rp1usb_dboff(void) { return R32(RP1_USB0, CAP_DBOFF);  }
