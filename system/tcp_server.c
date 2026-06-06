@@ -518,9 +518,11 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, " c0p2="); bl = s_putdec(body, bl, rp1usb_portsc(0,1));
             bl = s_put(body, bl, "\n");
         } else if (str_starts(rpath, "/usb/init")) {
-            extern int rp1usb_xhci_init(void);
+            extern int rp1usb_xhci_init(void); extern void rp1usb_select_ctrl(int);
+            rp1usb_select_ctrl(q_int(req,"ctrl",0));   /* 0=usb0, 1=usb1 */
             int r = rp1usb_xhci_init();
-            bl = s_put(body, bl, "xhci_init -> "); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, "xhci_init ctrl="); bl = s_putdec(body, bl, q_int(req,"ctrl",0));
+            bl = s_put(body, bl, " -> "); bl = s_putdec(body, bl, r);
             bl = s_put(body, bl, " USBSTS="); bl = s_putdec(body, bl, rp1usb_usbsts());
             bl = s_put(body, bl, " running="); bl = s_putdec(body, bl, rp1usb_running());
             bl = s_put(body, bl, "\n");

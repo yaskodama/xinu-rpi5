@@ -143,7 +143,9 @@ struct trb { unsigned int p0, p1, status, control; };
 #define NSCRATCH_MAX 64
 
 static unsigned long  g_xhci_base;
+static unsigned long  g_sel_base = RP1_USB0;   /* which DWC3/xHCI controller to init */
 static unsigned long  g_oper, g_rt, g_db;
+void rp1usb_select_ctrl(int which){ g_sel_base = (which==1)?RP1_USB1:RP1_USB0; }
 static unsigned long long g_dcbaa[256]      __attribute__((aligned(64)));
 static struct trb     g_cmd_ring[CMD_RING_N] __attribute__((aligned(64)));
 static struct trb     g_evt_ring[EVT_RING_N] __attribute__((aligned(64)));
@@ -166,7 +168,7 @@ static void xdelay(unsigned long us)
 
 int rp1usb_xhci_init(void)
 {
-    unsigned long base = RP1_USB0;
+    unsigned long base = g_sel_base ? g_sel_base : RP1_USB0;
     g_xhci_base = base;
     unsigned int caplen = xcaplen(base);
     g_oper = base + caplen;
