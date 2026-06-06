@@ -619,6 +619,20 @@ int rp1usb_mouse_fullsetup(int port)
 int rp1usb_full_slot(void) { return g_full_slot; }
 int rp1usb_full_speed(void){ return g_full_speed; }
 
+/* One-shot boot auto-bind: bring up usb1 (where the mouse lives) and scan its
+ * ports for a HID mouse, binding the first one found.  Called once from
+ * genet_rx_tick a few seconds into boot (after networking settles).  Returns the
+ * usb1 port the mouse bound on, or <0 if none. */
+int rp1usb_autostart(void)
+{
+    rp1usb_select_ctrl(1);
+    if (rp1usb_xhci_init() != 0) return -1;
+    for (int p = 1; p <= 3; p++) {
+        if (rp1usb_mouse_fullsetup(p) == 0 && g_mouse_active) return p;
+    }
+    return -2;
+}
+
 /* periodic-schedule clock: if MFINDEX advances, the controller IS running the
  * (micro)frame timer that drives interrupt endpoints. */
 unsigned int rp1usb_mfindex(void){ return R32(g_rt, 0) & 0x3fff; }

@@ -206,7 +206,20 @@ static void genet_rx_tick(void)
     dhcp_drive();          /* run the DHCP state machine (rate-limited inside) */
     gc_drive();            /* periodic global actor GC (rate-limited inside)   */
 #ifdef RP1_ETH_BASE
-    { extern void rp1usb_mouse_pump(void); rp1usb_mouse_pump(); }  /* USB mouse -> cursor */
+    {
+        extern void rp1usb_mouse_pump(void);
+        extern int  rp1usb_autostart(void);
+        static int  s_usb_autoinit = 0;
+        /* One-shot: ~5 s after boot (net settled), bring up usb1 + auto-bind the
+         * mouse.  Runs here in the timer ISR like the rest of USB, off the early-
+         * boot path that used to crash.  Set the flag first so a stall can't
+         * re-enter via a nested tick. */
+        if (!s_usb_autoinit && timer_ticks() > 500) {
+            s_usb_autoinit = 1;
+            rp1usb_autostart();
+        }
+        rp1usb_mouse_pump();                                       /* USB mouse -> cursor */
+    }
 #endif
     g_rx_busy = 0;
 }
