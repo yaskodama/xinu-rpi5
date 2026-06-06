@@ -270,13 +270,10 @@ void wm_run(void)
          * the composed frame keeping the live cursor rect intact, then stamp the
          * cursor straight onto HDMI several times before the next slow flip so it
          * tracks the mouse smoothly instead of at the flip rate. */
-        (void)draw_cursor;                       /* retained for reference */
-        video_present_hole();
-        for (int k = 0; k < CURSOR_SUBFRAMES; k++) {
-            extern void video_cursor_to_front(int, int, int);
-            video_cursor_to_front(cursor_x, cursor_y, cursor_visible);
-            delay_ms(CURSOR_SUBMS);
-        }
+        (void)draw_cursor; (void)CURSOR_SUBFRAMES; (void)CURSOR_SUBMS;  /* retained */
+        video_present_hole();                    /* flip, keeping the live cursor */
+        video_cursor_to_front(cursor_x, cursor_y, cursor_visible);  /* re-stamp after flip */
+        delay_ms(1000 / DEFAULT_FPS);
         frame++;
     }
 }

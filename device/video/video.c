@@ -257,6 +257,7 @@ static const unsigned char vid_cursor[VID_CURH][VID_CURW] = {
 };
 static int vid_cur_x = -10000, vid_cur_y = -10000;   /* where it's currently stamped */
 static int vid_cur_vis = 0;
+static volatile int vid_presenting = 0;              /* 1 while a flip is in progress */
 
 static void vid_restore(int x, int y)                /* back-buffer pixels -> front */
 {
@@ -275,6 +276,7 @@ static void vid_restore(int x, int y)                /* back-buffer pixels -> fr
 void video_cursor_to_front(int x, int y, int visible)
 {
     if (!fb_ready || !fb_back) return;
+    if (vid_presenting) return;          /* don't race the full-frame flip */
     if (vid_cur_x > -10000) vid_restore(vid_cur_x, vid_cur_y);   /* erase old */
     vid_cur_vis = visible;
     if (visible) {
@@ -297,6 +299,7 @@ void video_cursor_to_front(int x, int y, int visible)
 void video_present_hole(void)
 {
     if (!fb_ready || fb_draw == fb_base) return;
+    vid_presenting = 1;                  /* block the ISR cursor stamp while we flip */
     int hx = vid_cur_x, hy = vid_cur_y, hw = VID_CURW, hh = VID_CURH;
     int has_hole = vid_cur_vis && vid_cur_x > -10000;
     for (unsigned int y = 0; y < fb_height; y++) {
@@ -310,6 +313,7 @@ void video_present_hole(void)
             for (unsigned int x = x1; x < fb_width; x++) d[x] = s[x];   /* skip the cursor */
         }
     }
+    vid_presenting = 0;
 }
 
 /* Viewport offset: subtracted from every virtual-coord input

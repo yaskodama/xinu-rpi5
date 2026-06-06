@@ -13,8 +13,8 @@
 #ifndef XINU_RPI5_VIDEO_H
 #define XINU_RPI5_VIDEO_H
 
-#define SCREEN_WIDTH    1920
-#define SCREEN_HEIGHT   1080
+#define SCREEN_WIDTH    1280   /* 720p: smaller frame -> much faster uncached flip */
+#define SCREEN_HEIGHT   720
 #define SCREEN_DEPTH    32
 #define FONT_WIDTH      8
 #define FONT_HEIGHT     8
