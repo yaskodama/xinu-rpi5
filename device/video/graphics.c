@@ -75,8 +75,13 @@ void graphics_draw(window_t *self, unsigned int frame)
     int ch = self->height - WM_TITLEBAR_H - 3;
     int cx = self->x + 1 + cw / 2;
     int cy = self->y + WM_TITLEBAR_H + 2 + ch / 2;
-    int S  = (cw < ch ? cw : ch) / 2 - 20;     /* model radius 100 -> S pixels */
-    if (S < 10) return;
+    /* Scale to the model's bounding-sphere radius (the farthest profile point
+     * from the origin) so NO rotation can push the glass past the window: at any
+     * angle a point's projected distance is <= MAXR*S/100 = half. */
+    #define MAXR 122
+    int half = (cw < ch ? cw : ch) / 2 - 6;    /* leave a small margin */
+    int S = half * 100 / MAXR;                 /* MAXR model units -> `half` px */
+    if (S < 5) return;
 
     static int px[NP][NS], py[NP][NS];
     for (int i = 0; i < NP; i++) {
