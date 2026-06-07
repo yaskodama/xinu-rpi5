@@ -116,22 +116,17 @@ void uart_init(void)
 
 void uart_putc(char c)
 {
-    /* Busy-wait until the TX FIFO has room. */
+    /* HDMI is the real display here, so update it FIRST (instant) and only then
+     * push the byte out the UART — otherwise every echoed keystroke is paced by
+     * the 115200-baud TX FIFO, which makes typing feel laggy on screen. */
+    shellwin_record_char(c);   /* wm shell window ring — safe before init (drops) */
+    screen_putc(c);            /* text console — no-op before video_init()        */
+
+    /* UART TX last: busy-wait for FIFO room, then send (doesn't hold up HDMI). */
     while (UART_FR & FR_TXFF) {
         /* spin */
     }
     UART_DR = (unsigned int)(unsigned char)c;
-
-    /* Mirror to the HDMI console once video_init() has succeeded
-     * (after that point screen_putc is safe; before, it's a no-op).
-     * This is the whole point of the framebuffer driver — keeping
-     * a parallel log channel in case the UART cable is silent on
-     * this particular Pi 5 board. */
-    screen_putc(c);
-
-    /* Also feed the wm shell window's scrollback ring.  Safe to
-     * call before shellwin_init() — it just drops the byte then. */
-    shellwin_record_char(c);
 }
 
 void uart_puts(const char *s)
