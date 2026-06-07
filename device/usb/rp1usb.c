@@ -732,15 +732,19 @@ int rp1usb_autostart(void)
 {
     g_bind_ctxs[0] = g_dev_ctx; g_bind_ctxs[1] = g_kdevctx;
     g_nbound = 0;
-    g_mouse_active = 0; g_kbd_active = 0;   /* clear so a re-run re-binds fresh */
+    g_mouse_active = 0; g_kbd_active = 0;   /* clear so this run re-binds fresh */
     g_autostart_active = 1;
-    /* usb1 first (commonly the mouse), then usb0 (keyboard + the boot stick).
-     * Each controller has its own ring memory, so initialising the second does
-     * not disturb a device already bound on the first. */
+    /* IMPORTANT: HCRST-resetting a controller that already has a working device
+     * tends to leave the OTHER controller's device not delivering.  So init each
+     * controller AT MOST ONCE; on every (re-)run just re-enumerate + re-bind the
+     * ports (port reset + Address + Configure-Endpoint), which is what reliably
+     * gets a device delivering again. */
     rp1usb_select_ctrl(1);
-    if (rp1usb_xhci_init() == 0) autostart_scan_current_ctrl();
+    if (!g_cm[1].inited) rp1usb_xhci_init();
+    if (g_cm[1].inited) autostart_scan_current_ctrl();
     rp1usb_select_ctrl(0);
-    if (rp1usb_xhci_init() == 0) autostart_scan_current_ctrl();
+    if (!g_cm[0].inited) rp1usb_xhci_init();
+    if (g_cm[0].inited) autostart_scan_current_ctrl();
     g_addr_ctx = g_dev_ctx;                              /* restore default for manual paths */
     g_autostart_active = 0;
     return g_nbound;

@@ -213,15 +213,15 @@ static void genet_rx_tick(void)
         static int  s_usb_tries = 0;
         static unsigned long s_usb_next = 500;   /* first attempt ~5 s after boot */
         unsigned long t = timer_ticks();
-        /* Bind USB off the early-boot path that used to crash.  Binding is flaky
-         * (a device sometimes fails to enumerate or binds but never delivers), so
-         * keep re-running the full both-controller bind every ~2.5 s until BOTH
-         * the mouse and keyboard are bound, up to a handful of attempts. */
-        if (s_usb_tries < 8 && t >= s_usb_next) {
-            int n = rp1usb_autostart();          /* re-inits both controllers + binds */
+        /* Bind USB off the early-boot path that used to crash.  autostart inits
+         * each controller once and then just re-enumerates+re-binds; a single
+         * bind often comes up "bound but not delivering", and a re-bind fixes it.
+         * So run it a few times spaced out (NOT stopping at bound==2, which does
+         * not imply the device is actually delivering reports yet). */
+        if (s_usb_tries < 5 && t >= s_usb_next) {
+            rp1usb_autostart();
             s_usb_tries++;
-            if (n >= 2) s_usb_tries = 99;        /* both bound -> stop retrying */
-            else s_usb_next = t + 250;           /* otherwise retry in ~2.5 s */
+            s_usb_next = t + 250;                /* ~2.5 s between attempts */
         }
         rp1usb_mouse_pump();                                       /* USB mouse -> cursor */
     }
