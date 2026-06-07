@@ -48,6 +48,7 @@
 #include "timer.h"
 #include "wm.h"
 #include "genet.h"
+#include "vfs.h"
 
 /* Linker-script symbols (from kernel/link.ld).  `_end` is already
  * declared (as `unsigned char _end[]`) by memory.h, which we include
@@ -141,6 +142,94 @@ static int cmd_help(int argc, char **argv)
         uart_puts(commandtab[i].help);
         uart_puts("\n");
     }
+    return 0;
+}
+
+/* ---------- hierarchical filesystem: pwd / cd / ls / cat ---------- */
+
+static char g_cwd[128] = "/";          /* shell current directory (absolute) */
+
+/* Resolve `arg` (absolute or relative to g_cwd) into a normalized absolute
+ * path in `out`, collapsing "." and "..". */
+static void fs_resolve(const char *arg, char *out, int outsz)
+{
+    char tmp[256]; int n = 0;
+    if (arg && arg[0] == '/') {
+        for (const char *p = arg; *p && n < (int)sizeof tmp - 1; p++) tmp[n++] = *p;
+    } else {
+        for (const char *p = g_cwd; *p && n < (int)sizeof tmp - 1; p++) tmp[n++] = *p;
+        if (n == 0 || tmp[n-1] != '/') if (n < (int)sizeof tmp - 1) tmp[n++] = '/';
+        for (const char *p = arg ? arg : ""; *p && n < (int)sizeof tmp - 1; p++) tmp[n++] = *p;
+    }
+    tmp[n] = 0;
+
+    char comp[32][32]; int top = 0;
+    char *s = tmp;
+    while (*s) {
+        while (*s == '/') s++;
+        if (!*s) break;
+        char *start = s;
+        while (*s && *s != '/') s++;
+        int len = (int)(s - start);
+        if (len == 1 && start[0] == '.') continue;
+        if (len == 2 && start[0] == '.' && start[1] == '.') { if (top > 0) top--; continue; }
+        if (len > 31) len = 31;
+        if (top < 32) { for (int i = 0; i < len; i++) comp[top][i] = start[i]; comp[top][len] = 0; top++; }
+    }
+    int o = 0;
+    if (top == 0) { if (outsz > 1) { out[0] = '/'; out[1] = 0; } return; }
+    for (int i = 0; i < top; i++) {
+        if (o < outsz - 1) out[o++] = '/';
+        for (char *c = comp[i]; *c && o < outsz - 1; c++) out[o++] = *c;
+    }
+    out[o] = 0;
+}
+
+static int cmd_pwd(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    uart_puts(g_cwd); uart_putc('\n');
+    return 0;
+}
+
+static int cmd_cd(int argc, char **argv)
+{
+    char path[128];
+    fs_resolve(argc >= 2 ? argv[1] : "/", path, sizeof path);
+    vfs_node_t *n = vfs_lookup(path);
+    if (!n)               { uart_puts("cd: no such path: "); uart_puts(argc>=2?argv[1]:"/"); uart_putc('\n'); return 0; }
+    if (n->kind != VFS_DIR){ uart_puts("cd: not a directory\n"); return 0; }
+    int i = 0; for (; path[i] && i < (int)sizeof g_cwd - 1; i++) g_cwd[i] = path[i]; g_cwd[i] = 0;
+    return 0;
+}
+
+static int cmd_ls(int argc, char **argv)
+{
+    char path[128];
+    fs_resolve(argc >= 2 ? argv[1] : "", path, sizeof path);
+    vfs_node_t *n = vfs_lookup(path);
+    if (!n) { uart_puts("ls: no such path: "); uart_puts(argc>=2?argv[1]:g_cwd); uart_putc('\n'); return 0; }
+    if (n->kind == VFS_FILE) { uart_puts(n->name); uart_putc('\n'); return 0; }
+    for (vfs_node_t *c = n->children; c; c = c->next) {
+        uart_puts(c->name);
+        if (c->kind == VFS_DIR) uart_putc('/');
+        uart_putc('\n');
+    }
+    return 0;
+}
+
+static int cmd_cat(int argc, char **argv)
+{
+    if (argc < 2) { uart_puts("usage: cat <file>\n"); return 0; }
+    char path[128];
+    fs_resolve(argv[1], path, sizeof path);
+    vfs_node_t *n = vfs_lookup(path);
+    if (!n)                { uart_puts("cat: no such file: "); uart_puts(argv[1]); uart_putc('\n'); return 0; }
+    if (n->kind != VFS_FILE){ uart_puts("cat: is a directory\n"); return 0; }
+    char buf[1024];
+    int r = vfs_read(n, buf, sizeof buf - 1);
+    for (int i = 0; i < r; i++) uart_putc(buf[i]);
+    uart_putc('\n');
     return 0;
 }
 
@@ -688,6 +777,10 @@ static const struct centry commandtab[] = {
     { "4lines", "spin 4 segments on a square's corners",   cmd_4lines },
     { "kodama", "spin 3D block text \"KODAMA\" (Graphics)", cmd_kodama },
     { "clear",  "clear the shell window",                  cmd_clear  },
+    { "pwd",    "print working directory",                 cmd_pwd    },
+    { "cd",     "cd <dir>  change directory",              cmd_cd     },
+    { "ls",     "ls [path]  list directory",               cmd_ls     },
+    { "cat",    "cat <file>  print file contents",         cmd_cat    },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },
