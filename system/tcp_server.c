@@ -16,6 +16,7 @@
 #include "genet.h"
 #include "actor.h"
 #include "vfs.h"
+#include "wm.h"
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
