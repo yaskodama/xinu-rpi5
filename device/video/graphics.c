@@ -97,9 +97,9 @@ static void draw_4lines(window_t *self)
 
 void graphics_draw(window_t *self, unsigned int frame)
 {
-    /* advance the spin ~ every 4 frames until 30 steps are done */
-    if (g_active && (frame - g_last_frame) >= 4) {
-        g_last_frame = frame;
+    /* advance the spin every frame (no wait) until 30 steps are done */
+    (void)frame;
+    if (g_active) {
         g_ax = (g_ax + 12) % 360;
         g_ay = (g_ay + 8)  % 360;
         g_az = (g_az + 5)  % 360;
