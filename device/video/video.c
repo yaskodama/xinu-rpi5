@@ -255,8 +255,8 @@ static const unsigned char vid_cursor[VID_CURH][VID_CURW] = {
     {1,1,1,1,1,2,2,2,2,0,0,0},{1,1,2,1,1,2,0,0,0,0,0,0},
     {1,2,0,2,1,1,2,0,0,0,0,0},{2,0,0,0,2,1,1,2,0,0,0,0},
 };
-static int vid_cur_x = -10000, vid_cur_y = -10000;   /* where it's currently stamped */
-static int vid_cur_vis = 0;
+static volatile int vid_cur_x = -10000, vid_cur_y = -10000;   /* where it's stamped (ISR-updated) */
+static volatile int vid_cur_vis = 0;
 static volatile int vid_presenting = 0;              /* 1 while a flip is in progress */
 
 static void vid_restore(int x, int y)                /* back-buffer pixels -> front */
@@ -276,7 +276,9 @@ static void vid_restore(int x, int y)                /* back-buffer pixels -> fr
 void video_cursor_to_front(int x, int y, int visible)
 {
     if (!fb_ready || !fb_back) return;
-    if (vid_presenting) return;          /* don't race the full-frame flip */
+    /* No present-guard: stamping during the flip keeps the pointer moving the
+     * whole frame instead of freezing for the ~10 ms flip.  present_hole skips
+     * the cursor rect, so the worst case is a 1-frame flicker on a fast flick. */
     if (vid_cur_x > -10000) vid_restore(vid_cur_x, vid_cur_y);   /* erase old */
     vid_cur_vis = visible;
     if (visible) {
@@ -299,16 +301,21 @@ void video_cursor_to_front(int x, int y, int visible)
 void video_present_hole(void)
 {
     if (!fb_ready || fb_draw == fb_base) return;
-    vid_presenting = 1;                  /* block the ISR cursor stamp while we flip */
-    int hx = vid_cur_x, hy = vid_cur_y, hw = VID_CURW, hh = VID_CURH;
-    int has_hole = vid_cur_vis && vid_cur_x > -10000;
+    vid_presenting = 1;
+    /* A small margin around the cursor so that even if the ISR nudges it between
+     * rows, the live cursor still lands inside the skipped band. */
+    const int MG = 10;
     for (unsigned int y = 0; y < fb_height; y++) {
         unsigned int *d = (unsigned int *)(fb_base + y*fb_pitch);
         unsigned int *s = (unsigned int *)(fb_draw + y*fb_pitch);
-        if (!has_hole || (int)y < hy || (int)y >= hy + hh) {
+        /* Re-read the cursor position every row so the hole tracks it live. */
+        int hx = vid_cur_x, hy = vid_cur_y;
+        int has_hole = vid_cur_vis && hx > -10000;
+        if (!has_hole || (int)y < hy - MG || (int)y >= hy + VID_CURH + MG) {
             for (unsigned int x = 0; x < fb_width; x++) d[x] = s[x];   /* whole row */
         } else {
-            int x0 = hx < 0 ? 0 : hx, x1 = hx + hw > (int)fb_width ? (int)fb_width : hx + hw;
+            int x0 = hx - MG;                 if (x0 < 0) x0 = 0;
+            int x1 = hx + VID_CURW + MG;      if (x1 > (int)fb_width) x1 = fb_width;
             for (int x = 0; x < x0; x++) d[x] = s[x];
             for (unsigned int x = x1; x < fb_width; x++) d[x] = s[x];   /* skip the cursor */
         }
