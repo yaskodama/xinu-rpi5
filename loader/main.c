@@ -206,6 +206,8 @@ static void genet_rx_tick(void)
 
     dhcp_drive();          /* run the DHCP state machine (rate-limited inside) */
     gc_drive();            /* periodic global actor GC (rate-limited inside)   */
+    { extern void wifi_net_poll(void);   /* drain WiFi RX + run its ARP/ICMP    */
+      wifi_net_poll(); }                 /* responder (no-op until wifi has IP) */
 #ifdef RP1_ETH_BASE
     {
         extern void rp1usb_mouse_pump(void);
@@ -1481,11 +1483,12 @@ void kernel_main(void)
         softkbd_win.draw_content = softkbd_draw;
         wm_add(&softkbd_win);
 
-        /* Graphics window — 3D wireframe wine glass driven by the `wine` cmd. */
-        graphics_win.x = 1336;
-        graphics_win.y = 305;
-        graphics_win.width  = 567;
-        graphics_win.height = 740;
+        /* Graphics window — 3D wireframe wine glass driven by the `wine` cmd.
+         * Geometry captured from the live (user-arranged) layout via /win/dump. */
+        graphics_win.x = 1334;
+        graphics_win.y = 300;
+        graphics_win.width  = 568;
+        graphics_win.height = 692;
         const char *gwt = "Graphics";
         for (int i = 0; i < WM_TITLE_MAX && gwt[i]; i++) graphics_win.title[i] = gwt[i];
         graphics_win.chrome_color = 0xFF60C0FFU;

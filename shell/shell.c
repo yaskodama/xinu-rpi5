@@ -49,6 +49,7 @@
 #include "wm.h"
 #include "genet.h"
 #include "vfs.h"
+#include "wifi.h"
 
 /* Linker-script symbols (from kernel/link.ld).  `_end` is already
  * declared (as `unsigned char _end[]`) by memory.h, which we include
@@ -858,6 +859,119 @@ static int cmd_halt(int argc, char **argv)
     for (;;) __asm__ volatile ("wfe");
 }
 
+/* ---------- WiFi: on / off / status / scan + wifi-invest ---------- */
+static char g_wifi_ssid[64];
+static char g_wifi_pass[80];
+static int  g_wifi_have_creds = 0;
+
+static void str_copy(char *dst, const char *src, int cap)
+{
+    int i = 0;
+    while (src[i] && i < cap - 1) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+static void puts_ip(const unsigned char *ip)
+{
+    int i;
+    for (i = 0; i < 4; i++) { if (i) uart_putc('.'); puts_dec(ip[i]); }
+}
+
+/* wifi on [ssid pass] | wifi off | wifi status | wifi scan */
+static int cmd_wifi(int argc, char **argv)
+{
+    if (argc < 2 || str_eq(argv[1], "status")) {
+        if (wifi_connected()) {
+            unsigned char ip[4]; wifi_ipaddr(ip);
+            uart_puts("wifi: connected  ssid=\""); uart_puts(wifi_ssid());
+            uart_puts("\"  ip="); puts_ip(ip); uart_putc('\n');
+        } else {
+            uart_puts("wifi: not connected\n");
+            if (argc < 2)
+                uart_puts("usage: wifi on <ssid> <pass> | wifi on | wifi off | wifi scan | wifi status\n");
+        }
+        return 0;
+    }
+    if (str_eq(argv[1], "off")) {
+        wifi_off();
+        uart_puts("wifi: off (radio down)\n");
+        return 0;
+    }
+    if (str_eq(argv[1], "scan")) {
+        int n;
+        uart_puts("wifi: bringing up radio + scanning...\n");
+        if (wifi_probe() != 0) { uart_puts("wifi: bring-up FAILED — run wifi-invest\n"); return 1; }
+        n = wifi_scan_run();
+        uart_puts("wifi: scan done — "); puts_dec(n);
+        uart_puts(" APs (full list: wifi-invest)\n");
+        return 0;
+    }
+    if (str_eq(argv[1], "on")) {
+        const char *ssid = 0, *pass = 0;
+        if (argc >= 4) {                 /* wifi on <ssid> <pass>: remember + use */
+            ssid = argv[2]; pass = argv[3];
+            str_copy(g_wifi_ssid, ssid, sizeof g_wifi_ssid);
+            str_copy(g_wifi_pass, pass, sizeof g_wifi_pass);
+            g_wifi_have_creds = 1;
+        } else if (g_wifi_have_creds) {  /* wifi on: reuse last creds (RAM only) */
+            ssid = g_wifi_ssid; pass = g_wifi_pass;
+        }
+        uart_puts("wifi: bringing up firmware (takes a few seconds)...\n");
+        if (wifi_probe() != 0) { uart_puts("wifi: bring-up FAILED — run wifi-invest\n"); return 1; }
+        uart_puts("wifi: firmware up.\n");
+        if (!ssid) {
+            int n = wifi_scan_run();
+            uart_puts("wifi: radio up, "); puts_dec(n);
+            uart_puts(" APs found. Connect with: wifi on <ssid> <pass>\n");
+            return 0;
+        }
+        uart_puts("wifi: joining \""); uart_puts(ssid); uart_puts("\" (WPA2)...\n");
+        if (wifi_join_run(ssid, pass) != 0) {
+            uart_puts("wifi: JOIN FAILED — check ssid/pass, or run wifi-invest\n");
+            return 1;
+        }
+        uart_puts("wifi: associated. requesting DHCP...\n");
+        if (wifi_dhcp() != 0) {
+            uart_puts("wifi: DHCP FAILED — run wifi-invest\n");
+            return 1;
+        }
+        { unsigned char ip[4]; wifi_ipaddr(ip);
+          uart_puts("wifi: CONNECTED.  IP="); puts_ip(ip); uart_putc('\n'); }
+        return 0;
+    }
+    uart_puts("wifi: unknown subcommand — use on/off/status/scan\n");
+    return 1;
+}
+
+/* wifi-invest: maintenance / diagnostics for when the connection won't come up.
+ * Re-runs the full M0..M1 bring-up, dumps the pinmux + the detailed trace log,
+ * then scans, so the failing stage is visible. */
+static int cmd_wifi_invest(int argc, char **argv)
+{
+    int rc, n;
+    (void)argc; (void)argv;
+    uart_puts("=== wifi-invest: diagnostics ===\n");
+    uart_puts("status: ");
+    if (wifi_connected()) {
+        unsigned char ip[4]; wifi_ipaddr(ip);
+        uart_puts("connected ssid=\""); uart_puts(wifi_ssid());
+        uart_puts("\" ip="); puts_ip(ip); uart_putc('\n');
+    } else uart_puts("not connected\n");
+
+    uart_puts("-- re-running full bring-up (M0..M1) --\n");
+    rc = wifi_probe();
+    uart_puts("bring-up rc="); puts_dec(rc);
+    uart_puts(rc == 0 ? " (firmware up)\n" : " (FAILED — see trace below)\n");
+    if (rc == 0) {
+        n = wifi_scan_run();
+        uart_puts("scan: "); puts_dec(n); uart_puts(" APs\n");
+    }
+    uart_puts("-- trace log --\n");
+    uart_puts(wifi_trace());
+    uart_putc('\n');
+    uart_puts("=== end wifi-invest ===\n");
+    return 0;
+}
+
 static const struct centry commandtab[] = {
     { "help",   "list the commands",                       cmd_help   },
     { "echo",   "echo the remaining words back",           cmd_echo   },
@@ -887,6 +1001,8 @@ static const struct centry commandtab[] = {
     { "view",     "show viewport / desktop sizes",         cmd_view     },
     { "autopan",  "autopan [on|off]  toggle demo scroll",  cmd_autopan  },
     { "reboot",   "stub — spins until power-cycle",        cmd_reboot   },
+    { "wifi",       "wifi on <ssid> <pass> | off | status | scan", cmd_wifi },
+    { "wifi-invest","wifi diagnostics + maintenance (re-run bring-up, dump trace)", cmd_wifi_invest },
     { "?",      "alias for help",                          cmd_help   },
     { 0, 0, 0 }
 };

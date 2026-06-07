@@ -98,6 +98,10 @@ PI5_CFLAGS  = $(COMMON) -mcpu=cortex-a76 \
               -DMBOX_BASE=0x107C013880UL \
               -DMBOX_PROBE_BUS \
               -DRP1_ETH_BASE=0x1F00100000UL \
+              -DWIFI_SDIO_BASE=0x1001100000UL \
+              -DWIFI_SDIO_CFG_BASE=0x1001100400UL \
+              -DWIFI_GPIO_BASE=0x107D508500UL \
+              -DWIFI_PINCTRL_BASE=0x107D504100UL \
               -DGIC_BASE=0x107FFF8000UL \
               -DGIC_GROUP1 \
               -DHEAP_END=0x40000000UL \

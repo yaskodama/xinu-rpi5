@@ -17,6 +17,7 @@
 #include "actor.h"
 #include "vfs.h"
 #include "wm.h"
+#include "wifi.h"
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
@@ -767,6 +768,71 @@ static int http_build(const char *req, char *out, int max)
         } else {
             bl = s_put(body, bl, "staged="); bl = s_putdec(body, bl, g_chain_len);
             bl = s_put(body, bl, " bytes. GET /chainload?go=1&len=<N> to boot it\n");
+        }
+    } else if (str_starts(rpath, "/wifi")) {
+        /* CYW43455 WiFi bring-up, driven over HTTP and brought up in stages
+         * (the SDIO host layer is new; see device/wifi/wifi.c).  Each action
+         * appends to the ~8 KB trace; retrieve it paginated via /wifi-trace. */
+        ctype = "text/plain";
+        if (str_starts(rpath, "/wifi-trace")) {
+            int off = q_int(req, "off", 0);
+            const char *t = wifi_trace(); int tl = wifi_trace_len();
+            int i = 0;
+            for (; off + i < tl && i < 600 && bl < (int)sizeof body - 1; i++)
+                body[bl++] = t[off + i];
+        } else if (str_starts(rpath, "/wifi-pinmux")) {
+            int f = q_int(req, "fsel", -1);
+            if (f >= 0) wifi_set_pin_fsel((unsigned int)f);
+            wifi_pinmux_dump();
+            bl = s_put(body, bl, "pinmux set; GET /wifi-trace?off=0 for the reg dump\n");
+        } else if (str_starts(rpath, "/wifi-stage")) {
+            int hz = q_int(req, "hz", 0); if (hz) wifi_set_fwload_hz((unsigned int)hz);
+            int n  = q_int(req, "n", 0);
+            int rc = wifi_probe_stage(n);
+            bl = s_put(body, bl, "stage n="); bl = s_putdec(body, bl, n);
+            bl = s_put(body, bl, " rc=");     bl = s_putdec(body, bl, rc);
+            bl = s_put(body, bl, " tracelen="); bl = s_putdec(body, bl, wifi_trace_len());
+            bl = s_put(body, bl, " -- GET /wifi-trace?off=0,600,1200,...\n");
+        } else if (str_starts(rpath, "/wifi-bulk")) {
+            int rc = wifi_probe_bulk(q_int(req, "kb", 64), (unsigned int)q_int(req, "hz", 0));
+            bl = s_put(body, bl, "bulk rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else if (str_starts(rpath, "/wifi-win")) {
+            int rc = wifi_probe_winwrite(q_int(req, "w", 0));
+            bl = s_put(body, bl, "win rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/wifi-scan")) {
+            int rc = wifi_scan_run();
+            bl = s_put(body, bl, "scan rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else if (str_starts(rpath, "/wifi-join")) {
+            char ssid[40], pass[68];
+            if (!q_param(req, "ssid", ssid, sizeof ssid)) ssid[0] = 0;
+            if (!q_param(req, "pass", pass, sizeof pass)) pass[0] = 0;
+            int rc = wifi_join_run(ssid, pass);
+            bl = s_put(body, bl, "join rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else if (str_starts(rpath, "/wifi-dhcp")) {
+            int rc = wifi_dhcp();
+            bl = s_put(body, bl, "dhcp rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else if (str_starts(rpath, "/wifi-ping")) {
+            char ip[20]; unsigned char a[4] = {0,0,0,0};
+            if (q_param(req, "ip", ip, sizeof ip)) {
+                int o = 0, v = 0, k = 0;
+                for (; ip[o] && k < 4; o++) {
+                    if (ip[o] == '.') { a[k++] = (unsigned char)v; v = 0; }
+                    else if (ip[o] >= '0' && ip[o] <= '9') v = v*10 + (ip[o]-'0');
+                }
+                if (k < 4) a[k] = (unsigned char)v;
+            }
+            int rc = wifi_ping(a, q_int(req, "n", 4));
+            bl = s_put(body, bl, "ping rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else if (str_starts(rpath, "/wifi-probe")) {
+            int rc = wifi_probe();
+            bl = s_put(body, bl, "probe rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else {
+            bl = s_put(body, bl,
+              "wifi routes (bring-up is staged; poll /wifi-trace for the log):\n"
+              " /wifi-stage?n=-2..6[&hz=N]   (-2=power+host -1=pinmux+CMD5 0=chipid 1=ramscan\n"
+              "                               2=halt 3=4KB 4=fwload 5=CR4 6=Fn2)\n"
+              " /wifi-trace?off=N   /wifi-pinmux?fsel=N   /wifi-bulk?kb&hz   /wifi-win?w\n"
+              " /wifi-scan   /wifi-join?ssid&pass   /wifi-dhcp   /wifi-ping?ip&n\n");
         }
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";
