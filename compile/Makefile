@@ -158,6 +158,13 @@ obj/pi5/llm.o:  llm.c | obj/pi5  ; $(CC) $(PI5_FP_CFLAGS)  -c $< -o $@
 obj/pi4/llm.o:  llm.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
 obj/qemu/llm.o: llm.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
 
+# wifi_fw.c .incbin's wifi-fw/wifi.conf (boot auto-connect creds, .gitignore'd).
+# Ensure an (empty = auto-connect disabled) one exists so a clean checkout builds.
+obj/pi5/wifi_fw.o: wifi_fw.c | obj/pi5
+	@test -f ../wifi-fw/wifi.conf || { mkdir -p ../wifi-fw; : > ../wifi-fw/wifi.conf; \
+	  echo "  (created empty wifi-fw/wifi.conf — WiFi auto-connect disabled)"; }
+	$(CC) $(PI5_CFLAGS)  -c $< -o $@
+
 obj/pi5/%.o: %.c  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
 obj/pi5/%.o: %.S  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
 obj/pi4/%.o: %.c  | obj/pi4  ; $(CC) $(PI4_CFLAGS)  -c $< -o $@

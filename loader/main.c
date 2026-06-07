@@ -1016,11 +1016,46 @@ static void serial_layout_cmd(const char *s)
     else if (op == 'R') wm_resize_window(id, a, b);
 }
 
+/* Auto-connect to WiFi at boot from the build-time-embedded wifi.conf (line 1 =
+ * SSID, line 2 = password).  The conf lives in wifi-fw/wifi.conf which is
+ * .gitignore'd and .incbin'd into the image (same as the firmware blobs), so the
+ * password ends up only in the kernel image on the SD — never in git.  An empty
+ * conf disables auto-connect.  Runs once, deferred so the desktop shows first
+ * (the bring-up blocks ~15 s). */
+static void wifi_autoconnect(void)
+{
+    extern const char wifi_conf[], wifi_conf_end[];
+    extern int  wifi_probe(void);
+    extern int  wifi_join_run(const char *ssid, const char *pass);
+    extern int  wifi_dhcp(void);
+    extern void wifi_remember_creds(const char *ssid, const char *pass);
+    const char *c = wifi_conf; int avail = (int)(wifi_conf_end - wifi_conf);
+    char ssid[64], pass[80]; int i = 0, j = 0;
+    if (avail <= 0) { uart_puts("wifi: no wifi.conf — auto-connect disabled\n"); return; }
+    while (i < avail && c[i] && c[i] != '\n' && c[i] != '\r' && j < (int)sizeof ssid - 1) ssid[j++] = c[i++];
+    ssid[j] = 0;
+    while (i < avail && (c[i] == '\n' || c[i] == '\r' || c[i] == ' ')) i++;
+    j = 0;
+    while (i < avail && c[i] && c[i] != '\n' && c[i] != '\r' && j < (int)sizeof pass - 1) pass[j++] = c[i++];
+    pass[j] = 0;
+    if (!ssid[0]) { uart_puts("wifi: wifi.conf empty — auto-connect disabled\n"); return; }
+    uart_puts("wifi: auto-connecting to \""); uart_puts(ssid); uart_puts("\"...\n");
+    wifi_remember_creds(ssid, pass);                 /* so `wifi on` reconnects later */
+    if (wifi_probe() != 0)            { uart_puts("wifi: auto bring-up failed (try wifi-invest)\n"); return; }
+    if (wifi_join_run(ssid, pass) != 0){ uart_puts("wifi: auto join failed (check wifi.conf)\n"); return; }
+    if (wifi_dhcp() != 0)             { uart_puts("wifi: auto DHCP failed\n"); return; }
+    uart_puts("wifi: auto-connected\n");
+}
+
 static void serial_io_tick(void)
 {
     static char cmd[64];
     static int  clen = 0;
     static int  in_cmd = 0;
+    /* One-shot boot auto-connect, fired after ~30 frames so the desktop shows
+     * first.  -1 = already done.  The connect blocks the wm loop for ~15 s. */
+    static int  ac = 0;
+    if (ac >= 0 && ++ac > 30) { ac = -1; wifi_autoconnect(); }
     int ch, budget = 256;
 
     genet_rx_tick();                 /* keep the (no-op on Pi 5) net drain */

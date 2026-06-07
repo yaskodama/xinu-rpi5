@@ -883,6 +883,14 @@ static void str_copy(char *dst, const char *src, int cap)
     while (src[i] && i < cap - 1) { dst[i] = src[i]; i++; }
     dst[i] = 0;
 }
+/* Remember WiFi creds (RAM only) so `wifi on` (no args) reconnects later — used
+ * by the boot auto-connect so a subsequent `wifi off`/`wifi on` works too. */
+void wifi_remember_creds(const char *ssid, const char *pass)
+{
+    str_copy(g_wifi_ssid, ssid, sizeof g_wifi_ssid);
+    str_copy(g_wifi_pass, pass, sizeof g_wifi_pass);
+    g_wifi_have_creds = 1;
+}
 static void puts_ip(const unsigned char *ip)
 {
     int i;

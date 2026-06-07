@@ -31,6 +31,15 @@ asm(
     "  .incbin \"/Users/kodamay/projects/xinu-rpi5/wifi-fw/clm_43455.blob\"\n"
     ".globl wifi_clm_blob_end\n"
     "wifi_clm_blob_end:\n"
+    /* Boot WiFi auto-connect config: line1=SSID, line2=password.  Lives in the
+     * .gitignore'd wifi-fw/wifi.conf so the password is embedded in the image
+     * but never committed.  Empty file => auto-connect disabled. */
+    ".balign 4\n"
+    ".globl wifi_conf\n"
+    "wifi_conf:\n"
+    "  .incbin \"/Users/kodamay/projects/xinu-rpi5/wifi-fw/wifi.conf\"\n"
+    ".globl wifi_conf_end\n"
+    "wifi_conf_end:\n"
     ".balign 4\n"
 );
 #endif /* WIFI_SDIO_BASE */
