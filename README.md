@@ -3,6 +3,13 @@
 Embedded Xinu port for the Raspberry Pi 5 (BCM2712, Cortex-A76,
 AArch64-only).
 
+![Xinu running on a Raspberry Pi 5](docs/boot-screen.jpg)
+
+*Xinu on real Pi 5 hardware: a window-managed HDMI desktop with a live shell,
+system-status / actors / VFS-tree / memory panels, an on-screen keyboard, and a
+spinning 3-D wireframe wine glass — driven by a USB mouse and keyboard over the
+RP1 xHCI controllers.*
+
 This is a brand-new repository, bootstrapped from
 [`yaskodama/xinu-rpi`](https://github.com/yaskodama/xinu-rpi)
 (arm-qemu / arm-rpi platforms, 32-bit) and the AArch64 boot pattern
