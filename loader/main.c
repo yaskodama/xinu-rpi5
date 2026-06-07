@@ -819,10 +819,44 @@ static void vfs_populate_demo(void)
         vfs_write_str(f,
             "/* AIPL sample: tagged value_t arithmetic */\n"
             "int main() {\n"
-            "    print(\"AIPL value_t: 20 + 22 = \");\n"
+            "    puts(\"AIPL value_t: 20 + 22 =\");\n"
             "    v_print(v_add(v_int(20), v_int(22)));\n"
-            "    print(\"\\n\");\n"
             "    return 0;\n"
+            "}\n");
+        /* AIPL sample — PingPong: two players volley a ball back and forth.
+         * Run with:  cc /home/PingPong.abcl   (or  make /home/PingPong.abcl) */
+        f = vfs_create_file(home, "PingPong.abcl");
+        vfs_write_str(f,
+            "/* PingPong.abcl - AIPL sample: a ball volleyed back and forth. */\n"
+            "int main() {\n"
+            "    int volleys = 8;\n"
+            "    int i = 0;\n"
+            "    int side = 0;\n"
+            "    while (i < volleys) {\n"
+            "        if (side == 0) { puts(\"  Ping  ->\"); side = 1; }\n"
+            "        else           { puts(\"      <-  Pong\"); side = 0; }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    puts(\"PingPong: volleys done =\");\n"
+            "    print(volleys);\n"
+            "    return volleys;\n"
+            "}\n");
+        /* AIPL sample — RotateLine: four line segments, each centred on a
+         * corner of a square, all spinning in the Graphics window.  The value_t
+         * runtime computes the turn count, then the gfx_rotate_line() builtin
+         * drives the on-screen animation (same as the `4lines` command).
+         * Run with:  cc /home/RotateLine.abcl  (watch the Graphics window) */
+        f = vfs_create_file(home, "RotateLine.abcl");
+        vfs_write_str(f,
+            "/* RotateLine.abcl - AIPL sample: four line segments on a square's */\n"
+            "/* corners, all rotating in the Graphics window.                   */\n"
+            "int main() {\n"
+            "    int turns = v_int_of(v_add(v_int(20), v_int(10)));  /* = 30 */\n"
+            "    puts(\"RotateLine: 4 segments on a square, spinning\");\n"
+            "    puts(\"turns =\");\n"
+            "    print(turns);\n"
+            "    gfx_rotate_line(turns);\n"
+            "    return turns;\n"
             "}\n");
     }
     if (proc) {

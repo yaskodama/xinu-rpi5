@@ -124,6 +124,44 @@ int proc_create(proc_entry_t entry, unsigned long stksize, const char *name)
     return pid;
 }
 
+/* Like proc_create() but uses a caller-supplied stack buffer instead of
+ * getmem().  getmem() is not reentrant against the main thread, so it is
+ * unsafe to call from the genet_rx_tick / network-ISR context — which is where
+ * the `cc`/`make` shell commands run (they are dispatched from the USB-keyboard
+ * pump and the HTTP /run handler, both inside genet_rx_tick).  Handing in a
+ * static stack keeps process creation heap-free and therefore safe there. */
+int proc_create_static(proc_entry_t entry, void *stk, unsigned long stksize,
+                       const char *name)
+{
+    int pid = alloc_slot();
+    if (pid < 0) return -1;
+    if (stk == 0 || stksize < 1024) return -1;
+
+    struct procent *p = &proctab[pid];
+    p->state   = PR_READY;
+    p->prio    = 1;
+    p->stkbase = stk;
+    p->stklen  = stksize;
+    copy_name(p->name, name);
+    p->next    = 0;
+
+    /* Same initial saved-register frame as proc_create() (see there). */
+    unsigned long *sp_top = (unsigned long *)((unsigned char *)stk + stksize);
+    sp_top = (unsigned long *)((unsigned long)sp_top & ~15UL);   /* 16-byte align */
+    unsigned long *sp     = sp_top - 12;
+    sp[0]  = 0;                          /* x29 (FP)            */
+    sp[1]  = (unsigned long)entry;       /* x30 (LR -> entry)   */
+    sp[2]  = 0; sp[3]  = 0;
+    sp[4]  = 0; sp[5]  = 0;
+    sp[6]  = 0; sp[7]  = 0;
+    sp[8]  = 0; sp[9]  = 0;
+    sp[10] = 0; sp[11] = 0;
+    p->sp = (void *)sp;
+
+    ready_push(p);
+    return pid;
+}
+
 void proc_ready(int pid)
 {
     if (pid <= 0 || pid >= NPROC) return;

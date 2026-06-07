@@ -62,7 +62,8 @@ static int g_step;               /* 0..30 */
 static unsigned g_last_frame;
 static int g_ax, g_ay, g_az;     /* current rotation angles (degrees) */
 
-static int g_mode;               /* 0 = wine glass, 1 = four rotating lines */
+static int g_mode;               /* 0 = wine glass, 1 = four lines, 2 = KODAMA, 3 = rotateline */
+static int g_rl_turns = 50;      /* rotateline: number of full turns before stopping */
 
 void graphics_wine_start(void)
 {
@@ -76,6 +77,7 @@ void graphics_4lines_start(void)
     g_mode = 1;
     g_active = 1; g_step = 0; g_last_frame = 0;
     g_ax = 0; g_ay = 0; g_az = 0;
+    g_rl_turns = 30;                 /* the `4lines` command: 30 full turns */
 }
 
 void graphics_kodama_start(void)
@@ -83,6 +85,18 @@ void graphics_kodama_start(void)
     g_mode = 2;
     g_active = 1; g_step = 0; g_last_frame = 0;
     g_ax = 0; g_ay = 0; g_az = 0;
+}
+
+/* RotateLine: four line segments, each centred on a corner of a square, all
+ * spinning `turns` full revolutions — the same animation as the `4lines`
+ * command (mode 1) but with a caller-chosen turn count.  Driven by the AIPL
+ * sample RotateLine.abcl via the JIT builtin gfx_rotate_line(). */
+void graphics_rotateline_start(int turns)
+{
+    g_mode = 1;
+    g_active = 1; g_step = 0; g_last_frame = 0;
+    g_ax = 0; g_ay = 0; g_az = 0;
+    g_rl_turns = (turns < 1) ? 1 : (turns > 200 ? 200 : turns);
 }
 
 /* rotate (x,y,z) by g_ax,g_ay,g_az; fixed-point >>12. */
@@ -170,9 +184,9 @@ void graphics_draw(window_t *self, unsigned int frame)
     /* advance the spin every frame (no wait) */
     (void)frame;
     if (g_active) {
-        if (g_mode == 1) {                 /* 4lines: 30 deg/frame, 30 full turns */
+        if (g_mode == 1) {                 /* 4lines: 30 deg/frame, g_rl_turns turns */
             g_ax = (g_ax + 30) % 360;      /* 12 frames per turn (smoother) */
-            if (++g_step >= 360) g_active = 0;   /* 360 frames = 30 turns */
+            if (++g_step >= 12 * g_rl_turns) g_active = 0;
         } else {                           /* wine / kodama: 30 steps about x/y/z */
             g_ax = (g_ax + 12) % 360;
             g_ay = (g_ay + 8)  % 360;

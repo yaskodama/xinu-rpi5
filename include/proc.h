@@ -45,6 +45,10 @@ extern int            currpid;
 
 void proc_init(void);
 int  proc_create(proc_entry_t entry, unsigned long stksize, const char *name);
+/* Heap-free variant: runs on a caller-supplied static stack (safe to call from
+ * the genet_rx_tick / network-ISR context, where getmem() is not reentrant). */
+int  proc_create_static(proc_entry_t entry, void *stk, unsigned long stksize,
+                        const char *name);
 void proc_ready(int pid);
 void proc_resched(void);
 void proc_yield(void);

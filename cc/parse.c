@@ -402,6 +402,7 @@ static type_t *struct_decl(void)
         m->name = mname; m->ty = mty; m->offset = off; m->next = 0;
         mc = mc->next = m;
         off += mty->size;
+        if (cc_failed()) break;        /* don't spin on a malformed member */
     }
     expect("}");
     st->members = mhead.next;
@@ -611,31 +612,42 @@ static node_t *expr_stmt(void)
     return n;
 }
 
-/* declaration = declspec ident ("[" num "]")? ("=" expr)? ";" */
+/* declaration = declspec declarator ("," declarator)* ";"
+ * declarator  = ident ("[" num "]")? ("=" expr)?
+ * Multiple comma-separated declarators share the base type (e.g.
+ * `int n = 5, f = 1;`); each initializer becomes an assignment statement
+ * chained into the wrapping ND_BLOCK in source order. */
 static node_t *declaration(void)
 {
     type_t *base = declspec();
-    char *name = tk->kind == TK_IDENT ? tk->text : 0;
-    if (!name) { cc_error("expected identifier in declaration"); return new_node(ND_BLOCK); }
-    tk = tk->next;
+    node_t *n = new_node(ND_BLOCK);                    /* wraps the init stmts */
+    node_t head; head.next = 0; node_t *c = &head;
 
-    type_t *ty = base;
-    if (consume("[")) {
-        if (tk->kind != TK_NUM) { cc_error("array length must be a constant"); }
-        int len = (int)tk->val; tk = tk->next;
-        expect("]");
-        ty = ty_array_of(base, len);
-    }
-    var_t *v = new_local(name, ty);
+    for (;;) {
+        char *name = tk->kind == TK_IDENT ? tk->text : 0;
+        if (!name) { cc_error("expected identifier in declaration"); break; }
+        tk = tk->next;
 
-    node_t *n = new_node(ND_BLOCK);                    /* possibly-empty init wrapper */
-    if (consume("=")) {
-        node_t *lhs = new_node(ND_VAR); lhs->var = v; lhs->ty = v->ty;
-        node_t *as  = new_node(ND_ASSIGN); as->lhs = lhs; as->rhs = assign(); as->ty = v->ty;
-        node_t *es  = new_node(ND_EXPR_STMT); es->lhs = as;
-        n->body = es;
+        type_t *ty = base;
+        if (consume("[")) {
+            if (tk->kind != TK_NUM) { cc_error("array length must be a constant"); }
+            int len = (int)tk->val; tk = tk->next;
+            expect("]");
+            ty = ty_array_of(base, len);
+        }
+        var_t *v = new_local(name, ty);
+
+        if (consume("=")) {
+            node_t *lhs = new_node(ND_VAR); lhs->var = v; lhs->ty = v->ty;
+            node_t *as  = new_node(ND_ASSIGN); as->lhs = lhs; as->rhs = assign(); as->ty = v->ty;
+            node_t *es  = new_node(ND_EXPR_STMT); es->lhs = as;
+            c = c->next = es;
+        }
+        if (cc_failed()) break;
+        if (!consume(",")) break;                      /* next declarator, or done */
     }
     expect(";");
+    n->body = head.next;
     return n;
 }
 
@@ -708,6 +720,12 @@ static node_t *stmt(void)
         while (!is_punct(tk, "}") && tk->kind != TK_EOF) {
             node_t *s = looks_like_type(tk) ? declaration() : stmt();
             c = c->next = s;
+            /* A parse error leaves `tk` un-advanced (expect() does not skip on
+             * mismatch), so without this bail-out a malformed statement spins
+             * this loop forever — and the compiler has no runaway deadline, so
+             * that hard-freezes the board.  Stop at the first error; the driver
+             * reports it as a clean compile failure. */
+            if (cc_failed()) break;
         }
         expect("}");
         blk->body = head.next;
