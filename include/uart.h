@@ -17,6 +17,9 @@
 void uart_init(void);
 void uart_putc(char c);
 void uart_puts(const char *s);
+/* Tee uart output into `buf` (NUL-terminated, capped) until uart_capture_stop(). */
+void uart_capture(char *buf, int cap);
+void uart_capture_stop(void);
 
 /* Blocking read of one byte from RX FIFO. */
 char uart_getc(void);

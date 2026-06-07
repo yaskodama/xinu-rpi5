@@ -114,8 +114,19 @@ void uart_init(void)
     }
 }
 
+/* Optional capture sink: while set, uart output is also appended here (used by
+ * the HTTP /run endpoint to return a command's output). */
+static char *g_uart_cap;
+static int   g_uart_cap_cap, g_uart_cap_len;
+void uart_capture(char *buf, int cap) { g_uart_cap = buf; g_uart_cap_cap = cap; g_uart_cap_len = 0; if (buf && cap) buf[0] = 0; }
+void uart_capture_stop(void) { g_uart_cap = 0; }
+
 void uart_putc(char c)
 {
+    if (g_uart_cap && g_uart_cap_len < g_uart_cap_cap - 1) {
+        g_uart_cap[g_uart_cap_len++] = c;
+        g_uart_cap[g_uart_cap_len] = 0;
+    }
     /* HDMI is the real display here, so update it FIRST (instant). */
     shellwin_record_char(c);   /* wm shell window ring — safe before init (drops) */
     screen_putc(c);            /* text console — no-op before video_init()        */

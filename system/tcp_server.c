@@ -503,13 +503,26 @@ static int http_build(const char *req, char *out, int max)
         /* Run a shell command from HTTP — a reliable way to drive the shell
          * (wine/4lines/kodama/clear/...) when the USB keyboard is being flaky. */
         extern int shell_dispatch_line(char *line);
+        extern void uart_capture(char *, int); extern void uart_capture_stop(void);
         ctype = "text/plain";
         char cmd[128];
         if (q_param(req, "cmd", cmd, sizeof cmd)) {
+            /* URL-decode in place: %XX -> byte, '+' -> space. */
+            int r = 0, w = 0;
+            while (cmd[r]) {
+                if (cmd[r] == '%' && cmd[r+1] && cmd[r+2]) {
+                    int hi = cmd[r+1], lo = cmd[r+2];
+                    hi = (hi>='0'&&hi<='9')?hi-'0':(hi|32)-'a'+10;
+                    lo = (lo>='0'&&lo<='9')?lo-'0':(lo|32)-'a'+10;
+                    cmd[w++] = (char)((hi<<4)|lo); r += 3;
+                } else if (cmd[r] == '+') { cmd[w++] = ' '; r++; }
+                else cmd[w++] = cmd[r++];
+            }
+            cmd[w] = 0;
+            uart_capture(body, (int)sizeof body - 1);  /* tee command output into the reply */
             shell_dispatch_line(cmd);
-            bl = s_put(body, bl, "ran: ");
-            bl = s_put(body, bl, cmd);
-            bl = s_put(body, bl, "\n");
+            uart_capture_stop();
+            bl = 0; while (body[bl]) bl++;              /* length of captured output */
         } else {
             bl = s_put(body, bl, "usage: /run?cmd=<shell command>\n");
         }
