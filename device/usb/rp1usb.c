@@ -841,9 +841,23 @@ static const char g_kms[64] = {
     [0x2d]='_',[0x2e]='+',[0x2f]='{',[0x30]='}',[0x31]='|',[0x33]=':',[0x34]='"',[0x35]='~',
     [0x36]='<',[0x37]='>',[0x38]='?',
 };
+static char kbd_ascii(unsigned u, int shift)
+{
+    if (u >= 0x40) return 0;
+    return shift ? g_kms[u] : g_km[u];
+}
+
+/* Auto-repeat state: the boot keyboard (SET_IDLE 0) sends nothing while a key is
+ * held, so we synthesise repeats from a timer in kbd_repeat_tick(). */
+static int           g_kbd_held;     /* usage being held (0 = none) */
+static int           g_kbd_held_sh;
+static unsigned long g_kbd_rep_at;   /* next repeat time (timer ticks) */
+static int           g_kbd_rep_n;    /* repeats emitted (cap, in case of a stuck key) */
+
 static void kbd_decode(unsigned char *r)
 {
     extern void xhci_keyboard_event(char);
+    extern unsigned long timer_ticks(void);
     int shift = (r[0] & 0x22) != 0;                /* L/R Shift in modifier byte */
     for (int i=2;i<8;i++) {
         unsigned u=r[i];
@@ -851,10 +865,36 @@ static void kbd_decode(unsigned char *r)
         int held=0;                                /* already down in the previous report? */
         for (int j=2;j<8;j++) if (g_kbd_prev[j]==u){ held=1; break; }
         if (held) continue;
-        char c = shift ? g_kms[u] : g_km[u];
+        char c = kbd_ascii(u, shift);
         if (c) xhci_keyboard_event(c);
     }
+    /* Track the last typable key still down, for auto-repeat. */
+    int cur = 0;
+    for (int i=2;i<8;i++) if (r[i] && kbd_ascii(r[i], shift)) cur = r[i];
+    if (cur && cur != g_kbd_held) {                /* new key held -> start the delay */
+        g_kbd_held = cur; g_kbd_held_sh = shift;
+        g_kbd_rep_at = timer_ticks() + 45;         /* ~450 ms initial delay */
+        g_kbd_rep_n = 0;
+    } else if (!cur) {
+        g_kbd_held = 0;                            /* released */
+    }
     for (int i=0;i<8;i++) g_kbd_prev[i]=r[i];
+}
+
+/* Called every pump tick: while a key is held past the initial delay, re-emit it
+ * at the repeat rate (capped so a halted keyboard can't repeat forever). */
+static void kbd_repeat_tick(void)
+{
+    extern void xhci_keyboard_event(char);
+    extern unsigned long timer_ticks(void);
+    if (!g_kbd_held || g_kbd_rep_n > 300) return;
+    unsigned long now = timer_ticks();
+    if (now >= g_kbd_rep_at) {
+        char c = kbd_ascii(g_kbd_held, g_kbd_held_sh);
+        if (c) xhci_keyboard_event(c);
+        g_kbd_rep_at = now + 4;                    /* ~40 ms repeat interval (25/s) */
+        g_kbd_rep_n++;
+    }
 }
 
 static void ep1_queue_trb(void)            /* arm one interrupt-IN transfer */
@@ -881,6 +921,7 @@ int  rp1usb_poll_mode_get(void) { return g_poll_mode; }
 void rp1usb_mouse_pump(void)
 {
     if (!g_mouse_active && !g_kbd_active) return;
+    if (g_kbd_active) kbd_repeat_tick();        /* auto-repeat held keys */
     if (g_mouse_active && g_poll_mode) {       /* control-pipe polling path */
         extern int rp1usb_get_report(int,int);
         xhci_switch(g_mouse_ctrl);
