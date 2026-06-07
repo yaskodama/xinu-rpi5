@@ -36,11 +36,17 @@ struct kstroke { short x0, y0, x1, y1; };
 static const struct kstroke kodama_strokes[] = {
     /* コ */
     {  5, 10,  60, 10}, { 58, 10,  58, 75}, {  5, 75,  60, 75},
-    /* ダ (タ + dakuten), shifted +80 */
-    { 88, 18, 125, 12}, {130,  8,  95, 80}, { 90, 40, 128, 40},
-    {138,  8, 144, 14}, {138, 18, 144, 24},
-    /* マ, shifted +160 */
-    {168, 15, 218, 15}, {218, 15, 198, 48}, {200, 40, 178, 82},
+    /* ダ = タ (ノ flick + フ cap&sweep + middle bar) + dakuten */
+    {112, 12,  94, 42},   /* ノ flick, down-left           */
+    {108, 12, 138, 12},   /* フ top horizontal             */
+    {138, 12, 100, 80},   /* フ sweep down-left            */
+    {100, 46, 132, 46},   /* middle bar                    */
+    {143, 10, 150, 17},   /* dakuten 1                     */
+    {143, 22, 150, 29},   /* dakuten 2                     */
+    /* マ = top bar + right diagonal to centre + diagonal to bottom-left */
+    {170, 15, 215, 15},
+    {215, 15, 188, 48},
+    {195, 42, 170, 80},
 };
 #define NKS ((int)(sizeof(kodama_strokes)/sizeof(kodama_strokes[0])))
 
@@ -133,7 +139,7 @@ static void draw_kodama(window_t *self)
     int S = half * 100 / KMAXR;
     if (S < 3) return;
 
-    const int T = 8, HD = 8, CXc = 112, CYc = 45;   /* thickness, half-depth, cell centre */
+    const int T = 8, HD = 8, CXc = 110, CYc = 45;   /* thickness, half-depth, cell centre */
     unsigned int col = 0xFFFFD060u;                 /* warm gold */
     for (int i = 0; i < NKS; i++) {
         int x0 = kodama_strokes[i].x0, y0 = kodama_strokes[i].y0;
