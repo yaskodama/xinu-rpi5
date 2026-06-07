@@ -233,28 +233,92 @@ static int cmd_cat(int argc, char **argv)
     return 0;
 }
 
-static int cmd_make(int argc, char **argv)
+/* ---- local C/AIPL runner: compile, then execute in a dedicated process ----
+ * `cc` and `make` compile a program and run it on its OWN process stack, so a
+ * buggy program (deep recursion, runaway loop, bad pointer) can only blow that
+ * stack and trip the runaway-loop deadline — it can never smash the shell /
+ * network-ISR stack and freeze the board, which is exactly what the old inline
+ * JIT path did (e.g. the AIPL value_t sample).  The inline JIT (cc_run_source)
+ * stays reserved for the external HTTP path, where an outside computer streams
+ * an AIPL program in and gets its output back. */
+#define CCRUN_STK   16384
+
+static const char *g_ccrun_src;     /* source handed to the runner process    */
+static int         g_ccrun_len;
+static char        g_ccrun_out[2048];
+static long        g_ccrun_rv;
+static int         g_ccrun_rc;      /* cc_compile() result: 0 ok, <0 error     */
+static int         g_ccrun_aborted;
+
+/* Runs in the dedicated cc-run process: BOTH the compile and the execute
+ * happen here, so the whole JIT machinery uses this process's own stack and
+ * can't corrupt the shell / network-ISR stack. */
+static void ccrun_proc_entry(void)
 {
-    extern int cc_run_source(const char *, int, char *, int, long *);
-    char path[128];
-    fs_resolve(argc >= 2 ? argv[1] : "/home/hello.c", path, sizeof path);
-    vfs_node_t *n = vfs_lookup(path);
+    extern int  cc_compile(const char *, int);
+    extern long cc_exec_compiled(char *, int, int *);
+    g_ccrun_rc = cc_compile(g_ccrun_src, g_ccrun_len);
+    if (g_ccrun_rc == 0)
+        g_ccrun_rv = cc_exec_compiled(g_ccrun_out, sizeof g_ccrun_out, &g_ccrun_aborted);
+    proc_exit();
+}
+
+static int cc_compile_and_run(const char *path)
+{
+    extern const char *cc_last_error(void);
+    char rp[128];
+    fs_resolve(path, rp, sizeof rp);
+    vfs_node_t *n = vfs_lookup(rp);
     if (!n || n->kind != VFS_FILE) {
-        uart_puts("make: no such file: "); uart_puts(path); uart_putc('\n');
-        uart_puts("       try: make /home/hello.c   or   make /home/hello.aipl\n");
-        return 0;
+        uart_puts("cc: no such file: "); uart_puts(rp); uart_putc('\n');
+        uart_puts("    try: cc /home/hello.c   (or /home/PingPong.abcl, /home/RotateLine.abcl)\n");
+        return 1;
     }
     static char src[4096];
-    static char out[2048];
     int len = vfs_read(n, src, sizeof src - 1);
     src[len] = 0;
-    uart_puts("make: compiling + running "); uart_puts(path); uart_puts(" (on-device JIT)\n");
-    long rv = 0;
-    int rc = cc_run_source(src, len, out, sizeof out, &rv);
-    if (out[0]) { uart_puts(out); uart_putc('\n'); }
-    if (rc == 0) { uart_puts("=> return value = "); puts_dec((int)rv); uart_putc('\n'); }
-    else         { uart_puts("make: build/run failed\n"); }
+
+    uart_puts("cc: compiling + running "); uart_puts(rp);
+    uart_puts(" (separate process)\n");
+
+    /* Compile AND run in a dedicated process on a STATIC stack, so a buggy
+     * program (deep recursion, runaway loop, bad pointer) can only blow that
+     * stack and trip the runaway-loop deadline — never freeze the board.  A
+     * static stack (not getmem) is mandatory: cc/make are dispatched from
+     * genet_rx_tick (USB-keyboard pump + HTTP /run), where getmem() — which is
+     * not reentrant against the main thread — would race and wedge the box. */
+    static unsigned char ccrun_stack[CCRUN_STK] __attribute__((aligned(16)));
+    g_ccrun_src = src; g_ccrun_len = len;
+    g_ccrun_out[0] = 0; g_ccrun_rv = 0; g_ccrun_rc = 0; g_ccrun_aborted = 0;
+    int pid = proc_create_static(ccrun_proc_entry, ccrun_stack, CCRUN_STK, "cc-run");
+    if (pid < 0) { uart_puts("cc: proc_create failed (no slot)\n"); return 1; }
+    proc_resched();                 /* surrender CPU; returns after proc_exit() */
+
+    if (g_ccrun_rc != 0) {
+        uart_puts("cc: "); uart_puts(cc_last_error()); uart_putc('\n');
+        return 1;
+    }
+    if (g_ccrun_out[0]) uart_puts(g_ccrun_out);
+    if (g_ccrun_aborted)
+        uart_puts("\ncc: aborted (ran past the runaway-loop deadline)\n");
+    uart_puts("=> return value = "); puts_dec((int)g_ccrun_rv); uart_putc('\n');
     return 0;
+}
+
+static int cmd_cc(int argc, char **argv)
+{
+    if (argc < 2) {
+        uart_puts("usage: cc <file>   compile a C/AIPL program and run it\n");
+        return 1;
+    }
+    return cc_compile_and_run(argv[1]);
+}
+
+static int cmd_make(int argc, char **argv)
+{
+    /* `make` is a convenience alias for `cc`; default target is the C sample.
+     * Both compile + run locally via a dedicated process (not the inline JIT). */
+    return cc_compile_and_run(argc >= 2 ? argv[1] : "/home/hello.c");
 }
 
 static int cmd_clear(int argc, char **argv)
@@ -805,7 +869,8 @@ static const struct centry commandtab[] = {
     { "cd",     "cd <dir>  change directory",              cmd_cd     },
     { "ls",     "ls [path]  list directory",               cmd_ls     },
     { "cat",    "cat <file>  print file contents",         cmd_cat    },
-    { "make",   "make [file]  JIT-compile + run a program", cmd_make  },
+    { "cc",     "cc <file>  compile + run a C/AIPL program (own process)", cmd_cc },
+    { "make",   "make [file]  compile + run a program (alias for cc)", cmd_make  },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },

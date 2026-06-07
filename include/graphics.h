@@ -18,4 +18,9 @@ void graphics_4lines_start(void);
 /* Start the rotating 3D "コダマ" block text (the `kodama` command). */
 void graphics_kodama_start(void);
 
+/* Start the four-segments-on-a-square animation for `turns` revolutions (same
+ * as `4lines` but with a chosen turn count).  Driven by the AIPL sample
+ * RotateLine.abcl through the JIT builtin gfx_rotate_line(). */
+void graphics_rotateline_start(int turns);
+
 #endif /* XINU_RPI5_GRAPHICS_H */

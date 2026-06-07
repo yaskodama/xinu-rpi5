@@ -156,6 +156,17 @@ static long cc_actor_send(long id, const char *method, long arg)
     return (long)out;
 }
 
+/* gfx_rotate_line(turns) — kick off the Graphics-window "spin a line" demo.
+ * The window's wm-loop draw callback owns the actual rendering; the JIT'd
+ * program just sets the mode + turn count, so an AIPL sample (RotateLine.abcl)
+ * can drive the on-screen animation without touching the framebuffer itself. */
+static long cc_gfx_rotate_line(long turns)
+{
+    extern void graphics_rotateline_start(int turns);
+    graphics_rotateline_start((int)turns);
+    return turns;
+}
+
 /* ===================== AIPL value_t runtime (ported from xinu-rpi4) =====================
  * A tagged 64-bit value system (int/string/float/list) so the host AIPL->C compiler's
  * --xinu-jit output runs on this JIT.  Self-contained: only emit_ch/emit_str + two static
@@ -726,6 +737,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "putc",       (void *)&cc_putchar    },
         { "puts",       (void *)&cc_puts       },
         { "actor_send", (void *)&cc_actor_send },
+        { "gfx_rotate_line", (void *)&cc_gfx_rotate_line },
         { "__cc_tick",  (void *)&cc_tick       },
         /* AIPL value_t runtime — the --xinu-jit backend's call seam. */
         { "v_int",       (void *)&v_int        },
@@ -870,5 +882,83 @@ int cc_run_source(const char *src, int srclen, char *out, int outcap, long *retv
         while (*e && p < outcap - 1) out[p++] = *e++;
         out[p] = 0;
     }
+    return rc;
+}
+
+/* ---------- split compile / exec API ---------------------------------------
+ * cc_run_source() above is the inline JIT seam used by the external HTTP / AIPL
+ * path (an outside computer POSTs source and gets output back).  Locally, the
+ * `cc` and `make` shell commands instead cc_compile() once and then run the
+ * compiled program from a SEPARATE Xinu process (its own stack — see shell.c),
+ * so a buggy user program can only blow its own stack and hit the runaway-loop
+ * deadline, never smash the shell / network-ISR stack and freeze the board.
+ *
+ * The two halves share the same static g_codebuf + arena as cc_run_source();
+ * the one-run-at-a-time invariant still holds because a locally-dispatched run
+ * executes under genet_rx_tick's g_rx_busy guard, which blocks the ISR path
+ * (and thus any concurrent /cc HTTP compile) for its duration. */
+static unsigned char *g_cc_code;
+static int            g_cc_entry;
+static int            g_cc_ready;
+
+/* Compile `src` into g_codebuf.  Returns 0 on success, -1 compile error,
+ * -2 OOM.  Leaves the arena populated (it may hold string literals the JIT'd
+ * code dereferences) — the next cc_compile()/cc_run_source() resets it. */
+int cc_compile(const char *src, int srclen)
+{
+    unsigned long n = (unsigned long)(srclen < 0 ? 0 : srclen);
+    g_cc_ready = 0;
+    g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0; g_res_objcls = 0; g_res_clsname = 0;
+    if (!arena_init(CC_ARENA)) return -2;
+    g_err = 0; g_errbuf[0] = 0;
+
+    char *s = (char *)cc_alloc(n + 1);
+    for (unsigned long i = 0; i < n; i++) s[i] = src[i];
+    s[n] = 0;
+
+    token_t *toks = cc_lex(s);
+    func_t  *fns  = cc_failed() ? 0 : cc_parse(toks);
+
+    unsigned char *code = g_codebuf;
+    int entry = 0, len = -1;
+    if (!cc_failed())
+        len = cc_codegen(fns, code, CC_CODECAP, &entry);
+    if (cc_failed() || len < 0) return -1;
+
+    cc_sync_icache(code, (unsigned long)len);
+    g_cc_code = code; g_cc_entry = entry; g_cc_ready = 1;
+    return 0;
+}
+
+/* The last compile's error text (valid after cc_compile() returns < 0). */
+const char *cc_last_error(void)
+{
+    return g_errbuf[0] ? g_errbuf : "compile error";
+}
+
+/* Execute the most recently cc_compile()'d program.  Designed to be called
+ * from a dedicated process so its stack usage is isolated.  Captures stdout
+ * into out[], sets *aborted if the runaway-loop deadline fired, and returns
+ * main()'s value (0 if nothing was compiled). */
+long cc_exec_compiled(char *out, int outcap, int *aborted)
+{
+    if (aborted) *aborted = 0;
+    if (!g_cc_ready) { if (out && outcap > 0) out[0] = 0; return 0; }
+
+    g_cap = out; g_capcap = outcap; g_caplen = 0;
+    if (out && outcap > 0) out[0] = 0;
+
+    cc_set_deadline();
+    vheap_reset();
+    lheap_reset();
+    int aoff = cc_func_offset("apply");
+    cc_set_apply(aoff >= 0 ? (void *)(g_cc_code + aoff) : 0);
+
+    long (*entryfn)(void) = (long (*)(void))(g_cc_code + g_cc_entry);
+    long rc = entryfn();
+
+    if (aborted) *aborted = g_aborted;
+    if (g_cap) g_cap[(g_caplen < g_capcap) ? g_caplen : (g_capcap - 1)] = 0;
+    g_cap = 0;
     return rc;
 }
