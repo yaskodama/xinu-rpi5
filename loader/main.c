@@ -283,20 +283,34 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
      * dragging; holding + moving drags the window; release ends the drag. */
     {
         extern void wm_request_full_redraw(void);
+        enum { RESIZE_GRIP = 20 };
         static window_t *drag_win;            /* window being dragged, or NULL */
+        static window_t *resize_win;          /* window being resized, or NULL */
         static int drag_off_x, drag_off_y;    /* cursor offset inside the window */
         int dpx = g_cursor_x + wm_view_x();   /* screen -> virtual-desktop coords */
         int dpy = g_cursor_y + wm_view_y();
 
         if ((nButtons & 1u) && !(g_prev_btn & 1u)) {        /* press edge */
             window_t *w = wm_focus_at(g_cursor_x, g_cursor_y);
-            if (w && dpy >= w->y && dpy < w->y + WM_TITLEBAR_H) {
+            if (w &&
+                dpx >= w->x + w->width  - RESIZE_GRIP && dpx < w->x + w->width &&
+                dpy >= w->y + w->height - RESIZE_GRIP && dpy < w->y + w->height) {
+                resize_win = w;                             /* bottom-right grip -> resize */
+            } else if (w && dpy >= w->y && dpy < w->y + WM_TITLEBAR_H) {
                 drag_win = w; drag_off_x = dpx - w->x; drag_off_y = dpy - w->y;
             }
         }
-        if (!(nButtons & 1u)) drag_win = 0;                 /* release ends drag */
+        if (!(nButtons & 1u)) { drag_win = 0; resize_win = 0; }   /* release ends both */
 
-        if (drag_win) {                                     /* dragging: follow cursor */
+        if (resize_win) {                                   /* resizing: corner follows cursor */
+            int nw = dpx - resize_win->x, nh = dpy - resize_win->y;
+            if (nw < 100) nw = 100;                         /* sensible minimums */
+            if (nh < 48)  nh = 48;
+            if (nw != resize_win->width || nh != resize_win->height) {
+                resize_win->width = nw; resize_win->height = nh;
+                wm_request_full_redraw();
+            }
+        } else if (drag_win) {                              /* dragging: follow cursor */
             int nx = dpx - drag_off_x, ny = dpy - drag_off_y;
             if (ny < 0) ny = 0;                             /* keep title bar reachable */
             if (nx < -(drag_win->width - 60)) nx = -(drag_win->width - 60);

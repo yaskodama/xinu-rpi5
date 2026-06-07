@@ -211,6 +211,15 @@ static void draw_chrome(window_t *w)
     int cy = w->y + WM_TITLEBAR_H + 2;
     int ch = w->height - WM_TITLEBAR_H - 3;
     fill_rect(w->x + 1, cy, w->width - 2, ch, w->content_bg);
+
+    /* resize grip: a small staircase mark in the bottom-right corner so the user
+     * can see where to grab to resize the window. */
+    {
+        int gx = w->x + w->width - 3, gy = w->y + w->height - 3;
+        unsigned int gc = w->focused ? 0xFFFFFFFFu : w->chrome_color;
+        for (int i = 0; i < 3; i++)
+            fill_rect(gx - i*4, gy - i*4, 3, 3, gc);
+    }
 }
 
 void wm_run(void)
