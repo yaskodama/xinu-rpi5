@@ -164,9 +164,9 @@ void graphics_draw(window_t *self, unsigned int frame)
     /* advance the spin every frame (no wait) */
     (void)frame;
     if (g_active) {
-        if (g_mode == 1) {                 /* 4lines: fast, 50 full turns */
-            g_ax = (g_ax + 60) % 360;      /* 60 deg/frame -> 6 frames per turn */
-            if (++g_step >= 300) g_active = 0;   /* 300 frames = 50 turns */
+        if (g_mode == 1) {                 /* 4lines: 30 deg/frame, 30 full turns */
+            g_ax = (g_ax + 30) % 360;      /* 12 frames per turn (smoother) */
+            if (++g_step >= 360) g_active = 0;   /* 360 frames = 30 turns */
         } else {                           /* wine / kodama: 30 steps about x/y/z */
             g_ax = (g_ax + 12) % 360;
             g_ay = (g_ay + 8)  % 360;
