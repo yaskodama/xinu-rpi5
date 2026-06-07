@@ -30,6 +30,9 @@ int  screen_ready(void);
  * + carriage return) and '\r' (column 0).  Wraps at right edge,
  * scrolls one row at the bottom. */
 void screen_putc(char c);
+/* Stop mirroring uart output to the (slow, now-hidden) text console once the wm
+ * owns the framebuffer — keeps typing snappy and big command output non-blocking. */
+void screen_console_disable(void);
 
 void screen_puts(const char *s);
 

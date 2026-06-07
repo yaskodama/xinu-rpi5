@@ -150,9 +150,17 @@ static void scroll_one_row(void)
     }
 }
 
+/* The boot log uses the text console (screen_putc).  Once the window manager is
+ * running it owns the framebuffer (the shell window shows all text), so the text
+ * console is invisible AND its 1080p full-frame scroll is very slow — every
+ * uart_putc would otherwise pay that cost, making typing laggy and big command
+ * output (e.g. `help`) wedge the HTTP handler.  Disable it when wm starts. */
+static int g_screen_console = 1;
+void screen_console_disable(void) { g_screen_console = 0; }
+
 void screen_putc(char c)
 {
-    if (!fb_ready) return;
+    if (!fb_ready || !g_screen_console) return;
 
     if (c == '\r') { cursor_col = 0; return; }
     if (c == '\n') {

@@ -228,6 +228,10 @@ void wm_run(void)
     int sw = (int)video_screen_width();
     int sh = (int)video_screen_height();
 
+    /* The wm now owns the framebuffer; stop the slow text-console mirroring so
+     * uart_putc (keyboard echo, command output) stays fast. */
+    screen_console_disable();
+
     /* Render off-screen so the per-frame full-screen wipe + redraw never
      * shows as flicker; each finished frame is flipped to the visible
      * framebuffer in one pass via video_present().  Falls back to direct
