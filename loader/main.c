@@ -210,19 +210,18 @@ static void genet_rx_tick(void)
     {
         extern void rp1usb_mouse_pump(void);
         extern int  rp1usb_autostart(void);
-        extern unsigned long rp1usb_mouse_reports(void);
-        static int  s_usb_phase = 0;
+        static int  s_usb_tries = 0;
+        static unsigned long s_usb_next = 500;   /* first attempt ~5 s after boot */
         unsigned long t = timer_ticks();
-        /* Bind USB ~5 s after boot (net settled), off the early-boot path that
-         * used to crash.  A first bind sometimes "succeeds" before the device is
-         * really ready and then never delivers, so re-bind once around ~13 s if
-         * the mouse still hasn't produced a single report. */
-        if (s_usb_phase == 0 && t > 500) {
-            s_usb_phase = 1;
-            rp1usb_autostart();
-        } else if (s_usb_phase == 1 && t > 1300) {
-            s_usb_phase = 2;
-            if (rp1usb_mouse_reports() == 0) rp1usb_autostart();   /* mouse never delivered */
+        /* Bind USB off the early-boot path that used to crash.  Binding is flaky
+         * (a device sometimes fails to enumerate or binds but never delivers), so
+         * keep re-running the full both-controller bind every ~2.5 s until BOTH
+         * the mouse and keyboard are bound, up to a handful of attempts. */
+        if (s_usb_tries < 8 && t >= s_usb_next) {
+            int n = rp1usb_autostart();          /* re-inits both controllers + binds */
+            s_usb_tries++;
+            if (n >= 2) s_usb_tries = 99;        /* both bound -> stop retrying */
+            else s_usb_next = t + 250;           /* otherwise retry in ~2.5 s */
         }
         rp1usb_mouse_pump();                                       /* USB mouse -> cursor */
     }
