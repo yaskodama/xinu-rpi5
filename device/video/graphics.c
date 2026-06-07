@@ -22,6 +22,28 @@ static int isin(int deg)
 }
 static int icos(int deg) { return isin(deg + 90); }
 
+static int isqrt(int v)
+{
+    if (v <= 0) return 0;
+    int x = v, y = (x + 1) / 2;
+    while (y < x) { x = y; y = (x + v / x) / 2; }
+    return x;
+}
+
+/* "コダマ" as straight strokes in a 230x90 cell (x right, y down); each stroke is
+ * extruded into a 3D box (a block) by draw_kodama().  Three chars side by side. */
+struct kstroke { short x0, y0, x1, y1; };
+static const struct kstroke kodama_strokes[] = {
+    /* コ */
+    {  5, 10,  60, 10}, { 58, 10,  58, 75}, {  5, 75,  60, 75},
+    /* ダ (タ + dakuten), shifted +80 */
+    { 88, 18, 125, 12}, {130,  8,  95, 80}, { 90, 40, 128, 40},
+    {138,  8, 144, 14}, {138, 18, 144, 24},
+    /* マ, shifted +160 */
+    {168, 15, 218, 15}, {218, 15, 198, 48}, {200, 40, 178, 82},
+};
+#define NKS ((int)(sizeof(kodama_strokes)/sizeof(kodama_strokes[0])))
+
 /* ---- wine-glass profile: (radius, height) in model units, bottom -> rim ------- */
 #define NP 11
 #define NS 14            /* segments around the axis of revolution */
@@ -46,6 +68,13 @@ void graphics_wine_start(void)
 void graphics_4lines_start(void)
 {
     g_mode = 1;
+    g_active = 1; g_step = 0; g_last_frame = 0;
+    g_ax = 0; g_ay = 0; g_az = 0;
+}
+
+void graphics_kodama_start(void)
+{
+    g_mode = 2;
     g_active = 1; g_step = 0; g_last_frame = 0;
     g_ax = 0; g_ay = 0; g_az = 0;
 }
@@ -84,10 +113,7 @@ static void draw_4lines(window_t *self)
     int vx[4] = { -Q,  Q,  Q, -Q };
     int vy[4] = { -Q, -Q,  Q,  Q };
 
-    for (int i = 0; i < 4; i++) {   /* faint square through the four centres */
-        int j = (i + 1) & 3;
-        draw_line(cx+vx[i], cy+vy[i], cx+vx[j], cy+vy[j], 0xFF335577u);
-    }
+    /* (no square drawn — just the four rotating segments) */
     unsigned int col[4] = { 0xFFFF6060u, 0xFF60FF60u, 0xFF6080FFu, 0xFFFFFF60u };
     for (int i = 0; i < 4; i++) {   /* segment centred on each corner, rotated */
         int dx = (R*c) >> 12, dy = (R*s) >> 12;
@@ -95,18 +121,62 @@ static void draw_4lines(window_t *self)
     }
 }
 
+/* "コダマ" — each stroke extruded into a wireframe 3D box, all rotating. */
+static void draw_kodama(window_t *self)
+{
+    int cw = self->width - 2;
+    int ch = self->height - WM_TITLEBAR_H - 3;
+    int cx = self->x + 1 + cw / 2;
+    int cy = self->y + WM_TITLEBAR_H + 2 + ch / 2;
+    #define KMAXR 122
+    int half = (cw < ch ? cw : ch) / 2 - 6;
+    int S = half * 100 / KMAXR;
+    if (S < 3) return;
+
+    const int T = 8, HD = 8, CXc = 112, CYc = 45;   /* thickness, half-depth, cell centre */
+    unsigned int col = 0xFFFFD060u;                 /* warm gold */
+    for (int i = 0; i < NKS; i++) {
+        int x0 = kodama_strokes[i].x0, y0 = kodama_strokes[i].y0;
+        int x1 = kodama_strokes[i].x1, y1 = kodama_strokes[i].y1;
+        int dx = x1 - x0, dy = y1 - y0;
+        int len = isqrt(dx*dx + dy*dy); if (len < 1) len = 1;
+        int px = -dy * (T/2) / len, py = dx * (T/2) / len;     /* perpendicular */
+        int rx[4] = { x0+px, x1+px, x1-px, x0-px };            /* rectangle corners */
+        int ry[4] = { y0+py, y1+py, y1-py, y0-py };
+        int fx[4], fy[4], bx[4], by[4];
+        for (int k = 0; k < 4; k++) {
+            int mx = rx[k] - CXc, my = -(ry[k] - CYc);         /* to centred, y-up */
+            int ox, oy;
+            rotate(mx, my,  HD, &ox, &oy); fx[k] = cx + (ox*S)/100; fy[k] = cy - (oy*S)/100;
+            rotate(mx, my, -HD, &ox, &oy); bx[k] = cx + (ox*S)/100; by[k] = cy - (oy*S)/100;
+        }
+        for (int k = 0; k < 4; k++) {                          /* 12 box edges */
+            int j = (k + 1) & 3;
+            draw_line(fx[k],fy[k], fx[j],fy[j], col);
+            draw_line(bx[k],by[k], bx[j],by[j], col);
+            draw_line(fx[k],fy[k], bx[k],by[k], col);
+        }
+    }
+}
+
 void graphics_draw(window_t *self, unsigned int frame)
 {
-    /* advance the spin every frame (no wait) until 30 steps are done */
+    /* advance the spin every frame (no wait) */
     (void)frame;
     if (g_active) {
-        g_ax = (g_ax + 12) % 360;
-        g_ay = (g_ay + 8)  % 360;
-        g_az = (g_az + 5)  % 360;
-        if (++g_step >= 30) g_active = 0;
+        if (g_mode == 1) {                 /* 4lines: fast, 50 full turns */
+            g_ax = (g_ax + 60) % 360;      /* 60 deg/frame -> 6 frames per turn */
+            if (++g_step >= 300) g_active = 0;   /* 300 frames = 50 turns */
+        } else {                           /* wine / kodama: 30 steps about x/y/z */
+            g_ax = (g_ax + 12) % 360;
+            g_ay = (g_ay + 8)  % 360;
+            g_az = (g_az + 5)  % 360;
+            if (++g_step >= 30) g_active = 0;
+        }
     }
 
     if (g_mode == 1) { draw_4lines(self); return; }
+    if (g_mode == 2) { draw_kodama(self); return; }
 
     int cw = self->width - 2;
     int ch = self->height - WM_TITLEBAR_H - 3;

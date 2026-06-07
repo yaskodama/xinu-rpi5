@@ -171,6 +171,15 @@ static int cmd_4lines(int argc, char **argv)
     return 0;
 }
 
+static int cmd_kodama(int argc, char **argv)
+{
+    extern void graphics_kodama_start(void);
+    (void)argc; (void)argv;
+    graphics_kodama_start();
+    uart_puts("kodama: spinning 3D block text in the Graphics window\n");
+    return 0;
+}
+
 static int cmd_echo(int argc, char **argv)
 {
     int i;
@@ -677,6 +686,7 @@ static const struct centry commandtab[] = {
     { "echo",   "echo the remaining words back",           cmd_echo   },
     { "wine",   "spin a 3D wireframe wine glass (Graphics)", cmd_wine  },
     { "4lines", "spin 4 segments on a square's corners",   cmd_4lines },
+    { "kodama", "spin 3D block text \"KODAMA\" (Graphics)", cmd_kodama },
     { "clear",  "clear the shell window",                  cmd_clear  },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },

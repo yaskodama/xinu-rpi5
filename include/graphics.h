@@ -12,7 +12,10 @@ void graphics_draw(window_t *self, unsigned int frame);
 /* Start the 30-step rotation about x/y/z (called by the `wine` shell command). */
 void graphics_wine_start(void);
 
-/* Start the 30-step four-rotating-lines animation (the `4lines` command). */
+/* Start the four-rotating-lines animation (the `4lines` command). */
 void graphics_4lines_start(void);
+
+/* Start the rotating 3D "コダマ" block text (the `kodama` command). */
+void graphics_kodama_start(void);
 
 #endif /* XINU_RPI5_GRAPHICS_H */
