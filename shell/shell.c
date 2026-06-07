@@ -34,8 +34,8 @@
 //                        through 1-slot inboxes for N rounds (default
 //                        5, capped at 50) then self-terminate when
 //                        both stop sending and the inboxes drain
-//   reboot               watchdog-driven reset via RP1 (stub — needs
-//                        more work; for now just spins)
+//   reboot               full SoC reset via the BCM2712 PM watchdog
+//                        (0x10_7D200000, bcm2835 RSTC/WDOG layout)
 //
 // Designed so phase S0 (thread switch) and S1 (clock IRQ) can later
 // replace these stubs without touching the dispatch code.
@@ -635,9 +635,22 @@ static int cmd_procdemo(int argc, char **argv)
 
 static int cmd_reboot(int argc, char **argv)
 {
+    /* Reset the SoC via the BCM2712 PM watchdog ("brcm,bcm2712-pm") at CPU PA
+     * 0x10_7D200000 — the same bcm2835-layout PM block (PM_RSTC 0x1c, PM_RSTS
+     * 0x20, PM_WDOG 0x24, password 0x5a000000) the Pi firmware uses to restart.
+     * Arm a ~150us watchdog with WRCFG_FULL_RESET; the hardware then resets. */
+    volatile unsigned int *PM = (volatile unsigned int *)0x107D200000UL;
+    const unsigned int PW = 0x5a000000u;          /* PM_PASSWORD */
+    volatile unsigned long d; unsigned int v;
     (void)argc; (void)argv;
-    uart_puts("reboot: RP1 watchdog not wired up yet — spinning in WFE.\n");
-    uart_puts("        (power-cycle the board to recover)\n");
+    uart_puts("reboot: BCM2712 PM watchdog -> full reset...\n");
+    v = (PM[0x20/4] & 0xfffffaaau) | PW;           /* PM_RSTS -> boot partition 0 */
+    PM[0x20/4] = v;
+    PM[0x24/4] = 10u | PW;                          /* PM_WDOG: ~10 ticks (~150us)  */
+    v = (PM[0x1c/4] & 0xffffffcfu) | PW | 0x20u;    /* PM_RSTC: WRCFG_FULL_RESET     */
+    PM[0x1c/4] = v;
+    for (d = 0; d < 200000000UL; d++) __asm__ volatile ("nop");   /* wait for it */
+    uart_puts("reboot: watchdog did not fire (firmware may block it).\n");
     for (;;) __asm__ volatile ("wfe");
 }
 
@@ -1000,7 +1013,7 @@ static const struct centry commandtab[] = {
     { "pan",      "pan <dx> <dy>  scroll viewport",        cmd_pan      },
     { "view",     "show viewport / desktop sizes",         cmd_view     },
     { "autopan",  "autopan [on|off]  toggle demo scroll",  cmd_autopan  },
-    { "reboot",   "stub — spins until power-cycle",        cmd_reboot   },
+    { "reboot",   "reboot the board (BCM2712 PM watchdog)",  cmd_reboot   },
     { "wifi",       "wifi on <ssid> <pass> | off | status | scan", cmd_wifi },
     { "wifi-invest","wifi diagnostics + maintenance (re-run bring-up, dump trace)", cmd_wifi_invest },
     { "?",      "alias for help",                          cmd_help   },
