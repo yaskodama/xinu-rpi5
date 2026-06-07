@@ -116,17 +116,15 @@ void uart_init(void)
 
 void uart_putc(char c)
 {
-    /* HDMI is the real display here, so update it FIRST (instant) and only then
-     * push the byte out the UART — otherwise every echoed keystroke is paced by
-     * the 115200-baud TX FIFO, which makes typing feel laggy on screen. */
+    /* HDMI is the real display here, so update it FIRST (instant). */
     shellwin_record_char(c);   /* wm shell window ring — safe before init (drops) */
     screen_putc(c);            /* text console — no-op before video_init()        */
 
-    /* UART TX last: busy-wait for FIFO room, then send (doesn't hold up HDMI). */
-    while (UART_FR & FR_TXFF) {
-        /* spin */
-    }
-    UART_DR = (unsigned int)(unsigned char)c;
+    /* UART TX is NON-blocking: this runs in the input/echo path (often the timer
+     * ISR), and the serial line is unused on this board, so never spin on the
+     * 115200-baud FIFO — just drop the byte if it's full.  Keeps typing snappy. */
+    if (!(UART_FR & FR_TXFF))
+        UART_DR = (unsigned int)(unsigned char)c;
 }
 
 void uart_puts(const char *s)
