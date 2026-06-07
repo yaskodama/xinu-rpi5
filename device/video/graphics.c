@@ -34,8 +34,18 @@ static int g_step;               /* 0..30 */
 static unsigned g_last_frame;
 static int g_ax, g_ay, g_az;     /* current rotation angles (degrees) */
 
+static int g_mode;               /* 0 = wine glass, 1 = four rotating lines */
+
 void graphics_wine_start(void)
 {
+    g_mode = 0;
+    g_active = 1; g_step = 0; g_last_frame = 0;
+    g_ax = 0; g_ay = 0; g_az = 0;
+}
+
+void graphics_4lines_start(void)
+{
+    g_mode = 1;
     g_active = 1; g_step = 0; g_last_frame = 0;
     g_ax = 0; g_ay = 0; g_az = 0;
 }
@@ -60,6 +70,31 @@ static void rotate(int x, int y, int z, int *ox, int *oy)
     (void)z2;
 }
 
+/* Four line segments, each centred on a corner of a square, all spinning. */
+static void draw_4lines(window_t *self)
+{
+    int cw = self->width - 2;
+    int ch = self->height - WM_TITLEBAR_H - 3;
+    int cx = self->x + 1 + cw / 2;
+    int cy = self->y + WM_TITLEBAR_H + 2 + ch / 2;
+    int M = (cw < ch ? cw : ch);
+    int Q = M / 4;                  /* half the square's side */
+    int R = M / 8;                  /* half the segment length */
+    int c = icos(g_ax), s = isin(g_ax);
+    int vx[4] = { -Q,  Q,  Q, -Q };
+    int vy[4] = { -Q, -Q,  Q,  Q };
+
+    for (int i = 0; i < 4; i++) {   /* faint square through the four centres */
+        int j = (i + 1) & 3;
+        draw_line(cx+vx[i], cy+vy[i], cx+vx[j], cy+vy[j], 0xFF335577u);
+    }
+    unsigned int col[4] = { 0xFFFF6060u, 0xFF60FF60u, 0xFF6080FFu, 0xFFFFFF60u };
+    for (int i = 0; i < 4; i++) {   /* segment centred on each corner, rotated */
+        int dx = (R*c) >> 12, dy = (R*s) >> 12;
+        draw_line(cx+vx[i]-dx, cy+vy[i]-dy, cx+vx[i]+dx, cy+vy[i]+dy, col[i]);
+    }
+}
+
 void graphics_draw(window_t *self, unsigned int frame)
 {
     /* advance the spin ~ every 4 frames until 30 steps are done */
@@ -70,6 +105,8 @@ void graphics_draw(window_t *self, unsigned int frame)
         g_az = (g_az + 5)  % 360;
         if (++g_step >= 30) g_active = 0;
     }
+
+    if (g_mode == 1) { draw_4lines(self); return; }
 
     int cw = self->width - 2;
     int ch = self->height - WM_TITLEBAR_H - 3;
