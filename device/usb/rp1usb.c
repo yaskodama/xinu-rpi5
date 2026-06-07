@@ -343,8 +343,17 @@ int rp1usb_enum_slot(int p)
     /* Port reset: write PR (bit4) + PP (bit9); change bits are RW1C. */
     R32(psc, 0) = (1u<<9) | (1u<<4);
     for (int i=0;i<100;i++){ xdelay(1000); if (!(R32(psc,0)&(1u<<4))) break; }  /* PR clears when done */
-    xdelay(20000);
+    xdelay(30000);
+    /* Re-read PORTSC until the port reports connected (CCS) AND a valid speed id
+     * (bits 13:10 != 0).  The speed field isn't reliable the instant reset clears,
+     * and a wrong speed makes Address Device / the interrupt EP silently fail. */
     g_enum_portsc = R32(psc, 0);
+    for (int i=0;i<20;i++){
+        unsigned int v = R32(psc, 0);
+        if ((v & 1u) && ((v>>10)&0xf)) { g_enum_portsc = v; break; }
+        g_enum_portsc = v;
+        xdelay(3000);
+    }
 
     /* Enable Slot (TRB type 9). */
     cmd_submit(0, 0, 0, (9u<<10));

@@ -606,6 +606,14 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, " cfgepCC="); bl = s_putdec(body, bl, rp1usb_cfgep_cc());
             bl = s_put(body, bl, " setprotoCC="); bl = s_putdec(body, bl, rp1usb_setproto_cc());
             bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/autostart")) {
+            extern int rp1usb_autostart(void);
+            extern int rp1usb_mouse_on(void), rp1usb_kbd_on(void);
+            int n = rp1usb_autostart();    /* re-init both controllers + rebind mouse+kbd */
+            bl = s_put(body, bl, "autostart bound="); bl = s_putdec(body, bl, n);
+            bl = s_put(body, bl, " mouse="); bl = s_putdec(body, bl, rp1usb_mouse_on());
+            bl = s_put(body, bl, " kbd="); bl = s_putdec(body, bl, rp1usb_kbd_on());
+            bl = s_put(body, bl, "\n");
         } else if (str_starts(rpath, "/usb/mousefull")) {
             extern int rp1usb_mouse_fullsetup(int), rp1usb_full_slot(void), rp1usb_full_speed(void);
             extern int rp1usb_auto_epaddr(void), rp1usb_auto_dci(void), rp1usb_auto_mps(void),

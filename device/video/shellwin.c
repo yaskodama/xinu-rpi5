@@ -99,12 +99,14 @@ void shellwin_draw(window_t *self, unsigned int frame)
                        ring[r], 0xFFCCE0FFU, self->content_bg);
     }
 
-    /* Blinking input caret at the current write position (end of the prompt
-     * line, which is always the newest displayed row).  ~2 Hz blink off `frame`. */
-    if ((frame >> 4) & 1) {
+    /* Input caret at the current write position (end of the prompt line, which
+     * is always the newest displayed row).  Solid bright block, dimming on the
+     * blink-off phase so it stays visible but still blinks. */
+    {
         int caret_x = cx + cur_col * FONT_WIDTH;
         int caret_y = cy + (rows - 1) * line_h;
-        fill_rect(caret_x, caret_y, FONT_WIDTH, FONT_HEIGHT, 0xFFCCE0FFU);
+        unsigned int col = ((frame >> 4) & 1) ? 0xFF00FF00U : 0xFF006600U;
+        fill_rect(caret_x, caret_y, FONT_WIDTH, FONT_HEIGHT, col);
     }
 }
 
