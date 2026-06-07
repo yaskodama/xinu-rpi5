@@ -1403,8 +1403,8 @@ void kernel_main(void)
          * viewport.  Half-size as the user requested. */
         softkbd_win.x = 776;
         softkbd_win.y = 820;
-        softkbd_win.width  = 575;
-        softkbd_win.height = 239;
+        softkbd_win.width  = 548;
+        softkbd_win.height = 238;
         const char *kbt = "Soft keyboard";
         for (int i = 0; i < WM_TITLE_MAX && kbt[i]; i++) softkbd_win.title[i] = kbt[i];
         softkbd_win.chrome_color = 0xFFFFB060U;
@@ -1415,10 +1415,10 @@ void kernel_main(void)
         wm_add(&softkbd_win);
 
         /* Graphics window — 3D wireframe wine glass driven by the `wine` cmd. */
-        graphics_win.x = 1335;
-        graphics_win.y = 300;
-        graphics_win.width  = 571;
-        graphics_win.height = 500;
+        graphics_win.x = 1336;
+        graphics_win.y = 305;
+        graphics_win.width  = 567;
+        graphics_win.height = 740;
         const char *gwt = "Graphics";
         for (int i = 0; i < WM_TITLE_MAX && gwt[i]; i++) graphics_win.title[i] = gwt[i];
         graphics_win.chrome_color = 0xFF60C0FFU;
