@@ -209,19 +209,31 @@ static void genet_rx_tick(void)
 #ifdef RP1_ETH_BASE
     {
         extern void rp1usb_mouse_pump(void);
-        extern int  rp1usb_autostart(void);
-        static int  s_usb_tries = 0;
+        extern int  rp1usb_autostart(void), rp1usb_rebind_ctrl(int);
+        extern int  rp1usb_mouse_on(void), rp1usb_kbd_on(void);
+        extern int  rp1usb_mouse_ctrl_get(void), rp1usb_kbd_ctrl_get(void);
+        extern unsigned long rp1usb_mouse_reports(void);
+        static int  s_usb_phase = 0;
         static unsigned long s_usb_next = 500;   /* first attempt ~5 s after boot */
         unsigned long t = timer_ticks();
-        /* Bind USB off the early-boot path that used to crash.  autostart inits
-         * each controller once and then just re-enumerates+re-binds; a single
-         * bind often comes up "bound but not delivering", and a re-bind fixes it.
-         * So run it a few times spaced out (NOT stopping at bound==2, which does
-         * not imply the device is actually delivering reports yet). */
-        if (s_usb_tries < 5 && t >= s_usb_next) {
-            rp1usb_autostart();
-            s_usb_tries++;
-            s_usb_next = t + 250;                /* ~2.5 s between attempts */
+        /* First a full bind; then, only for whatever is NOT working yet, re-bind
+         * just that one controller — never re-touch a mouse that's already
+         * delivering (re-enumerating a working device is what broke it before).
+         * Stop once the mouse is delivering and the keyboard is bound. */
+        if (s_usb_phase < 12 && t >= s_usb_next) {
+            if (s_usb_phase == 0) {
+                rp1usb_autostart();
+            } else {
+                int mouse_ok = rp1usb_mouse_on() && rp1usb_mouse_reports() > 0;
+                int kbd_ok   = rp1usb_kbd_on();
+                if (!mouse_ok)
+                    rp1usb_rebind_ctrl(rp1usb_mouse_on() ? rp1usb_mouse_ctrl_get() : 1);
+                else if (!kbd_ok)
+                    rp1usb_rebind_ctrl(rp1usb_kbd_on() ? rp1usb_kbd_ctrl_get() : 0);
+                if (mouse_ok && kbd_ok) s_usb_phase = 999;   /* both good -> done */
+            }
+            s_usb_phase++;
+            s_usb_next = t + 300;                /* ~3 s between attempts */
         }
         rp1usb_mouse_pump();                                       /* USB mouse -> cursor */
     }

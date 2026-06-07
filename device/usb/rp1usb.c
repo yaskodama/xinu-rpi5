@@ -718,15 +718,35 @@ static int            g_nbound;
 static void autostart_scan_current_ctrl(void)
 {
     extern int rp1usb_address_device(int,int,int,int);
-    for (int p = 1; p <= 3 && g_nbound < 2; p++) {
+    /* One output ctx per CONTROLLER (mouse on usb1 -> g_dev_ctx, kbd on usb0 ->
+     * g_kdevctx) so a single-controller re-bind always reuses the same ctx and
+     * can't collide with the other controller's already-bound device. */
+    unsigned char *ctx = (g_active_ctrl == 1) ? g_dev_ctx : g_kdevctx;
+    for (int p = 1; p <= 3; p++) {
         int slot = rp1usb_enum_slot(p);
         if (slot < 0) continue;
         int speed = (int)((g_enum_portsc >> 10) & 0xf);
-        g_addr_ctx = g_bind_ctxs[g_nbound];              /* address into the next free ctx */
+        g_addr_ctx = ctx;
         if (rp1usb_address_device(slot, p, speed, 0) != 0) continue;
         /* autosetup walks the descriptor and routes mouse vs keyboard by proto. */
-        if (rp1usb_hid_autosetup_if(slot, p, speed, -1) == 0) g_nbound++;
+        if (rp1usb_hid_autosetup_if(slot, p, speed, -1) == 0) { g_nbound++; break; }
     }
+}
+
+/* Re-enumerate + re-bind only ONE controller's HID device, leaving the other
+ * controller (and a device already delivering there) completely untouched. */
+int rp1usb_rebind_ctrl(int ctrl)
+{
+    ctrl = (ctrl == 1) ? 1 : 0;
+    g_autostart_active = 1;
+    if (g_mouse_active && g_mouse_ctrl == ctrl) g_mouse_active = 0;
+    if (g_kbd_active   && g_kbd_ctrl   == ctrl) g_kbd_active = 0;
+    rp1usb_select_ctrl(ctrl);
+    if (!g_cm[ctrl].inited) rp1usb_xhci_init();
+    if (g_cm[ctrl].inited) autostart_scan_current_ctrl();
+    g_addr_ctx = g_dev_ctx;
+    g_autostart_active = 0;
+    return 0;
 }
 int rp1usb_autostart(void)
 {
