@@ -43,10 +43,10 @@ static const struct kstroke kodama_strokes[] = {
     {100, 46, 132, 46},   /* middle bar                    */
     {143, 10, 150, 17},   /* dakuten 1                     */
     {143, 22, 150, 29},   /* dakuten 2                     */
-    /* マ = top bar + right diagonal to centre + diagonal to bottom-left */
-    {170, 15, 215, 15},
-    {215, 15, 188, 48},
-    {195, 42, 170, 80},
+    /* マ = top bar + フ-tail (right end -> mid-left) + 2nd long diagonal to bottom-left */
+    {170, 15, 213, 15},   /* top horizontal                 */
+    {213, 15, 182, 52},   /* フ tail, down-left to mid       */
+    {193, 15, 170, 80},   /* 2nd stroke, mid-bar -> bottom-left */
 };
 #define NKS ((int)(sizeof(kodama_strokes)/sizeof(kodama_strokes[0])))
 
