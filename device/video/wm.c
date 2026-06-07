@@ -14,6 +14,8 @@
 #define CURSOR_SUBMS     2
 
 static window_t *wm_head;
+static int       s_force_wipe;          /* repaint the whole desktop next frame */
+void wm_request_full_redraw(void) { s_force_wipe = 1; }
 static void    (*wm_tick)(void);
 
 /* Cursor overlay state — repainted on top of all windows every
@@ -260,9 +262,9 @@ void wm_run(void)
          * fill each frame roughly halves compose time (faster frames => lower
          * keyboard echo latency + smoother pointer). */
         video_set_viewport(0, 0);
-        if (vp_x != s_last_vp_x || vp_y != s_last_vp_y) {
+        if (vp_x != s_last_vp_x || vp_y != s_last_vp_y || s_force_wipe) {
             fill_rect(0, 0, sw, sh, DESKTOP_BG);
-            s_last_vp_x = vp_x; s_last_vp_y = vp_y;
+            s_last_vp_x = vp_x; s_last_vp_y = vp_y; s_force_wipe = 0;
         }
 
         /* Now switch to the panned camera and draw all windows in

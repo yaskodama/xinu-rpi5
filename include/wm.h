@@ -46,6 +46,10 @@ struct window *wm_focus_at(int screen_x, int screen_y);
 /* The window currently focused via wm_focus_at(), or NULL. */
 struct window *wm_focused(void);
 
+/* Force a full desktop repaint on the next frame (call after moving a window so
+ * its old position doesn't leave a trail now that the per-frame wipe is skipped). */
+void wm_request_full_redraw(void);
+
 /* Push `w` onto the global window list (it will be redrawn after
  * everything previously added, so later windows are "on top" in
  * draw order, though we don't currently overlap them). */

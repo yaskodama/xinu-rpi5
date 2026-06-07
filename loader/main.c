@@ -278,9 +278,36 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
      * video_cursor_to_front no-ops while a flip is in progress to avoid a race. */
     { extern void video_cursor_to_front(int,int,int); video_cursor_to_front(g_cursor_x, g_cursor_y, 1); }
 
-    /* Left button (bit0) press edge -> select the window under the cursor. */
-    if ((nButtons & 1u) && !(g_prev_btn & 1u))
-        wm_focus_at(g_cursor_x, g_cursor_y);
+    /* Window interaction with the left button (bit0): press selects+raises the
+     * window under the cursor; if the press lands on its title bar, start
+     * dragging; holding + moving drags the window; release ends the drag. */
+    {
+        extern void wm_request_full_redraw(void);
+        static window_t *drag_win;            /* window being dragged, or NULL */
+        static int drag_off_x, drag_off_y;    /* cursor offset inside the window */
+        int dpx = g_cursor_x + wm_view_x();   /* screen -> virtual-desktop coords */
+        int dpy = g_cursor_y + wm_view_y();
+
+        if ((nButtons & 1u) && !(g_prev_btn & 1u)) {        /* press edge */
+            window_t *w = wm_focus_at(g_cursor_x, g_cursor_y);
+            if (w && dpy >= w->y && dpy < w->y + WM_TITLEBAR_H) {
+                drag_win = w; drag_off_x = dpx - w->x; drag_off_y = dpy - w->y;
+            }
+        }
+        if (!(nButtons & 1u)) drag_win = 0;                 /* release ends drag */
+
+        if (drag_win) {                                     /* dragging: follow cursor */
+            int nx = dpx - drag_off_x, ny = dpy - drag_off_y;
+            if (ny < 0) ny = 0;                             /* keep title bar reachable */
+            if (nx < -(drag_win->width - 60)) nx = -(drag_win->width - 60);
+            if (nx > WM_DESKTOP_W - 60) nx = WM_DESKTOP_W - 60;
+            if (ny > WM_DESKTOP_H - WM_TITLEBAR_H) ny = WM_DESKTOP_H - WM_TITLEBAR_H;
+            if (nx != drag_win->x || ny != drag_win->y) {
+                drag_win->x = nx; drag_win->y = ny;
+                wm_request_full_redraw();                   /* clear the old position */
+            }
+        }
+    }
     g_prev_btn = nButtons;
 }
 
