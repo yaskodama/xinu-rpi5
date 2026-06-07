@@ -499,6 +499,20 @@ static int http_build(const char *req, char *out, int max)
         int arg = q_int(req, "arg", 0);
         char m[ACTOR_NAMELEN]; if (!q_param(req, "m", m, sizeof m)) m[0]=0;
         cc_actor_send_msg(to, m, arg, body, (int)sizeof body); bl = 0; while(body[bl])bl++;
+    } else if (str_starts(rpath, "/run")) {
+        /* Run a shell command from HTTP — a reliable way to drive the shell
+         * (wine/4lines/kodama/clear/...) when the USB keyboard is being flaky. */
+        extern int shell_dispatch_line(char *line);
+        ctype = "text/plain";
+        char cmd[128];
+        if (q_param(req, "cmd", cmd, sizeof cmd)) {
+            shell_dispatch_line(cmd);
+            bl = s_put(body, bl, "ran: ");
+            bl = s_put(body, bl, cmd);
+            bl = s_put(body, bl, "\n");
+        } else {
+            bl = s_put(body, bl, "usage: /run?cmd=<shell command>\n");
+        }
     } else if (str_starts(rpath, "/win/dump")) {
         /* Dump every window's current geometry so the live (dragged/resized)
          * layout can be captured back into the boot defaults. */
