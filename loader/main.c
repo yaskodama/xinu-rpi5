@@ -803,6 +803,28 @@ static void vfs_populate_demo(void)
         f = vfs_create_file(etc,  "version");  vfs_write_str(f, "Xinu Round 1 / " SOC_NAME);
         f = vfs_create_file(etc,  "kernel");   vfs_write_str(f, KERNEL_NAME);
     }
+    if (home) {
+        vfs_node_t *f;
+        /* C sample — factorial of 5 (= 120).  Run with: make /home/hello.c */
+        f = vfs_create_file(home, "hello.c");
+        vfs_write_str(f,
+            "/* C sample: factorial of 5 = 120 */\n"
+            "int main() {\n"
+            "    int n = 5, f = 1;\n"
+            "    while (n > 1) { f = f * n; n = n - 1; }\n"
+            "    return f;\n"
+            "}\n");
+        /* AIPL sample — uses the AIPL value_t tagged runtime.  make /home/hello.aipl */
+        f = vfs_create_file(home, "hello.aipl");
+        vfs_write_str(f,
+            "/* AIPL sample: tagged value_t arithmetic */\n"
+            "int main() {\n"
+            "    print(\"AIPL value_t: 20 + 22 = \");\n"
+            "    v_print(v_add(v_int(20), v_int(22)));\n"
+            "    print(\"\\n\");\n"
+            "    return 0;\n"
+            "}\n");
+    }
     if (proc) {
         char buf[24];
         unsigned long midr;

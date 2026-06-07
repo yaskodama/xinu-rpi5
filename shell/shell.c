@@ -233,6 +233,30 @@ static int cmd_cat(int argc, char **argv)
     return 0;
 }
 
+static int cmd_make(int argc, char **argv)
+{
+    extern int cc_run_source(const char *, int, char *, int, long *);
+    char path[128];
+    fs_resolve(argc >= 2 ? argv[1] : "/home/hello.c", path, sizeof path);
+    vfs_node_t *n = vfs_lookup(path);
+    if (!n || n->kind != VFS_FILE) {
+        uart_puts("make: no such file: "); uart_puts(path); uart_putc('\n');
+        uart_puts("       try: make /home/hello.c   or   make /home/hello.aipl\n");
+        return 0;
+    }
+    static char src[4096];
+    static char out[2048];
+    int len = vfs_read(n, src, sizeof src - 1);
+    src[len] = 0;
+    uart_puts("make: compiling + running "); uart_puts(path); uart_puts(" (on-device JIT)\n");
+    long rv = 0;
+    int rc = cc_run_source(src, len, out, sizeof out, &rv);
+    if (out[0]) { uart_puts(out); uart_putc('\n'); }
+    if (rc == 0) { uart_puts("=> return value = "); puts_dec((int)rv); uart_putc('\n'); }
+    else         { uart_puts("make: build/run failed\n"); }
+    return 0;
+}
+
 static int cmd_clear(int argc, char **argv)
 {
     extern void shellwin_clear(void);
@@ -781,6 +805,7 @@ static const struct centry commandtab[] = {
     { "cd",     "cd <dir>  change directory",              cmd_cd     },
     { "ls",     "ls [path]  list directory",               cmd_ls     },
     { "cat",    "cat <file>  print file contents",         cmd_cat    },
+    { "make",   "make [file]  JIT-compile + run a program", cmd_make  },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },
