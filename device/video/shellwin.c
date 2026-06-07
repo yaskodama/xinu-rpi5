@@ -53,6 +53,14 @@ void shellwin_init(void)
     uart_puts("Embedded Xinu (Pi 5) shell -- type 'help'\nxinu-pi5$ ");
 }
 
+void shellwin_clear(void)
+{
+    for (int r = 0; r < SHELLWIN_ROWS; r++) ring[r][0] = 0;
+    cur_row = 0;
+    cur_col = 0;
+    ring_filled = 0;
+}
+
 void shellwin_record_char(char c)
 {
     if (!inited) return;

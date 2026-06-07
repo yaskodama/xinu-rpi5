@@ -144,6 +144,15 @@ static int cmd_help(int argc, char **argv)
     return 0;
 }
 
+static int cmd_clear(int argc, char **argv)
+{
+    extern void shellwin_clear(void);
+    (void)argc; (void)argv;
+    shellwin_clear();           /* wipe scrollback; the post-dispatch prompt
+                                 * then lands on the now-empty first line */
+    return 0;
+}
+
 static int cmd_wine(int argc, char **argv)
 {
     extern void graphics_wine_start(void);
@@ -658,6 +667,7 @@ static const struct centry commandtab[] = {
     { "help",   "list the commands",                       cmd_help   },
     { "echo",   "echo the remaining words back",           cmd_echo   },
     { "wine",   "spin a 3D wireframe wine glass (Graphics)", cmd_wine  },
+    { "clear",  "clear the shell window",                  cmd_clear  },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },

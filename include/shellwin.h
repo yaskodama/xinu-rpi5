@@ -33,6 +33,9 @@ void shellwin_init(void);
  * (no-op) so wiring it into uart_putc() can't crash early boot. */
 void shellwin_record_char(char c);
 
+/* Wipe the scrollback and move the write head back to the first row/column. */
+void shellwin_clear(void);
+
 /* draw_content callback for wm — paints the visible ring onto
  * self's content area in chronological order. */
 void shellwin_draw(window_t *self, unsigned int frame);
