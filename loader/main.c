@@ -209,14 +209,19 @@ static void genet_rx_tick(void)
     {
         extern void rp1usb_mouse_pump(void);
         extern int  rp1usb_autostart(void);
-        static int  s_usb_autoinit = 0;
-        /* One-shot: ~5 s after boot (net settled), bring up usb1 + auto-bind the
-         * mouse.  Runs here in the timer ISR like the rest of USB, off the early-
-         * boot path that used to crash.  Set the flag first so a stall can't
-         * re-enter via a nested tick. */
-        if (!s_usb_autoinit && timer_ticks() > 500) {
-            s_usb_autoinit = 1;
+        extern unsigned long rp1usb_mouse_reports(void);
+        static int  s_usb_phase = 0;
+        unsigned long t = timer_ticks();
+        /* Bind USB ~5 s after boot (net settled), off the early-boot path that
+         * used to crash.  A first bind sometimes "succeeds" before the device is
+         * really ready and then never delivers, so re-bind once around ~13 s if
+         * the mouse still hasn't produced a single report. */
+        if (s_usb_phase == 0 && t > 500) {
+            s_usb_phase = 1;
             rp1usb_autostart();
+        } else if (s_usb_phase == 1 && t > 1300) {
+            s_usb_phase = 2;
+            if (rp1usb_mouse_reports() == 0) rp1usb_autostart();   /* mouse never delivered */
         }
         rp1usb_mouse_pump();                                       /* USB mouse -> cursor */
     }
@@ -1303,8 +1308,8 @@ void kernel_main(void)
          * the viewport (0..sw) shows at any moment. */
         banner_win.x = 0;
         banner_win.y = 0;
-        banner_win.width  = WM_DESKTOP_W;
-        banner_win.height = 28;
+        banner_win.width  = 1914;
+        banner_win.height = 58;
         const char *bt = "Xinu " BOARD_NAME " on " SOC_NAME;
         for (int i = 0; i < WM_TITLE_MAX && bt[i]; i++) banner_win.title[i] = bt[i];
         banner_win.chrome_color = 0xFFAACCEEU;
@@ -1316,10 +1321,10 @@ void kernel_main(void)
 
         /* Status window: right side of the initial viewport so
          * the shell on the left has room to show the full log. */
-        status_win.x = 772;
-        status_win.y = 44;
-        status_win.width  = 560;
-        status_win.height = 500;
+        status_win.x = 770;
+        status_win.y = 65;
+        status_win.width  = 537;
+        status_win.height = 379;
         const char *st = "System status";
         for (int i = 0; i < WM_TITLE_MAX && st[i]; i++) status_win.title[i] = st[i];
         status_win.chrome_color = 0xFF60FF60U;
@@ -1331,10 +1336,10 @@ void kernel_main(void)
 
         /* File-tree window: well off the initial viewport so the
          * user can pan right to discover it. */
-        ftree_win.x = 1344;
-        ftree_win.y = 44;
-        ftree_win.width  = 572;
-        ftree_win.height = 700;
+        ftree_win.x = 778;
+        ftree_win.y = 451;
+        ftree_win.width  = 527;
+        ftree_win.height = 186;
         const char *ft = "VFS tree";
         for (int i = 0; i < WM_TITLE_MAX && ft[i]; i++) ftree_win.title[i] = ft[i];
         ftree_win.chrome_color = 0xFF60D0FFU;
@@ -1346,10 +1351,10 @@ void kernel_main(void)
 
         /* Memory window: right side, below status so it sits in
          * the initial viewport with the shell on the left. */
-        mem_win.x = 772;
-        mem_win.y = 556;
-        mem_win.width  = 560;
-        mem_win.height = 518;
+        mem_win.x = 777;
+        mem_win.y = 646;
+        mem_win.width  = 537;
+        mem_win.height = 166;
         const char *mt = "Memory";
         for (int i = 0; i < WM_TITLE_MAX && mt[i]; i++) mem_win.title[i] = mt[i];
         mem_win.chrome_color = 0xFFFFE060U;
@@ -1361,10 +1366,10 @@ void kernel_main(void)
 
         /* Actors window: a third column on the right (panned into view if the
          * initial viewport is narrower).  Lists gateway + AIPL actors + GC. */
-        actors_win.x = 1344;
-        actors_win.y = 44;
-        actors_win.width  = 568;
-        actors_win.height = 1030;
+        actors_win.x = 1335;
+        actors_win.y = 69;
+        actors_win.width  = 571;
+        actors_win.height = 225;
         const char *at = "Actors";
         for (int i = 0; i < WM_TITLE_MAX && at[i]; i++) actors_win.title[i] = at[i];
         actors_win.chrome_color = 0xFFC080FFU;
@@ -1378,10 +1383,10 @@ void kernel_main(void)
          * boot log lives here and must stay visible without any
          * scrolling so the user can read what happened during
          * USPi init. */
-        shell_win.x = 0;
-        shell_win.y = 44;
-        shell_win.width  = 760;
-        shell_win.height = 1030;
+        shell_win.x = 5;
+        shell_win.y = 67;
+        shell_win.width  = 755;
+        shell_win.height = 997;
         const char *swt = "Shell (UART)";
         for (int i = 0; i < WM_TITLE_MAX && swt[i]; i++) shell_win.title[i] = swt[i];
         shell_win.chrome_color = 0xFF80E080U;
@@ -1395,10 +1400,10 @@ void kernel_main(void)
 
         /* Soft keyboard window: bottom-left of the initial 640×480
          * viewport.  Half-size as the user requested. */
-        softkbd_win.x = 1344;
-        softkbd_win.y = 756;
-        softkbd_win.width  = 572;
-        softkbd_win.height = 318;
+        softkbd_win.x = 776;
+        softkbd_win.y = 820;
+        softkbd_win.width  = 575;
+        softkbd_win.height = 239;
         const char *kbt = "Soft keyboard";
         for (int i = 0; i < WM_TITLE_MAX && kbt[i]; i++) softkbd_win.title[i] = kbt[i];
         softkbd_win.chrome_color = 0xFFFFB060U;
