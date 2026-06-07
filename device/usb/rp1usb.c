@@ -732,6 +732,7 @@ int rp1usb_autostart(void)
 {
     g_bind_ctxs[0] = g_dev_ctx; g_bind_ctxs[1] = g_kdevctx;
     g_nbound = 0;
+    g_mouse_active = 0; g_kbd_active = 0;   /* clear so a re-run re-binds fresh */
     g_autostart_active = 1;
     /* usb1 first (commonly the mouse), then usb0 (keyboard + the boot stick).
      * Each controller has its own ring memory, so initialising the second does
@@ -911,6 +912,12 @@ void rp1usb_mouse_pump(void)
 }
 unsigned long rp1usb_kbd_reports(void){ return g_kbd_reports; }
 int           rp1usb_kbd_on(void)     { return g_kbd_active; }
+int rp1usb_mouse_ctrl_get(void){ return g_mouse_ctrl; }
+int rp1usb_kbd_ctrl_get(void)  { return g_kbd_ctrl; }
+int rp1usb_mouse_slot_get(void){ return g_mouse_slot; }
+int rp1usb_mouse_dci_get(void) { return g_mouse_dci; }
+int rp1usb_kbd_slot_get(void)  { return g_kbd_slot; }
+int rp1usb_kbd_dci_get(void)   { return g_kbd_dci; }
 unsigned long rp1usb_mouse_reports(void){ return g_mouse_reports; }
 int           rp1usb_mouse_on(void)     { return g_mouse_active; }
 int           rp1usb_last_btn(void)     { return g_last_btn; }

@@ -669,8 +669,17 @@ static int http_build(const char *req, char *out, int max)
           bl = s_put(body, bl, " evtidx="); bl = s_putdec(body, bl, rp1usb_evt_idx());
           bl = s_put(body, bl, " ep1idx="); bl = s_putdec(body, bl, rp1usb_ep1_idx_get()); }
         { extern int rp1usb_kbd_on(void); extern unsigned long rp1usb_kbd_reports(void);
+          extern int rp1usb_mouse_ctrl_get(void), rp1usb_kbd_ctrl_get(void),
+                     rp1usb_mouse_slot_get(void), rp1usb_mouse_dci_get(void),
+                     rp1usb_kbd_slot_get(void), rp1usb_kbd_dci_get(void);
           bl = s_put(body, bl, "\nkbd: active="); bl = s_putdec(body, bl, rp1usb_kbd_on());
-          bl = s_put(body, bl, " reports="); bl = s_putdec(body, bl, (int)rp1usb_kbd_reports()); }
+          bl = s_put(body, bl, " reports="); bl = s_putdec(body, bl, (int)rp1usb_kbd_reports());
+          bl = s_put(body, bl, "\ntopo: mouse ctrl="); bl = s_putdec(body, bl, rp1usb_mouse_ctrl_get());
+          bl = s_put(body, bl, " slot="); bl = s_putdec(body, bl, rp1usb_mouse_slot_get());
+          bl = s_put(body, bl, " dci="); bl = s_putdec(body, bl, rp1usb_mouse_dci_get());
+          bl = s_put(body, bl, " | kbd ctrl="); bl = s_putdec(body, bl, rp1usb_kbd_ctrl_get());
+          bl = s_put(body, bl, " slot="); bl = s_putdec(body, bl, rp1usb_kbd_slot_get());
+          bl = s_put(body, bl, " dci="); bl = s_putdec(body, bl, rp1usb_kbd_dci_get()); }
         { extern unsigned int rp1usb_slot_state(void), rp1usb_boundep_state(void),
                               rp1usb_boundep_deqlo(void), rp1usb_mfindex(void);
           extern int rp1usb_bound_dci(void);
