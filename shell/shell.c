@@ -144,6 +144,15 @@ static int cmd_help(int argc, char **argv)
     return 0;
 }
 
+static int cmd_wine(int argc, char **argv)
+{
+    extern void graphics_wine_start(void);
+    (void)argc; (void)argv;
+    graphics_wine_start();
+    uart_puts("wine: spinning the 3D wireframe wine glass in the Graphics window\n");
+    return 0;
+}
+
 static int cmd_echo(int argc, char **argv)
 {
     int i;
@@ -648,6 +657,7 @@ static int cmd_halt(int argc, char **argv)
 static const struct centry commandtab[] = {
     { "help",   "list the commands",                       cmd_help   },
     { "echo",   "echo the remaining words back",           cmd_echo   },
+    { "wine",   "spin a 3D wireframe wine glass (Graphics)", cmd_wine  },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },

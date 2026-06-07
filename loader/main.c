@@ -24,6 +24,7 @@
 #include "fat32.h"
 #include "usb.h"
 #include "shellwin.h"
+#include "graphics.h"
 #include "softkbd.h"
 #include "exception.h"
 #include "gic.h"
@@ -1412,6 +1413,20 @@ void kernel_main(void)
         softkbd_win.content_bg   = 0xFF0A0A14U;
         softkbd_win.draw_content = softkbd_draw;
         wm_add(&softkbd_win);
+
+        /* Graphics window — 3D wireframe wine glass driven by the `wine` cmd. */
+        graphics_win.x = 1335;
+        graphics_win.y = 300;
+        graphics_win.width  = 571;
+        graphics_win.height = 500;
+        const char *gwt = "Graphics";
+        for (int i = 0; i < WM_TITLE_MAX && gwt[i]; i++) graphics_win.title[i] = gwt[i];
+        graphics_win.chrome_color = 0xFF60C0FFU;
+        graphics_win.title_bg     = 0xFF103050U;
+        graphics_win.title_fg     = 0xFFFFFFFFU;
+        graphics_win.content_bg   = 0xFF000008U;
+        graphics_win.draw_content = graphics_draw;
+        wm_add(&graphics_win);
 
         /* Start the cursor at the centre of the *screen* (not the
          * virtual desktop) so it stays in view as the viewport

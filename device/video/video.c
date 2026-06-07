@@ -365,6 +365,24 @@ void draw_rect(int x, int y, int w, int h, unsigned int color)
     fill_rect(x + w - 1, y,         1, h, color);   /* right  */
 }
 
+/* Bresenham line in virtual-desktop coords (viewport-relative, clipped to fb). */
+void draw_line(int x0, int y0, int x1, int y1, unsigned int color)
+{
+    if (!fb_ready) return;
+    x0 -= view_x; y0 -= view_y; x1 -= view_x; y1 -= view_y;
+    int dx =  (x1 > x0 ? x1 - x0 : x0 - x1), sx = x0 < x1 ? 1 : -1;
+    int dy = -(y1 > y0 ? y1 - y0 : y0 - y1), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < (int)fb_width && y0 >= 0 && y0 < (int)fb_height)
+            *(volatile unsigned int *)(fb_draw + y0*fb_pitch + x0*4) = color;
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
 void draw_glyph_at(int px, int py, char c,
                    unsigned int fg, unsigned int bg)
 {

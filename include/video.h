@@ -74,6 +74,7 @@ int  video_viewport_y(void);
 /* Solid fill / outline rectangle at pixel (x,y), dimensions w×h. */
 void fill_rect(int x, int y, int w, int h, unsigned int color);
 void draw_rect(int x, int y, int w, int h, unsigned int color);
+void draw_line(int x0, int y0, int x1, int y1, unsigned int color);
 
 /* 8x8 glyph drawing with explicit foreground / background colour.
  * draw_string_at advances 8 pixels per character; caller wraps. */
