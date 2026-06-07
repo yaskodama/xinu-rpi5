@@ -498,6 +498,21 @@ static int http_build(const char *req, char *out, int max)
         int arg = q_int(req, "arg", 0);
         char m[ACTOR_NAMELEN]; if (!q_param(req, "m", m, sizeof m)) m[0]=0;
         cc_actor_send_msg(to, m, arg, body, (int)sizeof body); bl = 0; while(body[bl])bl++;
+    } else if (str_starts(rpath, "/win/dump")) {
+        /* Dump every window's current geometry so the live (dragged/resized)
+         * layout can be captured back into the boot defaults. */
+        extern struct window *wm_nth(int id);
+        ctype = "text/plain";
+        for (int i = 0; i < 16; i++) {
+            struct window *w = wm_nth(i);
+            if (!w) break;
+            bl = s_putdec(body, bl, i);
+            bl = s_put(body, bl, " x="); bl = s_putdec(body, bl, w->x);
+            bl = s_put(body, bl, " y="); bl = s_putdec(body, bl, w->y);
+            bl = s_put(body, bl, " w="); bl = s_putdec(body, bl, w->width);
+            bl = s_put(body, bl, " h="); bl = s_putdec(body, bl, w->height);
+            bl = s_put(body, bl, " \""); bl = s_put(body, bl, w->title); bl = s_put(body, bl, "\"\n");
+        }
     } else if (str_starts(rpath, "/usb")) {
         /* USB/xHCI diagnostics over HTTP (serial is unreliable on Pi 5). */
         extern unsigned int rp1usb_ver(int); extern int rp1usb_ports(int);
