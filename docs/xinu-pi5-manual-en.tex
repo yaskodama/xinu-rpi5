@@ -1,0 +1,329 @@
+% Embedded Xinu Raspberry Pi 5 — User's Manual (English)
+% Build: pdflatex xinu-pi5-manual-en.tex
+\documentclass[a4paper,11pt]{article}
+
+\usepackage[margin=24mm]{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{longtable}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{codebg}{gray}{0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=4pt, xrightmargin=4pt,
+  aboveskip=6pt, belowskip=6pt,
+}
+\newcommand{\cmd}[1]{\texttt{#1}}
+
+\title{\textbf{Embedded Xinu\\ Raspberry Pi 5 (BCM2712) \\ User's Manual}}
+\author{Xinu-rpi5 Project}
+\date{June 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%======================================================================
+\section{Introduction}
+This document is the user's manual for the Embedded Xinu kernel
+(\texttt{xinu-rpi5}) that runs bare-metal on the Raspberry Pi 5
+(BCM2712 / Cortex-A76). The system is a single-image AArch64 kernel with
+the MMU enabled, and provides:
+
+\begin{itemize}[noitemsep]
+  \item HDMI framebuffer and a window system (desktop)
+  \item Wired Ethernet over RP1 (TCP/IP and an HTTP gateway)
+  \item Full WiFi via the on-board CYW43455 (scan / WPA2 / DHCP / ping)
+  \item USB mouse and keyboard via the RP1 xHCI
+  \item microSD read/write (FAT32) mounted at \texttt{/microsd}
+  \item A \texttt{kexec} selector that switches to another kernel in RAM
+  \item Four OS variants derived from a single source tree
+\end{itemize}
+
+\paragraph{Important prerequisite (boot media).}
+The board \textbf{boots from a USB stick}; the on-board microSD slot is
+normally empty. The firmware loads \texttt{kernel\_2712.img} from the
+USB stick's FAT partition (\texttt{bootfs}). The microSD slot is used as
+a \textbf{data} area handled by this kernel's SD driver
+(mounted at \texttt{/microsd}).
+
+%======================================================================
+\section{System Overview}
+
+\subsection{Key Specifications}
+\begin{longtable}{ll}
+\hline
+Item & Value \\
+\hline
+SoC & BCM2712 (Cortex-A76, AArch64) \\
+Kernel image & \texttt{kernel\_2712.img} (entry \texttt{0x80000}) \\
+MMU & Enabled (identity map, caches off) \\
+Debug UART & \texttt{0x107D001000} (3-pin JST, 115200 8N1) \\
+HDMI & Default 1920$\times$1080$\times$32 (OS3 uses 1280$\times$720) \\
+Wired IP (static) & \texttt{192.168.3.101} \\
+microSD controller & sdhci-brcmstb sdio1 (\texttt{0x10\_00FFF000}) \\
+USB host & RP1 DWC3/xHCI (over PCIe) \\
+\hline
+\end{longtable}
+
+\subsection{Console}
+Output appears on both the HDMI text console and the debug UART
+(\texttt{uart\_putc} is mirrored to the screen). When the desktop starts,
+the window system takes over the screen and the text console is hidden.
+Remote operation over the network (Section~\ref{sec:remote}) is the most
+reliable way to drive the system.
+
+%======================================================================
+\section{Flashing and Booting the Kernel}
+
+\subsection{Build}
+Run \texttt{make} in the \texttt{compile/} directory.
+
+\begin{lstlisting}[language=bash]
+cd compile
+make pi5        # Full OS         -> kernel_2712.img
+make pi5-osmin  # OS1 (minimal)   -> kernel_min.img
+make pi5-os2    # OS2 (no WM)      -> kernel_os2.img
+make pi5-os3    # OS3 (lower res)  -> kernel_os3.img
+\end{lstlisting}
+
+\subsection{Writing to the USB Stick (Mac)}
+Insert the USB stick (FAT partition = \texttt{bootfs}) into the Mac, copy
+the image, and eject. Always verify the mount point.
+
+\begin{lstlisting}[language=bash]
+diskutil mount /dev/disk4s1
+cp kernel_2712.img /Volumes/bootfs/kernel_2712.img
+sync
+diskutil unmount /dev/disk4s1
+\end{lstlisting}
+
+After writing, put the USB stick back into the Pi 5 and power it on. The
+boot log appears on the UART/HDMI after the firmware initialises (about
+ten-plus seconds).
+
+%======================================================================
+\section{The Four OS Variants and Switching with kexec}
+\label{sec:variants}
+
+Four kernels are produced from the same \texttt{main.c} by changing only
+the compile flags. Any of them can be switched at runtime via
+\texttt{kexec} (Section~\ref{sec:kexec}).
+
+\begin{longtable}{lll}
+\hline
+Name & Image & Characteristics \\
+\hline
+Full OS & \texttt{kernel\_2712.img} & Window system + networking (all features) \\
+OS1 & \texttt{OS1.IMG} & Shell only. No networking, no windows \\
+OS2 & \texttt{OS2.IMG} & All features but no window system (text console) \\
+OS3 & \texttt{OS3.IMG} & All features, HDMI lowered one rank to 1280$\times$720 \\
+\hline
+\end{longtable}
+
+\begin{itemize}[noitemsep]
+  \item \textbf{OS1 (minimal)}: no networking and no windows. Shows an
+        \texttt{xinu-min\$} prompt on the HDMI text console; driven by the
+        USB keyboard.
+  \item \textbf{OS2 (no WM)}: keeps all features (networking, etc.) but runs
+        the shell on a full-screen text console instead of the window manager
+        (prompt \texttt{xinu-os2\$}). Remote operation over the network also
+        works.
+  \item \textbf{OS3 (lower resolution)}: same as the full OS but with HDMI at
+        1280$\times$720.
+\end{itemize}
+
+\paragraph{Readability.} The text-console font is the 8$\times$8 glyph scaled
+3$\times$ (active on OS1 and OS2).
+
+%======================================================================
+\section{microSD Storage}
+\label{sec:storage}
+
+The on-board microSD slot is mounted at \texttt{/microsd} (the directory
+exists even with no card inserted). Reading a FAT32 card and persistently
+writing small files are both supported.
+
+\subsection{Listing and Reading}
+\begin{lstlisting}[language=bash]
+ls /microsd                 # list files on the card
+cat /microsd/CONFIG.TXT     # print a file's contents
+\end{lstlisting}
+
+\subsection{Writing (persistent)}
+A small file (up to one cluster, 32\,KB) can be written persistently to the
+card over HTTP. The body is the content; the end of the URL is the file name
+(8.3 form).
+
+\begin{lstlisting}[language=bash]
+curl -X POST --data-binary "hello from xinu" \
+     http://192.168.3.101/microsd/write/TEST.TXT
+# Survives a reboot: ls /microsd / cat /microsd/TEST.TXT
+\end{lstlisting}
+
+\subsection{Diagnostics}
+A diagnostic command that shows the SD controller and card init state.
+\begin{lstlisting}[language=bash]
+sdtest        # shows controller + CMD0/CMD8/ACMD41 responses
+\end{lstlisting}
+
+%======================================================================
+\section{kexec Kernel Selector}
+\label{sec:kexec}
+
+\texttt{kexec} loads a kernel image from the microSD into RAM and jumps to
+it without a power cycle (no re-flash). Because it is a RAM-only operation,
+even a bad image is recovered by power-cycling back into the USB full OS;
+there is no brick risk.
+
+\begin{lstlisting}[language=bash]
+kexec /microsd/OS1.IMG      # boot OS1 (minimal)
+kexec /microsd/OS2.IMG      # boot OS2 (no WM)
+kexec /microsd/OS3.IMG      # boot OS3 (lower resolution)
+kexec /microsd/KERNEL~1.IMG # the full OS stored on the card
+\end{lstlisting}
+
+\paragraph{Notes.}
+\begin{itemize}[noitemsep]
+  \item Networking drops after \texttt{kexec} (PCIe is re-initialised from a
+        non-firmware state). Check the result on the HDMI screen.
+  \item Only \textbf{bare-metal Xinu kernels} can be booted. A Linux kernel
+        (e.g.\ \texttt{KERNEL8.IMG}, about 9.6\,MB) needs a different boot
+        protocol and would hang under the simple chainloader. This
+        implementation refuses any image $\geq$ 4\,MB as Linux (both Xinu and
+        Linux are arm64 Images sharing the same magic, so size is used to tell
+        them apart).
+\end{itemize}
+
+%======================================================================
+\section{Shell Commands}
+Run from the on-screen shell (USB keyboard) or over the network
+(Section~\ref{sec:remote}) via \texttt{/run?cmd=...}. The main commands:
+
+\begin{longtable}{ll}
+\hline
+Command & Description \\
+\hline
+\cmd{help} & list commands \\
+\cmd{ls [path]} & list a directory \\
+\cmd{cat <file>} & print a file's contents \\
+\cmd{cd / pwd} & change / print the current directory \\
+\cmd{kexec /microsd/<k.img>} & boot another kernel (Section~\ref{sec:kexec}) \\
+\cmd{cc <file> / make <file>} & compile and run a C/AIPL program in place \\
+\cmd{mem} & heap / BSS status \\
+\cmd{peek <hex>} & read a 32-bit MMIO word \\
+\cmd{uptime} & generic timer value \\
+\cmd{ps} & core / EL status \\
+\cmd{wifi on/off/status/scan} & WiFi operations (Section~\ref{sec:wifi}) \\
+\cmd{sdtest} & SD controller diagnostics \\
+\cmd{reboot} & reboot (PM watchdog) \\
+\cmd{clear} & clear the screen \\
+\hline
+\end{longtable}
+
+%======================================================================
+\section{Remote Operation over the Network}
+\label{sec:remote}
+The Full OS, OS2, and OS3 listen for HTTP on the wired IP
+\texttt{192.168.3.101}. Even where serial input is awkward, the system can
+be driven with \texttt{curl} from a Mac or similar.
+
+\begin{longtable}{ll}
+\hline
+Endpoint & Description \\
+\hline
+\cmd{/run?cmd=<shell>} & run any shell command and return its output \\
+\cmd{/fs}, \cmd{/fs/ls/<d>}, \cmd{/fs/cat/<f>} & browse the VFS tree \\
+\cmd{/fs/write/<f>} (POST) & write a file to the VFS (tmpfs) \\
+\cmd{/microsd/write/<NAME>} (POST) & persistent write to microSD (Section~\ref{sec:storage}) \\
+\cmd{/usb/...} & USB enumeration and diagnostics (Section~\ref{sec:usb}) \\
+\cmd{/api/actors}, \cmd{/send?to=\&m=} & actor / AIPL gateway \\
+\hline
+\end{longtable}
+
+\begin{lstlisting}[language=bash]
+curl 'http://192.168.3.101/run?cmd=ls%20/microsd'
+curl 'http://192.168.3.101/run?cmd=cat%20/microsd/CONFIG.TXT'
+curl 'http://192.168.3.101/run?cmd=wifi%20status'
+\end{lstlisting}
+
+\noindent\textbf{Note}: encode spaces in the URL as \texttt{\%20} or
+\texttt{+}. The output buffer is bounded, so long results are split.
+
+%======================================================================
+\section{WiFi}
+\label{sec:wifi}
+Full WiFi via the on-board CYW43455 (scan / WPA2 / DHCP / ping) is supported.
+Credentials are embedded into the kernel at build time, and the system
+\textbf{does not auto-connect at boot}. It connects only when \cmd{wifi on}
+is run.
+
+\begin{lstlisting}[language=bash]
+wifi on        # connect (using the embedded credentials)
+wifi status    # connection state, SSID, IP
+wifi scan      # scan nearby APs
+wifi off       # disconnect
+\end{lstlisting}
+
+A WiFi signal icon is drawn at the bottom-right of the screen, with the
+SSID and local IP shown beneath it.
+
+%======================================================================
+\section{USB (Mouse and Keyboard)}
+\label{sec:usb}
+The USB-A ports connect to two DWC3/xHCI controllers inside the RP1.
+To avoid faulting the boot, enumeration runs automatically a few seconds
+after boot (or can be driven manually via the \texttt{/usb/...} endpoints).
+The boot mouse moves the cursor and the keyboard feeds the shell.
+
+%======================================================================
+\section{Appendix}
+
+\subsection{Build Targets}
+\begin{longtable}{ll}
+\hline
+Target & Output \\
+\hline
+\cmd{make pi5} & \texttt{kernel\_2712.img} (Full OS) \\
+\cmd{make pi5-osmin} & \texttt{kernel\_min.img} (OS1) \\
+\cmd{make pi5-os2} & \texttt{kernel\_os2.img} (OS2) \\
+\cmd{make pi5-os3} & \texttt{kernel\_os3.img} (OS3) \\
+\hline
+\end{longtable}
+
+\subsection{Troubleshooting}
+\begin{itemize}[noitemsep]
+  \item \textbf{HTTP not responding}: right after boot the network is not yet
+        up. Wait ten-plus seconds and retry. Networking drops after
+        \texttt{kexec}; power-cycle to return to the USB full OS.
+  \item \textbf{\texttt{kexec} says ``too large''}: an image $\geq$ 4\,MB
+        (e.g.\ a Linux kernel) cannot be chainloaded. Specify a bare-metal
+        Xinu image.
+  \item \textbf{\texttt{/microsd} is empty}: check that a microSD is in the
+        slot. Use \texttt{sdtest} to inspect the init state.
+  \item \textbf{No display}: if the HDMI framebuffer mailbox init fails, the
+        console is UART-only.
+\end{itemize}
+
+\subsection{Safety Notes}
+\begin{itemize}[noitemsep]
+  \item Never commit the WiFi password to the source repository (it is
+        embedded at build time from a \texttt{.gitignore}d file).
+  \item \texttt{kexec} is a RAM-only operation; even an invalid image is
+        recovered by power-cycling (no risk of flash corruption).
+\end{itemize}
+
+\vfill
+\begin{center}\small Embedded Xinu / Raspberry Pi 5 --- June 2026\end{center}
+
+\end{document}

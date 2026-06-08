@@ -1,0 +1,319 @@
+% Embedded Xinu Raspberry Pi 5 ユーザーズマニュアル
+% コンパイル: lualatex xinu-pi5-manual.tex  (LuaTeX-ja / ltjsarticle)
+\documentclass[a4paper,11pt]{ltjsarticle}
+
+\usepackage{luatexja}
+\usepackage[margin=24mm]{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{longtable}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{codebg}{gray}{0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=4pt, xrightmargin=4pt,
+  aboveskip=6pt, belowskip=6pt,
+}
+% コマンド片用ショートカット
+\newcommand{\cmd}[1]{\texttt{#1}}
+
+\title{\textbf{Embedded Xinu\\ Raspberry Pi 5 (BCM2712) \\ ユーザーズマニュアル}}
+\author{Xinu-rpi5 プロジェクト}
+\date{2026年6月}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%======================================================================
+\section{はじめに}
+本書は、Raspberry Pi 5（BCM2712 / Cortex-A76）上でベアメタル動作する
+Embedded Xinu カーネル（\texttt{xinu-rpi5}）の使い方をまとめたユーザーズ
+マニュアルである。本システムは MMU を有効化した AArch64 のシングルイメージ
+カーネルで、以下を備える。
+
+\begin{itemize}[noitemsep]
+  \item HDMI フレームバッファとウィンドウシステム（デスクトップ）
+  \item RP1 経由の有線イーサネット（TCP/IP・HTTP ゲートウェイ）
+  \item 内蔵 CYW43455 による WiFi（スキャン／WPA2／DHCP／ping）
+  \item RP1 xHCI による USB マウス・キーボード
+  \item microSD カードの読み書き（FAT32）と \texttt{/microsd} マウント
+  \item RAM 上で別カーネルへ切り替える \texttt{kexec} セレクタ
+  \item 1 つのソースから派生する 4 種類の OS バリアント
+\end{itemize}
+
+\paragraph{重要な前提（起動メディア）.}
+本機は\textbf{USB メモリから起動}し、本体の microSD スロットは通常空である。
+USB メモリの FAT パーティション（\texttt{bootfs}）に置いた
+\texttt{kernel\_2712.img} がファームウェアによって読み込まれて起動する。
+microSD スロットは、本カーネルの SD ドライバが扱う\textbf{データ用}領域として
+利用する（\texttt{/microsd}）。
+
+%======================================================================
+\section{システム構成}
+
+\subsection{主要諸元}
+\begin{longtable}{ll}
+\hline
+項目 & 値 \\
+\hline
+SoC & BCM2712 (Cortex-A76, AArch64) \\
+カーネルイメージ & \texttt{kernel\_2712.img}（エントリ \texttt{0x80000}）\\
+MMU & 有効（恒等マップ、キャッシュ OFF）\\
+デバッグ UART & \texttt{0x107D001000}（3ピン JST、115200 8N1）\\
+HDMI & 既定 1920$\times$1080$\times$32（OS3 は 1280$\times$720）\\
+有線 IP（静的） & \texttt{192.168.3.101} \\
+microSD コントローラ & sdhci-brcmstb sdio1（\texttt{0x10\_00FFF000}）\\
+USB ホスト & RP1 内 DWC3/xHCI（PCIe 経由）\\
+\hline
+\end{longtable}
+
+\subsection{コンソール}
+出力は HDMI のテキストコンソールとデバッグ UART の両方に出る
+（\texttt{uart\_putc} が画面にもミラーされる）。デスクトップ起動時は
+ウィンドウシステムが画面を占有するため、テキストコンソールは隠れる。
+ネットワーク経由のリモート操作（第\ref{sec:remote}節）が最も確実な操作手段である。
+
+%======================================================================
+\section{カーネルのフラッシュと起動}
+
+\subsection{ビルド}
+\texttt{compile/} ディレクトリで \texttt{make} を実行する。
+
+\begin{lstlisting}[language=bash]
+cd compile
+make pi5        # フル OS        -> kernel_2712.img
+make pi5-osmin  # OS1 (最小)     -> kernel_min.img
+make pi5-os2    # OS2 (WMなし)   -> kernel_os2.img
+make pi5-os3    # OS3 (低解像度) -> kernel_os3.img
+\end{lstlisting}
+
+\subsection{USB メモリへの書き込み（Mac）}
+USB メモリ（FAT パーティション = \texttt{bootfs}）を Mac に挿し、
+イメージをコピーして取り外す。マウントポイントを必ず確認すること。
+
+\begin{lstlisting}[language=bash]
+diskutil mount /dev/disk4s1
+cp kernel_2712.img /Volumes/bootfs/kernel_2712.img
+sync
+diskutil unmount /dev/disk4s1
+\end{lstlisting}
+
+書き込んだら USB メモリを Pi 5 に戻し、電源を入れる。ファームウェアの
+初期化に十数秒かかった後、起動ログが UART／HDMI に表示される。
+
+%======================================================================
+\section{4 つの OS バリアントと kexec による切り替え}
+\label{sec:variants}
+
+同一の \texttt{main.c} からコンパイルフラグだけを変えて、4 種類のカーネルを
+生成できる。いずれも \texttt{kexec}（第\ref{sec:kexec}節）で相互に切り替え可能。
+
+\begin{longtable}{lll}
+\hline
+名称 & イメージ & 特徴 \\
+\hline
+フル OS & \texttt{kernel\_2712.img} & ウィンドウシステム + ネットワーク（全機能）\\
+OS1 & \texttt{OS1.IMG} & シェルのみ。ネットワークなし・ウィンドウなし \\
+OS2 & \texttt{OS2.IMG} & 全機能だがウィンドウシステムなし（テキストコンソール）\\
+OS3 & \texttt{OS3.IMG} & 全機能・HDMI を 1 ランク下げた 1280$\times$720 \\
+\hline
+\end{longtable}
+
+\begin{itemize}[noitemsep]
+  \item \textbf{OS1（最小）}：ネットワークもウィンドウも持たない。HDMI テキスト
+        コンソールに \texttt{xinu-min\$} プロンプトを表示し、USB キーボードで操作する。
+  \item \textbf{OS2（WM なし）}：ネットワーク等の全機能を持つが、ウィンドウ
+        マネージャの代わりに全画面テキストコンソールでシェルを動かす
+        （プロンプト \texttt{xinu-os2\$}）。ネットワーク経由の操作も可能。
+  \item \textbf{OS3（低解像度）}：フル OS と同じだが HDMI を 1280$\times$720 に下げた版。
+\end{itemize}
+
+\paragraph{読みやすさ.} テキストコンソールのフォントは 8$\times$8 を 3 倍に
+拡大して表示する（OS1・OS2 で有効）。
+
+%======================================================================
+\section{microSD ストレージ}
+\label{sec:storage}
+
+本体の microSD スロットは \texttt{/microsd} としてマウントされる
+（カード未挿入でもディレクトリは存在する）。FAT32 カードの読み出しと、
+小サイズファイルの永続書き込みに対応する。
+
+\subsection{一覧と読み出し}
+\begin{lstlisting}[language=bash]
+ls /microsd                 # カード上のファイル一覧
+cat /microsd/CONFIG.TXT     # ファイル内容の表示
+\end{lstlisting}
+
+\subsection{書き込み（永続）}
+HTTP 経由で 1 クラスタ（32\,KB）以下の小ファイルをカードへ永続書き込みできる。
+ボディが内容、URL 末尾がファイル名（8.3 形式）。
+
+\begin{lstlisting}[language=bash]
+curl -X POST --data-binary "hello from xinu" \
+     http://192.168.3.101/microsd/write/TEST.TXT
+# 再起動後も ls /microsd / cat /microsd/TEST.TXT で残存
+\end{lstlisting}
+
+\subsection{診断}
+SD コントローラとカードの初期化状況を表示する診断コマンド。
+\begin{lstlisting}[language=bash]
+sdtest        # コントローラ／CMD0,CMD8,ACMD41 等の応答を表示
+\end{lstlisting}
+
+%======================================================================
+\section{kexec カーネルセレクタ}
+\label{sec:kexec}
+
+\texttt{kexec} は microSD 上のカーネルイメージを RAM に読み込み、
+電源を切らずにそのカーネルへジャンプする（再フラッシュ不要）。失敗しても
+RAM 上の操作なので、電源再投入で USB のフル OS に戻るだけでブリック риск はない。
+
+\begin{lstlisting}[language=bash]
+kexec /microsd/OS1.IMG      # OS1 (最小) を起動
+kexec /microsd/OS2.IMG      # OS2 (WMなし) を起動
+kexec /microsd/OS3.IMG      # OS3 (低解像度) を起動
+kexec /microsd/KERNEL~1.IMG # カード上のフル OS へ
+\end{lstlisting}
+
+\paragraph{注意点.}
+\begin{itemize}[noitemsep]
+  \item \texttt{kexec} の後はネットワークが落ちる（非ファームウェア状態からの
+        PCIe 再初期化のため）。結果は HDMI 画面で確認する。
+  \item ブートできるのは\textbf{ベアメタルの Xinu カーネルのみ}。Linux カーネル
+        （例 \texttt{KERNEL8.IMG}、約 9.6\,MB）は別のブートプロトコルを必要とし、
+        単純なチェインロードではハングする。本実装は 4\,MB 以上のイメージを
+        Linux と見なして拒否する（Xinu と Linux はどちらも arm64 Image で
+        マジックが同じため、サイズで判別する）。
+\end{itemize}
+
+%======================================================================
+\section{シェルコマンド}
+画面のシェル（USB キーボード）か、ネットワーク経由（第\ref{sec:remote}節）の
+\texttt{/run?cmd=...} から実行する。主なコマンドを示す。
+
+\begin{longtable}{ll}
+\hline
+コマンド & 説明 \\
+\hline
+\cmd{help} & コマンド一覧 \\
+\cmd{ls [path]} & ディレクトリ一覧 \\
+\cmd{cat <file>} & ファイル内容表示 \\
+\cmd{cd / pwd} & カレントディレクトリ移動／表示 \\
+\cmd{kexec /microsd/<k.img>} & 別カーネルを起動（第\ref{sec:kexec}節）\\
+\cmd{cc <file> / make <file>} & C/AIPL プログラムをその場でコンパイル・実行 \\
+\cmd{mem} & ヒープ／BSS の状況 \\
+\cmd{peek <hex>} & 32bit MMIO ワードの読み出し \\
+\cmd{uptime} & 汎用タイマ値 \\
+\cmd{ps} & コア／EL 状態 \\
+\cmd{wifi on/off/status/scan} & WiFi 操作（第\ref{sec:wifi}節）\\
+\cmd{sdtest} & SD コントローラ診断 \\
+\cmd{reboot} & 再起動（PM ウォッチドッグ）\\
+\cmd{clear} & 画面クリア \\
+\hline
+\end{longtable}
+
+%======================================================================
+\section{ネットワーク経由のリモート操作}
+\label{sec:remote}
+フル OS・OS2・OS3 は有線 IP \texttt{192.168.3.101} で HTTP を待ち受ける。
+シリアル入力が使いにくい環境でも、Mac 等から \texttt{curl} で操作できる。
+
+\begin{longtable}{ll}
+\hline
+エンドポイント & 説明 \\
+\hline
+\cmd{/run?cmd=<shell>} & 任意のシェルコマンドを実行し出力を返す \\
+\cmd{/fs}, \cmd{/fs/ls/<d>}, \cmd{/fs/cat/<f>} & VFS ツリーの参照 \\
+\cmd{/fs/write/<f>} (POST) & VFS（tmpfs）へファイル書き込み \\
+\cmd{/microsd/write/<NAME>} (POST) & microSD へ永続書き込み（第\ref{sec:storage}節）\\
+\cmd{/usb/...} & USB の列挙・診断（第\ref{sec:usb}節）\\
+\cmd{/api/actors}, \cmd{/send?to=\&m=} & アクタ／AIPL ゲートウェイ \\
+\hline
+\end{longtable}
+
+\begin{lstlisting}[language=bash]
+curl 'http://192.168.3.101/run?cmd=ls%20/microsd'
+curl 'http://192.168.3.101/run?cmd=cat%20/microsd/CONFIG.TXT'
+curl 'http://192.168.3.101/run?cmd=wifi%20status'
+\end{lstlisting}
+
+\noindent\textbf{補足}：URL 中の空白は \texttt{\%20} もしくは \texttt{+} で
+エンコードする。出力バッファには上限があるため、長い結果は分割される。
+
+%======================================================================
+\section{WiFi}
+\label{sec:wifi}
+内蔵 CYW43455 によるフル WiFi（スキャン／WPA2／DHCP／ping）に対応する。
+資格情報はビルド時にカーネルへ埋め込まれ、\textbf{起動時には自動接続しない}。
+\cmd{wifi on} を実行したときのみ接続する。
+
+\begin{lstlisting}[language=bash]
+wifi on        # 接続（埋め込み資格情報を使用）
+wifi status    # 接続状態・SSID・IP
+wifi scan      # 近傍 AP のスキャン
+wifi off       # 切断
+\end{lstlisting}
+
+画面右下に WiFi の電波アイコンと、その下に SSID・自 IP を表示する。
+
+%======================================================================
+\section{USB（マウス・キーボード）}
+\label{sec:usb}
+USB-A ポートは RP1 内の 2 つの DWC3/xHCI コントローラに接続される。
+ブート時のフォールトを避けるため、列挙は起動数秒後に自動で行われる
+（あるいは \texttt{/usb/...} エンドポイントから手動駆動）。
+ブートマウスはカーソル移動に、キーボードはシェル入力に用いられる。
+
+%======================================================================
+\section{付録}
+
+\subsection{ビルドターゲット一覧}
+\begin{longtable}{ll}
+\hline
+ターゲット & 生成物 \\
+\hline
+\cmd{make pi5} & \texttt{kernel\_2712.img}（フル OS）\\
+\cmd{make pi5-osmin} & \texttt{kernel\_min.img}（OS1）\\
+\cmd{make pi5-os2} & \texttt{kernel\_os2.img}（OS2）\\
+\cmd{make pi5-os3} & \texttt{kernel\_os3.img}（OS3）\\
+\hline
+\end{longtable}
+
+\subsection{トラブルシューティング}
+\begin{itemize}[noitemsep]
+  \item \textbf{HTTP が応答しない}：起動直後はネットワーク初期化前。十数秒
+        待ってから再試行する。\texttt{kexec} 後はネットワークが落ちるため、
+        電源再投入で USB のフル OS に戻る。
+  \item \textbf{\texttt{kexec} で「too large」と出る}：4\,MB 以上のイメージ
+        （Linux カーネル等）はチェインロードできない。ベアメタル Xinu の
+        イメージを指定すること。
+  \item \textbf{\texttt{/microsd} が空}：スロットに microSD が入っているか確認。
+        \texttt{sdtest} で初期化状況を確認できる。
+  \item \textbf{画面が出ない}：HDMI フレームバッファのメールボックス初期化に
+        失敗した場合、コンソールは UART のみとなる。
+\end{itemize}
+
+\subsection{安全上の注意}
+\begin{itemize}[noitemsep]
+  \item WiFi のパスワードはソースリポジトリにコミットしない（ビルド時に
+        \texttt{.gitignore} 済みファイルから埋め込む運用）。
+  \item \texttt{kexec} は RAM 上の操作であり、不正なイメージでも電源再投入で
+        復帰する（フラッシュ破壊のリスクはない）。
+\end{itemize}
+
+\vfill
+\begin{center}\small Embedded Xinu / Raspberry Pi 5 — 2026年6月\end{center}
+
+\end{document}

@@ -13,8 +13,14 @@
 #ifndef XINU_RPI5_VIDEO_H
 #define XINU_RPI5_VIDEO_H
 
+/* Default HDMI mode 1920x1080.  Overridable from the Makefile (-DSCREEN_WIDTH=...)
+ * — the "OS #3" variant (pi5-os3) builds video.o at 1280x720, one rank lower. */
+#ifndef SCREEN_WIDTH
 #define SCREEN_WIDTH    1920
+#endif
+#ifndef SCREEN_HEIGHT
 #define SCREEN_HEIGHT   1080
+#endif
 #define SCREEN_DEPTH    32
 #define FONT_WIDTH      8
 #define FONT_HEIGHT     8

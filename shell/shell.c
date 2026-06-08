@@ -234,6 +234,20 @@ static int cmd_cat(int argc, char **argv)
     return 0;
 }
 
+/* kexec <file> — boot a different Xinu kernel image from /microsd (no reflash).
+ * e.g.  kexec /microsd/KERNEL_2712.IMG   — RAM-only chainload, does not return. */
+static int cmd_kexec(int argc, char **argv)
+{
+    extern int microsd_kexec(const char *path);
+    if (argc < 2) { uart_puts("usage: kexec /microsd/<kernel.img>\n"); return 0; }
+    char path[128];
+    fs_resolve(argv[1], path, sizeof path);
+    uart_puts("kexec: loading "); uart_puts(path); uart_puts(" ...\n");
+    int r = microsd_kexec(path);     /* returns only on failure */
+    uart_puts("kexec: failed (rc="); uart_putc((char)('0' + (r<0?1:0))); uart_puts(") — not booted\n");
+    return 0;
+}
+
 /* ---- local C/AIPL runner: compile, then execute in a dedicated process ----
  * `cc` and `make` compile a program and run it on its OWN process stack, so a
  * buggy program (deep recursion, runaway loop, bad pointer) can only blow that
@@ -927,36 +941,62 @@ static int cmd_wifi(int argc, char **argv)
         return 0;
     }
     if (str_eq(argv[1], "on")) {
+        static char cs[64], cp[80];      /* creds parsed from the embedded conf */
         const char *ssid = 0, *pass = 0;
         if (argc >= 4) {                 /* wifi on <ssid> <pass>: remember + use */
             ssid = argv[2]; pass = argv[3];
             str_copy(g_wifi_ssid, ssid, sizeof g_wifi_ssid);
             str_copy(g_wifi_pass, pass, sizeof g_wifi_pass);
             g_wifi_have_creds = 1;
-        } else if (g_wifi_have_creds) {  /* wifi on: reuse last creds (RAM only) */
+        } else if (g_wifi_have_creds) {  /* wifi on: reuse last creds (RAM) */
             ssid = g_wifi_ssid; pass = g_wifi_pass;
+        } else {                         /* wifi on: pull saved creds from wifi.conf */
+            extern const char wifi_conf[], wifi_conf_end[];
+            const char *c = wifi_conf; int avail = (int)(wifi_conf_end - wifi_conf), i = 0, j = 0;
+            while (i < avail && c[i] && c[i] != '\n' && c[i] != '\r' && j < (int)sizeof cs - 1) cs[j++] = c[i++];
+            cs[j] = 0;
+            while (i < avail && (c[i] == '\n' || c[i] == '\r' || c[i] == ' ')) i++;
+            j = 0;
+            while (i < avail && c[i] && c[i] != '\n' && c[i] != '\r' && j < (int)sizeof cp - 1) cp[j++] = c[i++];
+            cp[j] = 0;
+            if (cs[0]) { ssid = cs; pass = cp; wifi_remember_creds(cs, cp); }
         }
-        uart_puts("wifi: bringing up firmware (takes a few seconds)...\n");
-        if (wifi_probe() != 0) { uart_puts("wifi: bring-up FAILED — run wifi-invest\n"); return 1; }
-        uart_puts("wifi: firmware up.\n");
-        if (!ssid) {
-            int n = wifi_scan_run();
-            uart_puts("wifi: radio up, "); puts_dec(n);
-            uart_puts(" APs found. Connect with: wifi on <ssid> <pass>\n");
-            return 0;
+        { extern unsigned long timer_ticks(void);   /* 100 Hz -> 10 ms/tick */
+          extern void shell_flush_screen(void);      /* repaint mid-command      */
+          unsigned long t0 = timer_ticks(), t1, t2, t3;
+          uart_puts("wifi: bringing up firmware (please wait ~10 s)...\n");
+          shell_flush_screen();                      /* show it before the block */
+          if (wifi_probe() != 0) { uart_puts("wifi: bring-up FAILED — run wifi-invest\n"); shell_flush_screen(); return 1; }
+          t1 = timer_ticks();
+          uart_puts("wifi: firmware up ("); puts_dec((int)((t1-t0)*10)); uart_puts(" ms).\n");
+          if (!ssid) {
+              shell_flush_screen();
+              int n = wifi_scan_run();
+              uart_puts("wifi: radio up, "); puts_dec(n);
+              uart_puts(" APs found. Connect with: wifi on <ssid> <pass>\n");
+              shell_flush_screen();
+              return 0;
+          }
+          uart_puts("wifi: joining \""); uart_puts(ssid); uart_puts("\" (WPA2)...\n");
+          shell_flush_screen();
+          if (wifi_join_run(ssid, pass) != 0) {
+              uart_puts("wifi: JOIN FAILED — check ssid/pass, or run wifi-invest\n");
+              shell_flush_screen(); return 1;
+          }
+          t2 = timer_ticks();
+          uart_puts("wifi: associated ("); puts_dec((int)((t2-t1)*10)); uart_puts(" ms). DHCP...\n");
+          shell_flush_screen();
+          if (wifi_dhcp() != 0) {
+              uart_puts("wifi: DHCP FAILED — run wifi-invest\n");
+              shell_flush_screen(); return 1;
+          }
+          t3 = timer_ticks();
+          { unsigned char ip[4]; wifi_ipaddr(ip);
+            uart_puts("wifi: CONNECTED  IP="); puts_ip(ip);
+            uart_puts("  (dhcp "); puts_dec((int)((t3-t2)*10));
+            uart_puts(" ms, total "); puts_dec((int)((t3-t0)*10)); uart_puts(" ms)\n"); }
+          shell_flush_screen();
         }
-        uart_puts("wifi: joining \""); uart_puts(ssid); uart_puts("\" (WPA2)...\n");
-        if (wifi_join_run(ssid, pass) != 0) {
-            uart_puts("wifi: JOIN FAILED — check ssid/pass, or run wifi-invest\n");
-            return 1;
-        }
-        uart_puts("wifi: associated. requesting DHCP...\n");
-        if (wifi_dhcp() != 0) {
-            uart_puts("wifi: DHCP FAILED — run wifi-invest\n");
-            return 1;
-        }
-        { unsigned char ip[4]; wifi_ipaddr(ip);
-          uart_puts("wifi: CONNECTED.  IP="); puts_ip(ip); uart_putc('\n'); }
         return 0;
     }
     uart_puts("wifi: unknown subcommand — use on/off/status/scan\n");
@@ -993,6 +1033,14 @@ static int cmd_wifi_invest(int argc, char **argv)
     return 0;
 }
 
+static int cmd_sdtest(int argc, char **argv)
+{
+    extern void sd_diag(void);
+    (void)argc; (void)argv;
+    sd_diag();
+    return 0;
+}
+
 static const struct centry commandtab[] = {
     { "help",   "list the commands",                       cmd_help   },
     { "echo",   "echo the remaining words back",           cmd_echo   },
@@ -1004,6 +1052,7 @@ static const struct centry commandtab[] = {
     { "cd",     "cd <dir>  change directory",              cmd_cd     },
     { "ls",     "ls [path]  list directory",               cmd_ls     },
     { "cat",    "cat <file>  print file contents",         cmd_cat    },
+    { "kexec",  "kexec /microsd/<k.img>  boot another kernel from microSD", cmd_kexec },
     { "cc",     "cc <file>  compile + run a C/AIPL program (own process)", cmd_cc },
     { "make",   "make [file]  compile + run a program (alias for cc)", cmd_make  },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
@@ -1024,6 +1073,7 @@ static const struct centry commandtab[] = {
     { "reboot",   "reboot the board (BCM2712 PM watchdog)",  cmd_reboot   },
     { "wifi",       "wifi on <ssid> <pass> | off | status | scan", cmd_wifi },
     { "wifi-invest","wifi diagnostics + maintenance (re-run bring-up, dump trace)", cmd_wifi_invest },
+    { "sdtest",     "SD card controller diagnostics (read LBA 0)", cmd_sdtest },
     { "?",      "alias for help",                          cmd_help   },
     { 0, 0, 0 }
 };

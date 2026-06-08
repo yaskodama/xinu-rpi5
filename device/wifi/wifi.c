@@ -30,7 +30,9 @@ extern void uart_putc(char c);
  * ------------------------------------------------------------------ */
 static char wifi_tbuf[8000];
 static int  wifi_tn;
-static u32  g_fwload_hz = 2000000u;    /* SD clock for the bulk fw download; tunable via /wifi-stage?hz=N */
+static u32  g_fwload_hz = 25000000u;   /* SD clock for CMD53 data: 25 MHz is the sweet spot now
+                                        * that the DAT pinmux is fixed (~4 MB/s; 50 MHz is slower).
+                                        * Tunable via /wifi-stage?hz=N. */
 void wifi_set_fwload_hz(u32 hz) { if (hz) g_fwload_hz = hz; }
 
 static void wlog_putc(char c)
@@ -682,6 +684,10 @@ static int wifi_backplane_read32(u32 addr, u32 *out)
 }
 
 static int g_cmd53_logn = 0;    /* throttle counter for tolerated-CRC logging */
+static int g_cmd53_errn = 0;    /* throttle counter for CMD53 error logging   */
+/* Gate spammy CMD53 error logs to ~1/256 — a wedged/idle data plane (e.g. the
+ * RX poller hitting a bad clock) must never flood the screen/UART. */
+#define CMD53_ERR_LOG  ((g_cmd53_errn++ & 0xFF) == 0)
 /* CMD53 (IO_RW_EXTENDED) block/byte PIO transfer — standard SDHCI register
  * layout (XFER_MODE 0x0C + COMMAND 0x0E split, INT_STATUS 0x30, BUFFER 0x20).
  * Same semantics as the Pi4 Arasan version; only the register plumbing differs. */
@@ -699,7 +705,8 @@ static int wifi_cmd53_pio(int write, int fn, u32 off, u8 *buf, int len, int incr
     if (!write) sdio_cmd52(0, 0x06, 1, (u32)fn);
     for (t = 0; t < 200000; t++) if (!(SDREG(SDHCI_PRESENT_STATE) & (SR_CMD_INHIBIT|SR_DAT_INHIBIT))) break;
     if (SDREG(SDHCI_PRESENT_STATE) & (SR_CMD_INHIBIT|SR_DAT_INHIBIT)) {
-        wifi_log("[wifi]   cmd53 line busy PRESENT=0x%08x\r\n", SDREG(SDHCI_PRESENT_STATE)); return -1; }
+        if (CMD53_ERR_LOG) wifi_log("[wifi]   cmd53 line busy PRESENT=0x%08x\r\n", SDREG(SDHCI_PRESENT_STATE));
+        return -1; }
     /* Drain stale read-FIFO data from a previous transfer (RPi forum t=377652). */
     if (!write) { int g = 0; while ((SDREG(SDHCI_PRESENT_STATE) & (1u<<11)) && g++ < 4096) (void)SDREG(SDHCI_BUFFER); }
     /* Space out the register writes (Pi4 'ew()' erratum: the controller needs
@@ -718,18 +725,18 @@ static int wifi_cmd53_pio(int write, int fn, u32 off, u8 *buf, int len, int incr
       if (blkmode) c |= TM_MULTI_BLK | TM_BLKCNT_EN;
       SDREG(SDHCI_CMDTM)    = c; wifi_delay_us(12); }   /* ONE 32-bit write triggers the command */
     for (t = 0; t < 100000; t++) { intr = SDREG(SDHCI_INT_STATUS);
-        if (intr & INT_ERR) { wifi_log("[wifi]   cmd53 err 0x%08x\r\n", intr); return -1; }
+        if (intr & INT_ERR) { if (CMD53_ERR_LOG) wifi_log("[wifi]   cmd53 err 0x%08x\r\n", intr); return -1; }
         if (intr & INT_CMD_DONE) { SDREG(SDHCI_INT_STATUS) = INT_CMD_DONE; break; } }
-    if (t >= 100000) { wifi_log("[wifi]   cmd53 CMD timeout off=0x%x\r\n", off); return -1; }
+    if (t >= 100000) { if (CMD53_ERR_LOG) wifi_log("[wifi]   cmd53 CMD timeout off=0x%x\r\n", off); return -1; }
     words = (total + 3) / 4;
     { u32 done = 0;
       while (done < words) {
         u32 flag = write ? INT_WRITE_RDY : INT_READ_RDY;
         u32 chunk = (total > bsize && (words-done) > (bsize/4)) ? (bsize/4) : (words-done);
         for (t = 0; t < 100000; t++) { intr = SDREG(SDHCI_INT_STATUS);
-            if (intr & INT_ERR) { wifi_log("[wifi]   cmd53 read err 0x%08x off=0x%x done=%u\r\n", intr, off, done); return -1; }
+            if (intr & INT_ERR) { if (CMD53_ERR_LOG) wifi_log("[wifi]   cmd53 read err 0x%08x off=0x%x done=%u\r\n", intr, off, done); return -1; }
             if (intr & flag) { SDREG(SDHCI_INT_STATUS) = flag; break; } }
-        if (t >= 100000) { wifi_log("[wifi]   cmd53 RDY timeout done=%u/%u\r\n", done, words); return -1; }
+        if (t >= 100000) { if (CMD53_ERR_LOG) wifi_log("[wifi]   cmd53 RDY timeout done=%u/%u\r\n", done, words); return -1; }
         for (w = 0; w < chunk; w++) { u32 idx = (done+w)*4;
             if (write) { u32 v = (u32)buf[idx]|((u32)buf[idx+1]<<8)|((u32)buf[idx+2]<<16)|((u32)buf[idx+3]<<24); SDREG(SDHCI_BUFFER) = v; }
             else       { u32 v = SDREG(SDHCI_BUFFER); buf[idx]=v; buf[idx+1]=v>>8; buf[idx+2]=v>>16; buf[idx+3]=v>>24; } }
@@ -1934,7 +1941,15 @@ int wifi_serve(int secs)
 void wifi_net_poll(void)
 {
     static u8 fr[2048]; int chan, doff, n, budget;
+    static u32 last_us = 0; u32 now;
     if (!wifi_have_ip) return;
+    /* Throttle to ~50 Hz: this runs from the 100 Hz timer ISR *and* the wm frame
+     * loop, and each drain does SDIO reads — polling it every tick added latency
+     * to the render loop (and so to shell-key echo).  20 ms still answers pings
+     * promptly while leaving the loop free to repaint/echo smoothly. */
+    now = SYSTIMER_CLO;
+    if ((u32)(now - last_us) < 20000u) return;
+    last_us = now;
     /* Drain all queued RX frames this tick (bounded so we never monopolize the
      * wm frame loop) — at the wm frame rate a single frame/tick dropped pings;
      * draining the FIFO each tick keeps the responder reliable. */

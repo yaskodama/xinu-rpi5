@@ -55,4 +55,15 @@ typedef void (*fat32_visit_fn)(const char  *name,
 int fat32_walk_dir(fat32_t *fs, unsigned int cluster, int depth,
                    fat32_visit_fn visit, void *ctx);
 
+/* Read a file's contents (cluster-chain walk) into `buf`; copies up to
+ * min(size, maxlen) bytes.  Returns bytes copied, or -1 on error. */
+int fat32_read_file(fat32_t *fs, unsigned int first_cluster,
+                    unsigned long size, void *buf, unsigned long maxlen);
+
+/* Write a small file (<= one cluster) named `name` (8.3) into the directory
+ * whose first cluster is `dir_cluster`, allocating one free cluster and adding/
+ * overwriting the directory entry.  Returns 0 on success, -1 on error. */
+int fat32_write_file(fat32_t *fs, unsigned int dir_cluster, const char *name,
+                     const void *buf, unsigned long len);
+
 #endif /* XINU_RPI5_FAT32_H */

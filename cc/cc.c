@@ -686,6 +686,11 @@ int cc_actor_send_msg(int to, const char *method, int arg, char *out, int outcap
     return 0;
 }
 
+/* Node actor capacity — paired with cc_actor_live_count() (below) as the load
+ * metric the mesh load-balancer queries via /api/load to pick the least-loaded
+ * Xinu node. */
+int cc_actor_capacity(void)   { return ACT_MAX; }
+
 /* Global GC entry for the HTTP endpoint + the periodic timer sweep.  Writes a
  * one-line report into `out` (may be NULL for the silent periodic call). */
 int cc_actor_gc(long threshold_ms, int dry, char *out, int outcap)

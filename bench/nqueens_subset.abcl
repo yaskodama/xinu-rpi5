@@ -1,0 +1,63 @@
+// nqueens_subset.abcl — compute the sum of subtree counts for a given
+// set of row-0 column choices.  Used by bench_nqueens.py to time the
+// Mac-side share of a Mac+Xinu split.
+//
+// The runner writes a fresh K_FIRST / K_LAST / N at the top of this
+// file before each call (sed pattern: ^var N = .*;).  We sum count()
+// over k = K_FIRST..K_LAST-1.
+//
+// AIPL gotcha: top-level allows only var-decl / call / send / new.
+// Everything stateful goes inside a function (`run()`).
+
+// --- params (re-written by runner) ---
+var N        = 10;
+var K_FIRST  = 0;
+var K_LAST   = 10;
+// --- end params ---
+
+function safe(cols, row, c) {
+  var i = 0;
+  while (i < row) do {
+    var p = cols[i];
+    if (p == c)           { return 0; }
+    if (p - c == row - i) { return 0; }
+    if (c - p == row - i) { return 0; }
+    i = i + 1;
+  }
+  return 1;
+}
+
+function nq_count(cols, n, row) {
+  if (row == n) { return 1; }
+  var total = 0;
+  var c = 0;
+  while (c < n) do {
+    if (safe(cols, row, c)) {
+      cols[row] = c;
+      total = total + nq_count(cols, n, row + 1);
+    }
+    c = c + 1;
+  }
+  return total;
+}
+
+function run(n, k_first, k_last) {
+  var cols[12];
+  // Use the auto-spawned global `Clock` actor via the synchronous
+  // message-send syntax (`now Clock.ms()`) rather than the bare
+  // `now_ms()` builtin call.  Keeps the source consistent with
+  // actor-oriented AIPL idioms (cf. `now AI.ask(...)`).
+  var start = now Clock.ms();
+  var total = 0;
+  var k = k_first;
+  while (k < k_last) do {
+    cols[0] = k;
+    total = total + nq_count(cols, n, 1);
+    k = k + 1;
+  }
+  var elapsed = (now Clock.ms()) - start;
+  print("nqueens_subset N=" + n + " ks=[" + k_first + ".." + k_last + ") subtotal=" + total + " elapsed_ms=" + elapsed);
+  return total;
+}
+
+var _ = run(N, K_FIRST, K_LAST);

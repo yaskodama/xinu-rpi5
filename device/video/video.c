@@ -19,8 +19,14 @@ static int                     fb_ready;
 
 static int cursor_col;
 static int cursor_row;
-#define COLS  (SCREEN_WIDTH  / FONT_WIDTH)
-#define ROWS  (SCREEN_HEIGHT / FONT_HEIGHT)
+/* Text-console glyph scale: each 8x8 font pixel is drawn as a FONT_SCALE x
+ * FONT_SCALE block, so the on-screen character cell is CELL_W x CELL_H.  Bumped
+ * from 1 to 3 for readability (the minimal "OS #1" shell console lives here). */
+#define FONT_SCALE  3
+#define CELL_W  (FONT_WIDTH  * FONT_SCALE)
+#define CELL_H  (FONT_HEIGHT * FONT_SCALE)
+#define COLS  (SCREEN_WIDTH  / CELL_W)
+#define ROWS  (SCREEN_HEIGHT / CELL_H)
 
 /* ARGB8888 packing: B in byte 0 ... A in byte 3, which is what the
  * VC firmware hands us when we ask for depth=32 + BGR pixel order. */
@@ -123,28 +129,31 @@ static void draw_glyph(int col, int row, char c)
     if (ci < 0x20 || ci > 0x7F) ci = '?';
     const unsigned char *glyph = font8x8[ci - 0x20];
 
-    int px = col * FONT_WIDTH;
-    int py = row * FONT_HEIGHT;
+    int px = col * CELL_W;
+    int py = row * CELL_H;
     for (int gy = 0; gy < FONT_HEIGHT; gy++) {
         unsigned char bits = glyph[gy];
-        unsigned int *line =
-            (unsigned int *)(fb_draw + (py + gy) * fb_pitch + px * 4);
-        for (int gx = 0; gx < FONT_WIDTH; gx++) {
-            line[gx] = (bits & (0x80 >> gx)) ? color_fg : color_bg;
+        for (int sy = 0; sy < FONT_SCALE; sy++) {
+            unsigned int *line =
+                (unsigned int *)(fb_draw + (py + gy * FONT_SCALE + sy) * fb_pitch + px * 4);
+            for (int gx = 0; gx < FONT_WIDTH; gx++) {
+                unsigned int c32 = (bits & (0x80 >> gx)) ? color_fg : color_bg;
+                for (int sx = 0; sx < FONT_SCALE; sx++) line[gx * FONT_SCALE + sx] = c32;
+            }
         }
     }
 }
 
 static void scroll_one_row(void)
 {
-    /* Move every row up by FONT_HEIGHT pixels, then clear the bottom. */
-    for (unsigned int y = 0; y < fb_height - FONT_HEIGHT; y++) {
+    /* Move every row up by one character cell (CELL_H pixels), clear the bottom. */
+    for (unsigned int y = 0; y < fb_height - CELL_H; y++) {
         unsigned int *dst = (unsigned int *)(fb_draw + y * fb_pitch);
         unsigned int *src =
-            (unsigned int *)(fb_draw + (y + FONT_HEIGHT) * fb_pitch);
+            (unsigned int *)(fb_draw + (y + CELL_H) * fb_pitch);
         for (unsigned int x = 0; x < fb_width; x++) dst[x] = src[x];
     }
-    for (unsigned int y = fb_height - FONT_HEIGHT; y < fb_height; y++) {
+    for (unsigned int y = fb_height - CELL_H; y < fb_height; y++) {
         unsigned int *row = (unsigned int *)(fb_draw + y * fb_pitch);
         for (unsigned int x = 0; x < fb_width; x++) row[x] = color_bg;
     }

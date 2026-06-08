@@ -252,6 +252,13 @@ static int s_putdec(char *b, int pos, long v)
     return pos;
 }
 
+static int s_puthex(char *b, int pos, unsigned int v)
+{
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 7; i >= 0; i--) b[pos++] = hx[(v >> (i*4)) & 0xF];
+    return pos;
+}
+
 /* ---------- /fs/* hierarchical-filesystem HTTP helpers ---------- */
 
 /* Copy the request-line path (after "METHOD ", up to ' ' or '?') into pbuf. */
@@ -404,6 +411,20 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "\",\"result\":");
         bl = s_putdec(body, bl, result);
         bl = s_put(body, bl, "}\n");
+    } else if (path_eq(req, "/api/load")) {
+        /* Node load metric for the mesh load-balancer's placement policy:
+         * managers (Mac/Windows) poll this to pick the least-loaded Xinu node. */
+        extern int cc_actor_live_count(void), cc_actor_capacity(void);
+        ctype = "application/json";
+        int live = cc_actor_live_count(), cap = cc_actor_capacity();
+        int pct = cap > 0 ? (live * 100) / cap : 0;
+        bl = s_put(body, bl, "{\"node\":\"xinu\",\"live_actors\":");
+        bl = s_putdec(body, bl, live);
+        bl = s_put(body, bl, ",\"capacity\":");
+        bl = s_putdec(body, bl, cap);
+        bl = s_put(body, bl, ",\"load_pct\":");
+        bl = s_putdec(body, bl, pct);
+        bl = s_put(body, bl, "}\n");
     } else if (path_eq(req, "/api/actors")) {
         int n = actor_count();
         bl = s_put(body, bl, "{\"actors\":[");
@@ -420,6 +441,20 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "}");
         }
         bl = s_put(body, bl, "]}\n");
+    } else if (str_starts(rpath, "/microsd/write/")) {
+        /* Persistent FAT32 write to the microSD root: POST /microsd/write/<NAME>
+         * with the file content as the request body (8.3 name, <= one cluster). */
+        extern int microsd_write_file(const char *name, const void *data, unsigned long len);
+        ctype = "text/plain";
+        const char *name = rpath + 15;          /* strlen("/microsd/write/") */
+        const char *b = http_body(req);
+        if (name[0] && b) {
+            int blen = 0; while (b[blen]) blen++;
+            int r = microsd_write_file(name, b, (unsigned long)blen);
+            bl = s_put(body, bl, r == 0 ? "microsd write: ok " : "microsd write: FAILED ");
+            bl = s_putdec(body, bl, blen); bl = s_put(body, bl, " bytes -> "); bl = s_put(body, bl, name);
+            bl = s_put(body, bl, "\n");
+        } else bl = s_put(body, bl, "microsd write: bad name or empty body\n");
     } else if (str_starts(rpath, "/fs")) {
         /* Hierarchical in-memory filesystem (fs/vfs.c) over HTTP:
          *   GET  /fs   or  /fs/tree        -> indented tree of the whole FS
@@ -681,6 +716,109 @@ static int http_build(const char *req, char *out, int max)
             rp1usb_set_poll_mode(q_int(req,"on",1));
             bl = s_put(body, bl, "poll_mode="); bl = s_putdec(body, bl, rp1usb_poll_mode_get());
             bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-setup")) {
+            extern int rp1usb_msd_fullsetup(int), rp1usb_msd_slot(void),
+                       rp1usb_msd_in_ep(void), rp1usb_msd_out_ep(void),
+                       rp1usb_msd_in_dci(void), rp1usb_msd_out_dci(void);
+            extern unsigned int rp1usb_msd_setup_cc(void), rp1usb_msd_cfgep_cc(void);
+            int r = rp1usb_msd_fullsetup(q_int(req,"port",2));   /* boot stick = c0p2 */
+            bl = s_put(body, bl, "msd-setup r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " slot="); bl = s_putdec(body, bl, rp1usb_msd_slot());
+            bl = s_put(body, bl, " setcfgCC="); bl = s_putdec(body, bl, rp1usb_msd_setup_cc());
+            bl = s_put(body, bl, " cfgepCC="); bl = s_putdec(body, bl, rp1usb_msd_cfgep_cc());
+            bl = s_put(body, bl, " inEP="); bl = s_putdec(body, bl, rp1usb_msd_in_ep());
+            bl = s_put(body, bl, " outEP="); bl = s_putdec(body, bl, rp1usb_msd_out_ep());
+            bl = s_put(body, bl, " inDCI="); bl = s_putdec(body, bl, rp1usb_msd_in_dci());
+            bl = s_put(body, bl, " outDCI="); bl = s_putdec(body, bl, rp1usb_msd_out_dci());
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-inquiry")) {
+            extern int rp1usb_msd_inquiry(void);
+            extern unsigned int rp1usb_msd_csw_status(void), rp1usb_msd_data_byte(int);
+            extern int rp1usb_msd_p_cbw(void), rp1usb_msd_p_data(void), rp1usb_msd_p_csw(void);
+            extern unsigned int rp1usb_msd_p_cbw_cc(void), rp1usb_msd_p_data_cc(void), rp1usb_msd_p_csw_cc(void);
+            int r = rp1usb_msd_inquiry();
+            bl = s_put(body, bl, "inquiry r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " cswStatus="); bl = s_putdec(body, bl, rp1usb_msd_csw_status());
+            bl = s_put(body, bl, "\n CBW: n="); bl = s_putdec(body, bl, rp1usb_msd_p_cbw());
+            bl = s_put(body, bl, " cc="); bl = s_putdec(body, bl, (int)rp1usb_msd_p_cbw_cc());
+            bl = s_put(body, bl, " | DATA: n="); bl = s_putdec(body, bl, rp1usb_msd_p_data());
+            bl = s_put(body, bl, " cc="); bl = s_putdec(body, bl, (int)rp1usb_msd_p_data_cc());
+            bl = s_put(body, bl, " | CSW: n="); bl = s_putdec(body, bl, rp1usb_msd_p_csw());
+            bl = s_put(body, bl, " cc="); bl = s_putdec(body, bl, (int)rp1usb_msd_p_csw_cc());
+            bl = s_put(body, bl, "\n vendor=");    /* INQUIRY bytes 8..15 = vendor ASCII */
+            for (int i=8;i<16;i++){ unsigned c=rp1usb_msd_data_byte(i); if(c>=32&&c<127) body[bl++]=(char)c; }
+            bl = s_put(body, bl, " product=");   /* bytes 16..31 = product ASCII */
+            for (int i=16;i<32;i++){ unsigned c=rp1usb_msd_data_byte(i); if(c>=32&&c<127) body[bl++]=(char)c; }
+            bl = s_put(body, bl, " first8:");
+            for (int i=0;i<8;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_msd_data_byte(i)); }
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-epstate")) {
+            extern int rp1usb_msd_inquiry(void);
+            extern int rp1usb_msd_p_cbw(void); extern unsigned int rp1usb_msd_p_cbw_cc(void);
+            extern unsigned int rp1usb_msd_slotstate(void), rp1usb_msd_out_epstate(void),
+                       rp1usb_msd_in_epstate(void), rp1usb_msd_out_deqlo(void),
+                       rp1usb_msd_in_deqlo(void), rp1usb_msd_out_ep1(void),
+                       rp1usb_msd_usbsts(void), rp1usb_msd_portsc2(void);
+            extern int rp1usb_msd_out_dci(void), rp1usb_msd_in_dci(void);
+            int r = rp1usb_msd_inquiry();
+            bl = s_put(body, bl, "epstate inq_r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " cbw_n="); bl = s_putdec(body, bl, rp1usb_msd_p_cbw());
+            bl = s_put(body, bl, " cbw_cc="); bl = s_putdec(body, bl, (int)rp1usb_msd_p_cbw_cc());
+            bl = s_put(body, bl, "\n slotstate="); bl = s_putdec(body, bl, (int)rp1usb_msd_slotstate());
+            bl = s_put(body, bl, " outDCI="); bl = s_putdec(body, bl, rp1usb_msd_out_dci());
+            bl = s_put(body, bl, " outEPstate="); bl = s_putdec(body, bl, (int)rp1usb_msd_out_epstate());
+            bl = s_put(body, bl, " outEP_dw1=0x"); bl = s_puthex(body, bl, rp1usb_msd_out_ep1());
+            bl = s_put(body, bl, " outDeqLo=0x"); bl = s_puthex(body, bl, rp1usb_msd_out_deqlo());
+            bl = s_put(body, bl, "\n inDCI="); bl = s_putdec(body, bl, rp1usb_msd_in_dci());
+            bl = s_put(body, bl, " inEPstate="); bl = s_putdec(body, bl, (int)rp1usb_msd_in_epstate());
+            bl = s_put(body, bl, " inDeqLo=0x"); bl = s_puthex(body, bl, rp1usb_msd_in_deqlo());
+            bl = s_put(body, bl, "\n USBSTS=0x"); bl = s_puthex(body, bl, rp1usb_msd_usbsts());
+            bl = s_put(body, bl, " PORTSC2=0x"); bl = s_puthex(body, bl, rp1usb_msd_portsc2());
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-capacity")) {
+            extern int rp1usb_msd_capacity(void);
+            extern unsigned int rp1usb_msd_csw_status(void), rp1usb_msd_blocks(void), rp1usb_msd_blocksize(void);
+            int r = rp1usb_msd_capacity();
+            bl = s_put(body, bl, "capacity r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " cswStatus="); bl = s_putdec(body, bl, rp1usb_msd_csw_status());
+            bl = s_put(body, bl, " blocks="); bl = s_putdec(body, bl, (int)rp1usb_msd_blocks());
+            bl = s_put(body, bl, " blocksize="); bl = s_putdec(body, bl, (int)rp1usb_msd_blocksize());
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-read")) {
+            extern int rp1usb_msd_read_block(unsigned int);
+            extern unsigned int rp1usb_msd_csw_status(void), rp1usb_msd_data_byte(int);
+            unsigned int lba = (unsigned int)q_int(req,"lba",0);
+            int r = rp1usb_msd_read_block(lba);
+            bl = s_put(body, bl, "read lba="); bl = s_putdec(body, bl, (int)lba);
+            bl = s_put(body, bl, " r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " cswStatus="); bl = s_putdec(body, bl, rp1usb_msd_csw_status());
+            bl = s_put(body, bl, " mbrSig=");    /* bytes 510,511 should be 85,170 (0x55AA) */
+            bl = s_putdec(body, bl, rp1usb_msd_data_byte(510)); bl = s_put(body, bl, ",");
+            bl = s_putdec(body, bl, rp1usb_msd_data_byte(511));
+            bl = s_put(body, bl, " first16:");
+            for (int i=0;i<16 && bl<680;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_msd_data_byte(i)); }
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-write")) {
+            extern int rp1usb_msd_read_block(unsigned int), rp1usb_msd_write_block(unsigned int);
+            extern void rp1usb_msd_fill_pattern(unsigned int);
+            extern unsigned int rp1usb_msd_csw_status(void), rp1usb_msd_data_byte(int);
+            unsigned int lba = (unsigned int)q_int(req,"lba",0);
+            unsigned int seed = (unsigned int)q_int(req,"seed",0x41);
+            rp1usb_msd_fill_pattern(seed);
+            int w = rp1usb_msd_write_block(lba);
+            unsigned int wstat = rp1usb_msd_csw_status();
+            int rr = rp1usb_msd_read_block(lba);       /* read back to verify */
+            bl = s_put(body, bl, "write lba="); bl = s_putdec(body, bl, (int)lba);
+            bl = s_put(body, bl, " seed="); bl = s_putdec(body, bl, (int)seed);
+            bl = s_put(body, bl, " w="); bl = s_putdec(body, bl, w);
+            bl = s_put(body, bl, " wCSW="); bl = s_putdec(body, bl, (int)wstat);
+            bl = s_put(body, bl, " readback r="); bl = s_putdec(body, bl, rr);
+            bl = s_put(body, bl, " rCSW="); bl = s_putdec(body, bl, (int)rp1usb_msd_csw_status());
+            bl = s_put(body, bl, " first4:");
+            for (int i=0;i<4;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_msd_data_byte(i)); }
+            bl = s_put(body, bl, " (expect "); bl = s_putdec(body, bl, (int)(seed&0xff));
+            bl = s_put(body, bl, " "); bl = s_putdec(body, bl, (int)((seed+1)&0xff));
+            bl = s_put(body, bl, " ...)\n");
         } else {
         bl = s_put(body, bl, "hciver=");   bl = s_putdec(body, bl, rp1usb_ver(0));
         bl = s_put(body, bl, " ports=");   bl = s_putdec(body, bl, rp1usb_ports(0));
