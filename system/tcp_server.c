@@ -21,6 +21,12 @@
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
+/* TX is pluggable so the same server runs over Ethernet (genet, Pi 4) or the
+ * WiFi data path (wifi_eth_tx, Pi 5).  Defaults to genet; the WiFi bring-up
+ * calls tcp_set_tx(wifi_eth_tx) once it has a DHCP address. */
+static int (*g_tcp_tx)(const unsigned char *frame, int length) = genet_tx_frame;
+void tcp_set_tx(int (*fn)(const unsigned char *frame, int length)) { g_tcp_tx = fn; }
+
 /* --- byte/checksum helpers (duplicated, intentionally — keeps
  *     this file standalone of net_responder/dhcp_client) --- */
 static unsigned short ip_checksum(const unsigned char *data, int len)
@@ -221,7 +227,7 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
         send_len = 60;
     }
 
-    return genet_tx_frame((const unsigned char *)tx_frame, send_len);
+    return g_tcp_tx((const unsigned char *)tx_frame, send_len);
 }
 
 /* =====================================================================

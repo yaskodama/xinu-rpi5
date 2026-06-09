@@ -250,6 +250,12 @@ static void genet_rx_tick(void)
 void timer_tick_hook(void)
 {
 #if defined(RP1_ETH_BASE) && !defined(MINIMAL_OS)
+    /* The shell main loop blocks on UART input, so the timer IRQ is the only
+     * thing that reliably drains WiFi RX.  genet_rx_tick() -> wifi_net_poll()
+     * therefore answers ARP/ICMP and now also services the TCP/HTTP server in
+     * interrupt context — the same way the existing RP1-eth path already runs
+     * tcp_handle_packet() here.  A POST /compile runs cc inline (bounded by the
+     * cc runaway guard), causing a brief stall but no wedge. */
     genet_rx_tick();
 #endif
 }
@@ -1009,20 +1015,23 @@ static void vfs_populate_demo(void)
          * Run with:  cc /home/PingPong.abcl   (or  make /home/PingPong.abcl) */
         f = vfs_create_file(home, "PingPong.abcl");
         vfs_write_str(f,
-            "/* PingPong.abcl - AIPL sample: a ball volleyed back and forth. */\n"
-            "int main() {\n"
-            "    int volleys = 8;\n"
-            "    int i = 0;\n"
-            "    int side = 0;\n"
-            "    while (i < volleys) {\n"
-            "        if (side == 0) { puts(\"  Ping  ->\"); side = 1; }\n"
-            "        else           { puts(\"      <-  Pong\"); side = 0; }\n"
-            "        i = i + 1;\n"
+            "/* PingPong.abcl - real AIPL: two Player actors volley a ball.\n"
+            "   Each `hit` prints, then sends `hit` to its peer with n-1, so the\n"
+            "   ball bounces between the two actors until the count reaches 0.\n"
+            "   cc/make translate this with the on-device abcl2c (see `abcl2c`). */\n"
+            "class Player {\n"
+            "    var peer = 0;\n"
+            "    method setup(p) { peer = p; }\n"
+            "    method hit(n) {\n"
+            "        print(\"hit \" + n);\n"
+            "        if (n > 0) send peer.hit(n - 1);\n"
             "    }\n"
-            "    puts(\"PingPong: volleys done =\");\n"
-            "    print(volleys);\n"
-            "    return volleys;\n"
-            "}\n");
+            "}\n"
+            "var a = new Player();\n"
+            "var b = new Player();\n"
+            "send a.setup(b);\n"
+            "send b.setup(a);\n"
+            "send a.hit(6);\n");
         /* AIPL sample — RotateLine: four line segments, each centred on a
          * corner of a square, all spinning in the Graphics window.  The value_t
          * runtime computes the turn count, then the gfx_rotate_line() builtin

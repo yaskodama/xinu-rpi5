@@ -848,11 +848,15 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
      * v_list_map/filter can call back into compiled AIPL functions. */
     vheap_reset();
     lheap_reset();
+    cc_actor_reset();
     int aoff = cc_func_offset("apply");
     cc_set_apply(aoff >= 0 ? (void *)(code + aoff) : 0);
+    { int doff = cc_func_offset("dispatch");      /* AIPL async send() support */
+      g_dispatch = (doff >= 0) ? (long(*)(long,long,long,long,long,long))(code + doff) : 0; }
 
     long (*entryfn)(void) = (long (*)(void))(code + entry);
     long rc = entryfn();                 /* JIT: run main() in place */
+    cc_pump();                           /* deliver async send() cascade       */
     if (retval) *retval = rc;
 
     arena_free();
@@ -932,6 +936,114 @@ int cc_compile(const char *src, int srclen)
 
     cc_sync_icache(code, (unsigned long)len);
     g_cc_code = code; g_cc_entry = entry; g_cc_ready = 1;
+    /* If this is an AIPL actor program (abcl2c emits a `dispatch` function),
+     * wire it so cc_exec_compiled() can deliver the async send() mailbox via
+     * cc_pump().  Plain C has no `dispatch` -> g_dispatch stays 0 (no-op). */
+    { int doff = cc_func_offset("dispatch");
+      g_dispatch = (doff >= 0) ? (long(*)(long,long,long,long,long,long))(code + doff) : 0; }
+    return 0;
+}
+
+/* ===================================================================== *
+ *  Executable-form blobs — save a compiled program to a file and run    *
+ *  it again later (the `make` / `run` shell commands).                  *
+ *                                                                       *
+ *  The JIT targets the FIXED static g_codebuf + g_arenabuf, so a blob    *
+ *  capturing (entry, apply offset, the emitted code bytes, and the used  *
+ *  arena bytes) is enough to restore those buffers to the very same      *
+ *  addresses and re-execute: code-internal offsets, arena string-literal *
+ *  addresses and kernel-builtin addresses all still resolve under the    *
+ *  SAME kernel image.  (Re-flashing the kernel invalidates old blobs.)   *
+ * ===================================================================== */
+#define XJX_MAGIC 0x31584a58u                 /* 'X','J','X','1' (LE)        */
+struct xjx_hdr {
+    unsigned int magic;       /* XJX_MAGIC                                   */
+    unsigned int entry;       /* main() offset into the code image           */
+    unsigned int apply_off;   /* apply(id,x) offset, or 0xffffffff if none   */
+    unsigned int dispatch_off;/* AIPL dispatch() offset, 0xffffffff if none  */
+    unsigned int codelen;     /* bytes of machine code                       */
+    unsigned int arenalen;    /* bytes of arena (string literals + globals)  */
+};
+
+/* Compile `src` and serialize the executable form into out[0..outcap).
+ * Returns the blob length, or <0 on error (error text left in g_errbuf). */
+int cc_compile_blob(const char *src, int srclen, unsigned char *out, int outcap)
+{
+    unsigned long n = (unsigned long)(srclen < 0 ? 0 : srclen);
+    g_res_loaded = 0; g_dispatch = 0;
+    if (!arena_init(CC_ARENA)) return -2;
+    g_err = 0; g_errbuf[0] = 0;
+
+    char *s = (char *)cc_alloc(n + 1);
+    for (unsigned long i = 0; i < n; i++) s[i] = src[i];
+    s[n] = 0;
+
+    token_t *toks = cc_lex(s);
+    func_t  *fns  = cc_failed() ? 0 : cc_parse(toks);
+    int entry = 0, len = -1;
+    if (!cc_failed()) len = cc_codegen(fns, g_codebuf, CC_CODECAP, &entry);
+    if (cc_failed() || len < 0) { arena_free(); return -1; }
+
+    int aoff = cc_func_offset("apply");        /* -1 if the program has none  */
+    int doff = cc_func_offset("dispatch");     /* -1 unless an AIPL program    */
+    unsigned int codelen  = (unsigned int)len;
+    unsigned int arenalen = (unsigned int)g_apos;
+    unsigned long total = sizeof(struct xjx_hdr) + codelen + arenalen;
+    if (!out || (long)total > (long)outcap) {
+        cc_error("program too large for the executable buffer");
+        arena_free(); return -3;
+    }
+
+    struct xjx_hdr *h = (struct xjx_hdr *)out;
+    h->magic = XJX_MAGIC;  h->entry = (unsigned int)entry;
+    h->apply_off = (unsigned int)aoff;
+    h->dispatch_off = (unsigned int)doff;
+    h->codelen = codelen;  h->arenalen = arenalen;
+    unsigned char *p = out + sizeof *h;
+    for (unsigned int i = 0; i < codelen;  i++) p[i] = g_codebuf[i];
+    p += codelen;
+    for (unsigned int i = 0; i < arenalen; i++) p[i] = (unsigned char)g_arenabuf[i];
+
+    arena_free();
+    return (int)total;
+}
+
+/* Restore an executable-form blob and run it (capturing output into `out`).
+ * Returns 0 on success, <0 if the blob is invalid. */
+int cc_run_blob(const unsigned char *blob, int bloblen, char *out, int outcap, long *retval)
+{
+    if (out && outcap > 0) out[0] = 0;
+    if (!blob || bloblen < (int)sizeof(struct xjx_hdr)) return -1;
+    const struct xjx_hdr *h = (const struct xjx_hdr *)blob;
+    if (h->magic != XJX_MAGIC) return -1;
+    if (h->codelen > CC_CODECAP || h->arenalen > CC_ARENA) return -1;
+    if ((unsigned long)sizeof(struct xjx_hdr) + h->codelen + h->arenalen
+        > (unsigned long)bloblen) return -1;
+
+    const unsigned char *p = blob + sizeof *h;
+    for (unsigned int i = 0; i < h->codelen;  i++) g_codebuf[i]  = p[i];
+    p += h->codelen;
+    for (unsigned int i = 0; i < h->arenalen; i++) g_arenabuf[i] = (char)p[i];
+
+    cc_sync_icache(g_codebuf, h->codelen);
+    cc_set_deadline();
+    vheap_reset(); lheap_reset();
+    cc_actor_reset();
+    cc_set_apply(h->apply_off != 0xffffffffu ? (void *)(g_codebuf + h->apply_off) : 0);
+    g_dispatch = (h->dispatch_off != 0xffffffffu)
+               ? (long(*)(long,long,long,long,long,long))(g_codebuf + h->dispatch_off) : 0;
+
+    g_cap = out; g_capcap = outcap; g_caplen = 0;
+    long (*entryfn)(void) = (long (*)(void))(g_codebuf + h->entry);
+    long rv = entryfn();
+    cc_pump();                        /* deliver async send() cascade (AIPL)   */
+    if (g_aborted && g_cap) {
+        const char *note = "cc: aborted (ran past the runaway-loop deadline)\n";
+        for (int i = 0; note[i] && g_caplen < g_capcap - 1; i++) g_cap[g_caplen++] = note[i];
+    }
+    if (g_cap) g_cap[(g_caplen < g_capcap) ? g_caplen : (g_capcap - 1)] = 0;
+    g_cap = 0;
+    if (retval) *retval = rv;
     return 0;
 }
 
@@ -956,11 +1068,13 @@ long cc_exec_compiled(char *out, int outcap, int *aborted)
     cc_set_deadline();
     vheap_reset();
     lheap_reset();
+    cc_actor_reset();                 /* fresh actor world for AIPL programs   */
     int aoff = cc_func_offset("apply");
     cc_set_apply(aoff >= 0 ? (void *)(g_cc_code + aoff) : 0);
 
     long (*entryfn)(void) = (long (*)(void))(g_cc_code + g_cc_entry);
     long rc = entryfn();
+    cc_pump();                        /* deliver async send() cascade (AIPL)   */
 
     if (aborted) *aborted = g_aborted;
     if (g_cap) g_cap[(g_caplen < g_capcap) ? g_caplen : (g_capcap - 1)] = 0;

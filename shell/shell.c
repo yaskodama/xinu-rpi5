@@ -278,6 +278,30 @@ static void ccrun_proc_entry(void)
     proc_exit();
 }
 
+/* A .abcl/.aipl source is real AIPL — translate it to C with the on-device
+ * abcl2c first, then hand the C to cc.  g_xlat holds the translation. */
+static char g_xlat[16384];
+static int  src_is_aipl(const char *path)
+{
+    int n = 0; while (path[n]) n++;
+    const char *e[] = { ".abcl", ".aipl", 0 };
+    for (int k = 0; e[k]; k++) { int el = 0; while (e[k][el]) el++;
+        if (n > el) { int m = 1; for (int i = 0; i < el; i++) if (path[n-el+i] != e[k][i]) { m = 0; break; } if (m) return 1; } }
+    return 0;
+}
+/* If `path` is AIPL, translate raw[0..rawlen) into g_xlat and point *csrc at
+ * it (returns the C length); otherwise *csrc = raw (returns rawlen).  <0 on a
+ * translation error (message already printed). */
+static int aipl_prep(const char *path, char *raw, int rawlen, char **csrc)
+{
+    if (!src_is_aipl(path)) { *csrc = raw; return rawlen; }
+    extern int         abcl2c(const char *, int, char *, int);
+    extern const char *abcl2c_error(void);
+    int r = abcl2c(raw, rawlen, g_xlat, sizeof g_xlat);
+    if (r < 0) { uart_puts("abcl2c: "); uart_puts(abcl2c_error()); uart_putc('\n'); return -1; }
+    *csrc = g_xlat; return r;
+}
+
 static int cc_compile_and_run(const char *path)
 {
     extern const char *cc_last_error(void);
@@ -289,11 +313,16 @@ static int cc_compile_and_run(const char *path)
         uart_puts("    try: cc /home/hello.c   (or /home/PingPong.abcl, /home/RotateLine.abcl)\n");
         return 1;
     }
-    static char src[4096];
+    static char src[8192];
     int len = vfs_read(n, src, sizeof src - 1);
     src[len] = 0;
 
+    /* real AIPL (.abcl/.aipl) is translated to C by the on-device abcl2c */
+    char *csrc; int clen = aipl_prep(rp, src, len, &csrc);
+    if (clen < 0) return 1;
+
     uart_puts("cc: compiling + running "); uart_puts(rp);
+    if (csrc != src) uart_puts(" (abcl2c -> C)");
     uart_puts(" (separate process)\n");
 
     /* Compile AND run in a dedicated process on a STATIC stack, so a buggy
@@ -303,7 +332,7 @@ static int cc_compile_and_run(const char *path)
      * genet_rx_tick (USB-keyboard pump + HTTP /run), where getmem() — which is
      * not reentrant against the main thread — would race and wedge the box. */
     static unsigned char ccrun_stack[CCRUN_STK] __attribute__((aligned(16)));
-    g_ccrun_src = src; g_ccrun_len = len;
+    g_ccrun_src = csrc; g_ccrun_len = clen;
     g_ccrun_out[0] = 0; g_ccrun_rv = 0; g_ccrun_rc = 0; g_ccrun_aborted = 0;
     int pid = proc_create_static(ccrun_proc_entry, ccrun_stack, CCRUN_STK, "cc-run");
     if (pid < 0) { uart_puts("cc: proc_create failed (no slot)\n"); return 1; }
@@ -329,11 +358,428 @@ static int cmd_cc(int argc, char **argv)
     return cc_compile_and_run(argv[1]);
 }
 
+/* ============================================================ *
+ *  make / run — build a Makefile + an executable-form file      *
+ *                                                               *
+ *  `make` no longer just aliases cc.  It (1) ensures a Makefile  *
+ *  exists in the cwd (generating a default one and honouring its *
+ *  SRC/TARGET), (2) compiles SRC with the on-device C compiler   *
+ *  into an executable-form file TARGET (a saved machine-code     *
+ *  image, see cc_compile_blob), and (3) runs it.  `run TARGET`   *
+ *  re-executes a built file without recompiling.                 *
+ * ============================================================ */
+#define EXE_BLOB_CAP (192 * 1024)
+static unsigned char g_exeblob[EXE_BLOB_CAP];
+static unsigned char ccblob_stack[CCRUN_STK] __attribute__((aligned(16)));
+
+/* compile SRC -> g_exeblob (own stack; cc recursion must not smash ours) */
+static const char *g_mk_src; static int g_mk_srclen; static int g_mk_bloblen;
+static void make_compile_proc(void)
+{
+    extern int cc_compile_blob(const char *, int, unsigned char *, int);
+    g_mk_bloblen = cc_compile_blob(g_mk_src, g_mk_srclen, g_exeblob, sizeof g_exeblob);
+    proc_exit();
+}
+
+/* run an executable-form blob (own stack + runaway-loop deadline) */
+static const unsigned char *g_rb_blob; static int g_rb_len;
+static char g_rb_out[2048]; static long g_rb_rv; static int g_rb_rc;
+static void run_blob_proc(void)
+{
+    extern int cc_run_blob(const unsigned char *, int, char *, int, long *);
+    g_rb_rc = cc_run_blob(g_rb_blob, g_rb_len, g_rb_out, sizeof g_rb_out, &g_rb_rv);
+    proc_exit();
+}
+
+static int run_exe_blob(const unsigned char *blob, int len)
+{
+    g_rb_blob = blob; g_rb_len = len; g_rb_out[0] = 0; g_rb_rv = 0; g_rb_rc = 0;
+    int pid = proc_create_static(run_blob_proc, ccblob_stack, CCRUN_STK, "run");
+    if (pid < 0) { uart_puts("run: no proc slot\n"); return 1; }
+    proc_resched();
+    if (g_rb_rc != 0) {
+        uart_puts("run: not an executable-form file "
+                  "(bad magic / built by another kernel)\n");
+        return 1;
+    }
+    if (g_rb_out[0]) uart_puts(g_rb_out);
+    uart_puts("=> return value = "); puts_dec((int)g_rb_rv); uart_putc('\n');
+    return 0;
+}
+
+/* small string append into a fixed buffer */
+static int s_app(char *b, int p, int cap, const char *s)
+{ while (*s && p < cap - 1) b[p++] = *s++; b[p] = 0; return p; }
+
+/* base name of `src` minus a trailing .c/.abcl/.aipl -> out (the TARGET) */
+static void make_target_name(const char *src, char *out, int outsz)
+{
+    const char *b = src; for (const char *p = src; *p; p++) if (*p == '/') b = p + 1;
+    int n = 0; for (; b[n] && n < outsz - 1; n++) out[n] = b[n]; out[n] = 0;
+    const char *ext[] = { ".c", ".abcl", ".aipl", 0 };
+    for (int e = 0; ext[e]; e++) {
+        int el = 0; while (ext[e][el]) el++;
+        if (n > el) { int m = 1;
+            for (int i = 0; i < el; i++) if (out[n-el+i] != ext[e][i]) { m = 0; break; }
+            if (m) { out[n-el] = 0; return; } }
+    }
+}
+
+/* read `key = value` from a Makefile buffer -> out; returns 1 if found */
+static int mk_get(const char *buf, int len, const char *key, char *out, int outsz)
+{
+    int kl = 0; while (key[kl]) kl++;
+    for (int i = 0; i < len; ) {
+        int j = i; while (j < len && (buf[j]==' '||buf[j]=='\t')) j++;
+        int m = 1; for (int k = 0; k < kl; k++) if (j+k >= len || buf[j+k] != key[k]) { m = 0; break; }
+        if (m) { int p = j + kl;
+            while (p < len && (buf[p]==' '||buf[p]=='\t')) p++;
+            if (p < len && buf[p] == '=') { p++;
+                while (p < len && (buf[p]==' '||buf[p]=='\t')) p++;
+                int o = 0;
+                while (p < len && buf[p]!='\n' && buf[p]!='\r' && buf[p]!=' ' && buf[p]!='\t' && o < outsz-1)
+                    out[o++] = buf[p++];
+                out[o] = 0; if (o > 0) return 1; } }
+        while (i < len && buf[i] != '\n') i++; i++;
+    }
+    return 0;
+}
+
+/* open an existing regular file at an absolute path, else create it */
+static vfs_node_t *fs_open_or_create(const char *abspath)
+{
+    vfs_node_t *n = vfs_lookup(abspath);
+    if (n) return (n->kind == VFS_FILE) ? n : 0;
+    return vfs_create_path(abspath);
+}
+
 static int cmd_make(int argc, char **argv)
 {
-    /* `make` is a convenience alias for `cc`; default target is the C sample.
-     * Both compile + run locally via a dedicated process (not the inline JIT). */
-    return cc_compile_and_run(argc >= 2 ? argv[1] : "/home/hello.c");
+    extern const char *cc_last_error(void);
+    char src[64] = "hello.c", target[64] = "hello";
+    char mkpath[160], srcpath[160], exepath[160];
+    static char mkbuf[2048], srcbuf[4096];
+
+    /* 1. Makefile in the cwd: read SRC/TARGET, or generate a default one. */
+    fs_resolve("Makefile", mkpath, sizeof mkpath);
+    vfs_node_t *mk = vfs_lookup(mkpath);
+    int have_mk = (mk && mk->kind == VFS_FILE);
+    if (have_mk) {
+        int n = vfs_read(mk, mkbuf, sizeof mkbuf - 1); mkbuf[n] = 0;
+        char v[64];
+        if (mk_get(mkbuf, n, "SRC",    v, sizeof v)) { int i=0; for(;v[i]&&i<63;i++) src[i]=v[i];    src[i]=0; }
+        if (mk_get(mkbuf, n, "TARGET", v, sizeof v)) { int i=0; for(;v[i]&&i<63;i++) target[i]=v[i]; target[i]=0; }
+    }
+    /* explicit arg wins and derives the target name */
+    if (argc >= 2) { int i=0; for(;argv[1][i]&&i<63;i++) src[i]=argv[1][i]; src[i]=0;
+                     make_target_name(src, target, sizeof target); }
+    else if (!have_mk) make_target_name(src, target, sizeof target);
+
+    /* 2. generate a Makefile when none exists */
+    if (!have_mk) {
+        vfs_node_t *f = fs_open_or_create(mkpath);
+        if (f) {
+            static char gen[512]; int p = 0;
+            p = s_app(gen, p, sizeof gen,
+                "# Auto-generated by `make` on Xinu Pi5 (on-device JIT toolchain).\n"
+                "# `make` compiles SRC with the built-in C compiler into the\n"
+                "# executable-form file TARGET (a saved machine-code image), then\n"
+                "# runs it.  Re-run a built file without recompiling:  run TARGET\n"
+                "SRC = ");
+            p = s_app(gen, p, sizeof gen, src);
+            p = s_app(gen, p, sizeof gen, "\nTARGET = ");
+            p = s_app(gen, p, sizeof gen, target);
+            p = s_app(gen, p, sizeof gen, "\n");
+            vfs_write_str(f, gen);
+            uart_puts("make: wrote "); uart_puts(mkpath); uart_putc('\n');
+        }
+    }
+
+    /* 3. read the source */
+    fs_resolve(src, srcpath, sizeof srcpath);
+    vfs_node_t *sn = vfs_lookup(srcpath);
+    if (!sn || sn->kind != VFS_FILE) {
+        uart_puts("make: no such source: "); uart_puts(srcpath); uart_putc('\n');
+        uart_puts("  (set SRC in the Makefile, or: make <file.c>)\n");
+        return 1;
+    }
+    int slen = vfs_read(sn, srcbuf, sizeof srcbuf - 1); srcbuf[slen] = 0;
+
+    /* real AIPL (.abcl/.aipl) is translated to C by the on-device abcl2c */
+    char *csrc; int clen = aipl_prep(srcpath, srcbuf, slen, &csrc);
+    if (clen < 0) return 1;
+    if (csrc != srcbuf) { uart_puts("make: abcl2c "); uart_puts(srcpath); uart_puts(" -> C\n"); }
+
+    /* 4. compile -> executable-form blob (own stack) */
+    g_mk_src = csrc; g_mk_srclen = clen; g_mk_bloblen = -1;
+    int pid = proc_create_static(make_compile_proc, ccblob_stack, CCRUN_STK, "cc-make");
+    if (pid < 0) { uart_puts("make: no proc slot\n"); return 1; }
+    proc_resched();
+    if (g_mk_bloblen < 0) {
+        uart_puts("make: compile failed: "); uart_puts(cc_last_error()); uart_putc('\n');
+        return 1;
+    }
+
+    /* 5. write the executable-form file */
+    fs_resolve(target, exepath, sizeof exepath);
+    vfs_node_t *ef = fs_open_or_create(exepath);
+    if (!ef) { uart_puts("make: cannot create "); uart_puts(exepath); uart_putc('\n'); return 1; }
+    vfs_write(ef, g_exeblob, (unsigned long)g_mk_bloblen);
+    uart_puts("make: "); uart_puts(srcpath); uart_puts(" -> "); uart_puts(exepath);
+    uart_puts(" ("); puts_dec(g_mk_bloblen); uart_puts(" bytes)\n");
+
+    /* 6. run it */
+    uart_puts("make: running "); uart_puts(target); uart_putc('\n');
+    return run_exe_blob(g_exeblob, g_mk_bloblen);
+}
+
+static int cmd_run(int argc, char **argv)
+{
+    if (argc < 2) {
+        uart_puts("usage: run <file>   execute an executable-form file built by make\n");
+        return 1;
+    }
+    char path[160]; fs_resolve(argv[1], path, sizeof path);
+    vfs_node_t *n = vfs_lookup(path);
+    if (!n || n->kind != VFS_FILE) {
+        uart_puts("run: no such file: "); uart_puts(path); uart_putc('\n'); return 1;
+    }
+    int len = vfs_read(n, g_exeblob, sizeof g_exeblob);
+    return run_exe_blob(g_exeblob, len);
+}
+
+/* ============================================================ *
+ *  edit — a small emacs-style full-screen text editor          *
+ *                                                              *
+ *  Drives the SERIAL terminal with ANSI escapes (the HDMI/wm   *
+ *  console is line-oriented, so use a serial terminal).  The   *
+ *  network + window manager keep running from the timer IRQ    *
+ *  while edit blocks on uart_getc(), so the box stays alive.   *
+ *  Bindings (Emacs):                                           *
+ *    C-f/C-b  fwd/back char     C-n/C-p  next/prev line        *
+ *    C-a/C-e  start/end of line arrows too                     *
+ *    C-d      delete char       Backspace delete back          *
+ *    C-k      kill to EOL       Enter     split line           *
+ *    C-x C-s  save              C-x C-c   quit                 *
+ * ============================================================ */
+#define ED_ROWS 256
+#define ED_COLS 200
+#define ED_VIEW 22                       /* visible text rows (status on 23) */
+static char ed_text[ED_ROWS][ED_COLS];
+static int  ed_llen[ED_ROWS];
+static int  ed_n, ed_cy, ed_cx, ed_top, ed_dirty;
+
+static void ed_num(int v)
+{ char b[8]; int n = 0; if (v <= 0) { uart_putc('0'); return; }
+  while (v) { b[n++] = (char)('0' + v % 10); v /= 10; } while (n) uart_putc(b[--n]); }
+
+static void ed_gotoxy(int row, int col)            /* 1-based */
+{ uart_puts("\x1b["); ed_num(row); uart_putc(';'); ed_num(col); uart_putc('H'); }
+
+static void ed_place_cursor(void)
+{ ed_gotoxy(ed_cy - ed_top + 1, ed_cx + 1); }
+
+static void ed_draw_status(const char *fn)
+{
+    ed_gotoxy(ED_VIEW + 1, 1);
+    uart_puts("\x1b[7m\x1b[K");                     /* reverse video + clear  */
+    uart_puts(" edit "); uart_puts(fn);
+    uart_puts(ed_dirty ? "  [modified] " : "  [saved] ");
+    uart_puts(" C-x C-s save  C-x C-c quit   ln ");
+    ed_num(ed_cy + 1); uart_putc('/'); ed_num(ed_n);
+    uart_puts("\x1b[0m");
+}
+
+static void ed_draw_textrow(int sr)                 /* sr = 0..ED_VIEW-1      */
+{
+    int y = ed_top + sr;
+    ed_gotoxy(sr + 1, 1); uart_puts("\x1b[K");
+    if (y < ed_n) for (int i = 0; i < ed_llen[y]; i++) uart_putc(ed_text[y][i]);
+}
+
+static void ed_redraw(const char *fn)
+{
+    uart_puts("\x1b[2J");
+    for (int sr = 0; sr < ED_VIEW; sr++) ed_draw_textrow(sr);
+    ed_draw_status(fn);
+    ed_place_cursor();
+}
+
+/* keep the cursor row on screen; returns 1 if the view scrolled */
+static int ed_scroll(void)
+{
+    int old = ed_top;
+    if (ed_cy < ed_top)              ed_top = ed_cy;
+    if (ed_cy >= ed_top + ED_VIEW)   ed_top = ed_cy - ED_VIEW + 1;
+    if (ed_top < 0) ed_top = 0;
+    return ed_top != old;
+}
+
+static void ed_save(const char *path, const char *fn)
+{
+    static char ob[ED_ROWS * ED_COLS]; int p = 0;
+    for (int y = 0; y < ed_n; y++) {
+        for (int i = 0; i < ed_llen[y] && p < (int)sizeof ob - 2; i++) ob[p++] = ed_text[y][i];
+        if (y < ed_n - 1 && p < (int)sizeof ob - 2) ob[p++] = '\n';
+    }
+    ob[p] = 0;
+    vfs_node_t *f = fs_open_or_create(path);
+    if (f) { vfs_write(f, ob, (unsigned long)p); ed_dirty = 0; }
+    ed_draw_status(fn); ed_place_cursor();
+}
+
+static int cmd_edit(int argc, char **argv)
+{
+    if (argc < 2) { uart_puts("usage: edit <file>   emacs-style editor (serial terminal)\n"); return 1; }
+    char path[160]; fs_resolve(argv[1], path, sizeof path);
+
+    /* load (or start empty) */
+    ed_n = 0; ed_cy = ed_cx = ed_top = ed_dirty = 0;
+    vfs_node_t *node = vfs_lookup(path);
+    if (node && node->kind == VFS_FILE) {
+        static char fb[ED_ROWS * ED_COLS];
+        int len = vfs_read(node, fb, sizeof fb - 1); if (len < 0) len = 0; fb[len] = 0;
+        int row = 0, col = 0;
+        for (int i = 0; i < len && row < ED_ROWS; i++) {
+            char ch = fb[i];
+            if (ch == '\r') continue;
+            if (ch == '\n') { ed_llen[row] = col; row++; col = 0; }
+            else if (col < ED_COLS - 1) ed_text[row][col++] = ch;
+        }
+        if (row < ED_ROWS) { ed_llen[row] = col; row++; }
+        ed_n = row;
+    } else if (node) {
+        uart_puts("edit: not a file: "); uart_puts(path); uart_putc('\n'); return 1;
+    }
+    if (ed_n == 0) { ed_llen[0] = 0; ed_n = 1; }
+
+    ed_redraw(argv[1]);
+
+    int prefix = 0;                                 /* C-x seen */
+    for (;;) {
+        char c = uart_getc();
+
+        if (prefix) {
+            prefix = 0;
+            if (c == 0x13) { ed_save(path, argv[1]); continue; }   /* C-s */
+            if (c == 0x03) break;                                  /* C-c */
+            continue;
+        }
+        if (c == 0x18) { prefix = 1; continue; }                   /* C-x */
+
+        /* arrow keys: ESC [ A/B/C/D -> map to C-p/n/f/b */
+        if (c == 0x1b) {
+            char b1 = uart_getc();
+            if (b1 == '[') { char d = uart_getc();
+                if (d == 'A') c = 0x10; else if (d == 'B') c = 0x0e;
+                else if (d == 'C') c = 0x06; else if (d == 'D') c = 0x02;
+                else continue;
+            } else continue;
+        }
+
+        if (ed_cx > ed_llen[ed_cy]) ed_cx = ed_llen[ed_cy];
+
+        if (c == 0x06) {                                            /* C-f */
+            if (ed_cx < ed_llen[ed_cy]) ed_cx++;
+            else if (ed_cy < ed_n - 1) { ed_cy++; ed_cx = 0; }
+        } else if (c == 0x02) {                                     /* C-b */
+            if (ed_cx > 0) ed_cx--;
+            else if (ed_cy > 0) { ed_cy--; ed_cx = ed_llen[ed_cy]; }
+        } else if (c == 0x0e) {                                     /* C-n */
+            if (ed_cy < ed_n - 1) { ed_cy++; if (ed_cx > ed_llen[ed_cy]) ed_cx = ed_llen[ed_cy]; }
+        } else if (c == 0x10) {                                     /* C-p */
+            if (ed_cy > 0) { ed_cy--; if (ed_cx > ed_llen[ed_cy]) ed_cx = ed_llen[ed_cy]; }
+        } else if (c == 0x01) { ed_cx = 0; }                        /* C-a */
+        else if (c == 0x05) { ed_cx = ed_llen[ed_cy]; }             /* C-e */
+        else if (c == 0x0b) {                                       /* C-k kill EOL */
+            ed_llen[ed_cy] = ed_cx; ed_dirty = 1;
+            ed_draw_textrow(ed_cy - ed_top); ed_draw_status(argv[1]); ed_place_cursor();
+            continue;
+        } else if (c == 0x7f || c == 0x08) {                        /* Backspace */
+            if (ed_cx > 0) {
+                for (int i = ed_cx - 1; i < ed_llen[ed_cy] - 1; i++) ed_text[ed_cy][i] = ed_text[ed_cy][i + 1];
+                ed_llen[ed_cy]--; ed_cx--; ed_dirty = 1;
+                ed_draw_textrow(ed_cy - ed_top); ed_draw_status(argv[1]); ed_place_cursor();
+                continue;
+            } else if (ed_cy > 0) {                                 /* join with previous */
+                int prev = ed_cy - 1, pl = ed_llen[prev];
+                for (int i = 0; i < ed_llen[ed_cy] && pl + i < ED_COLS - 1; i++) ed_text[prev][pl + i] = ed_text[ed_cy][i];
+                ed_llen[prev] = pl + ed_llen[ed_cy];
+                for (int y = ed_cy; y < ed_n - 1; y++) { for (int i = 0; i < ed_llen[y + 1]; i++) ed_text[y][i] = ed_text[y + 1][i]; ed_llen[y] = ed_llen[y + 1]; }
+                ed_n--; ed_cy = prev; ed_cx = pl; ed_dirty = 1;
+                ed_scroll(); ed_redraw(argv[1]); continue;
+            }
+        } else if (c == 0x04) {                                     /* C-d delete fwd */
+            if (ed_cx < ed_llen[ed_cy]) {
+                for (int i = ed_cx; i < ed_llen[ed_cy] - 1; i++) ed_text[ed_cy][i] = ed_text[ed_cy][i + 1];
+                ed_llen[ed_cy]--; ed_dirty = 1;
+                ed_draw_textrow(ed_cy - ed_top); ed_draw_status(argv[1]); ed_place_cursor();
+                continue;
+            } else if (ed_cy < ed_n - 1) {                          /* join next up */
+                int nl = ed_llen[ed_cy + 1];
+                for (int i = 0; i < nl && ed_cx + i < ED_COLS - 1; i++) ed_text[ed_cy][ed_cx + i] = ed_text[ed_cy + 1][i];
+                ed_llen[ed_cy] = ed_cx + nl;
+                for (int y = ed_cy + 1; y < ed_n - 1; y++) { for (int i = 0; i < ed_llen[y + 1]; i++) ed_text[y][i] = ed_text[y + 1][i]; ed_llen[y] = ed_llen[y + 1]; }
+                ed_n--; ed_dirty = 1; ed_redraw(argv[1]); continue;
+            }
+        } else if (c == 0x0d || c == 0x0a) {                        /* Enter: split */
+            if (ed_n < ED_ROWS) {
+                for (int y = ed_n; y > ed_cy + 1; y--) { for (int i = 0; i < ed_llen[y - 1]; i++) ed_text[y][i] = ed_text[y - 1][i]; ed_llen[y] = ed_llen[y - 1]; }
+                int tail = ed_llen[ed_cy] - ed_cx;
+                for (int i = 0; i < tail; i++) ed_text[ed_cy + 1][i] = ed_text[ed_cy][ed_cx + i];
+                ed_llen[ed_cy + 1] = tail; ed_llen[ed_cy] = ed_cx;
+                ed_n++; ed_cy++; ed_cx = 0; ed_dirty = 1;
+                ed_scroll(); ed_redraw(argv[1]); continue;
+            }
+        } else if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7f) {  /* insert */
+            if (ed_llen[ed_cy] < ED_COLS - 1) {
+                for (int i = ed_llen[ed_cy]; i > ed_cx; i--) ed_text[ed_cy][i] = ed_text[ed_cy][i - 1];
+                ed_text[ed_cy][ed_cx] = c; ed_llen[ed_cy]++; ed_cx++; ed_dirty = 1;
+                ed_draw_textrow(ed_cy - ed_top); ed_draw_status(argv[1]); ed_place_cursor();
+                continue;
+            }
+        }
+
+        /* cursor-move fallthrough: redraw if it scrolled, else just move */
+        if (ed_scroll()) ed_redraw(argv[1]);
+        else { ed_draw_status(argv[1]); ed_place_cursor(); }
+    }
+
+    uart_puts("\x1b[2J\x1b[H");                     /* clean exit */
+    uart_puts("edit: done");
+    if (ed_dirty) uart_puts(" (unsaved changes discarded — C-x C-s to save)");
+    uart_putc('\n');
+    return 0;
+}
+
+/* abcl2c <file.abcl> — translate real AIPL to C and write <file>.c.
+ * (cc/make on a .abcl already translate transparently; this exposes the C.) */
+static int cmd_abcl2c(int argc, char **argv)
+{
+    if (argc < 2) { uart_puts("usage: abcl2c <file.abcl>   (writes <file>.c)\n"); return 1; }
+    char path[160]; fs_resolve(argv[1], path, sizeof path);
+    vfs_node_t *n = vfs_lookup(path);
+    if (!n || n->kind != VFS_FILE) { uart_puts("abcl2c: no such file: "); uart_puts(path); uart_putc('\n'); return 1; }
+    static char raw[8192]; int rl = vfs_read(n, raw, sizeof raw - 1); raw[rl] = 0;
+
+    extern int         abcl2c(const char *, int, char *, int);
+    extern const char *abcl2c_error(void);
+    int r = abcl2c(raw, rl, g_xlat, sizeof g_xlat);
+    if (r < 0) { uart_puts("abcl2c: "); uart_puts(abcl2c_error()); uart_putc('\n'); return 1; }
+
+    /* output path: strip .abcl/.aipl, append .c */
+    char op[160]; int i = 0; for (; path[i] && i < 150; i++) op[i] = path[i]; op[i] = 0;
+    int n2 = i; const char *ex[] = { ".abcl", ".aipl", 0 };
+    for (int k = 0; ex[k]; k++) { int el = 0; while (ex[k][el]) el++;
+        if (n2 > el) { int m = 1; for (int j = 0; j < el; j++) if (op[n2-el+j] != ex[k][j]) { m = 0; break; } if (m) { n2 -= el; break; } } }
+    op[n2] = '.'; op[n2+1] = 'c'; op[n2+2] = 0;
+
+    vfs_node_t *f = fs_open_or_create(op);
+    if (!f) { uart_puts("abcl2c: cannot create "); uart_puts(op); uart_putc('\n'); return 1; }
+    vfs_write(f, g_xlat, (unsigned long)r);
+    uart_puts("abcl2c: "); uart_puts(path); uart_puts(" -> "); uart_puts(op);
+    uart_puts(" ("); puts_dec(r); uart_puts(" bytes C)\n  run it:  cc "); uart_puts(op); uart_putc('\n');
+    return 0;
 }
 
 static int cmd_clear(int argc, char **argv)
@@ -1054,7 +1500,10 @@ static const struct centry commandtab[] = {
     { "cat",    "cat <file>  print file contents",         cmd_cat    },
     { "kexec",  "kexec /microsd/<k.img>  boot another kernel from microSD", cmd_kexec },
     { "cc",     "cc <file>  compile + run a C/AIPL program (own process)", cmd_cc },
-    { "make",   "make [file]  compile + run a program (alias for cc)", cmd_make  },
+    { "make",   "make [file]  build Makefile + executable-form file, then run", cmd_make },
+    { "run",    "run <file>   execute an executable-form file built by make",   cmd_run  },
+    { "edit",   "edit <file>  emacs-style full-screen editor (serial terminal)", cmd_edit },
+    { "abcl2c", "abcl2c <f.abcl>  translate real AIPL to C (writes <f>.c)",      cmd_abcl2c },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },

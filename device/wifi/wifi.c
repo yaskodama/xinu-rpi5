@@ -25,6 +25,15 @@ typedef unsigned int   u32;
 extern void uart_puts(const char *s);
 extern void uart_putc(char c);
 
+/* TCP/HTTP server (system/tcp_server.c) — wired onto the WLAN data path on
+ * Pi 5 so a host on the same network can reach the on-device services
+ * (GET / , /api/actors, POST /compile = remote JIT, /actor/load, ...). */
+extern int  tcp_handle_packet(const unsigned char *frame, int len);
+extern void tcp_set_mac(const unsigned char mac[6]);
+extern void tcp_set_ip(const unsigned char ip[4]);
+extern void tcp_set_tx(int (*fn)(const unsigned char *frame, int length));
+extern void tcp_listen(unsigned short port);
+
 /* ------------------------------------------------------------------ *
  *  trace log (HTTP /wifi-trace dumps this) + mini formatter          *
  * ------------------------------------------------------------------ */
@@ -1733,6 +1742,24 @@ static u8 wifi_ip[4], wifi_mask[4], wifi_gw[4], wifi_dns[4], wifi_mac[6];
 static int wifi_have_ip = 0;
 int wifi_connected(void) { return wifi_have_ip; }
 
+/* Public TX wrapper: lets tcp_server.c transmit over the WLAN data channel
+ * (registered via tcp_set_tx in wifi_bind_tcp_server). */
+int wifi_eth_tx(const unsigned char *eth, int len) { return wifi_data_tx(eth, len); }
+
+/* Bind the TCP/HTTP server to our current WLAN identity and start listening on
+ * port 80.  Called once DHCP (or the ad-hoc static IP) has given us an address.
+ * Idempotent — safe to call again on re-association. */
+static void wifi_bind_tcp_server(void)
+{
+    tcp_set_tx(wifi_eth_tx);
+    tcp_set_mac(wifi_mac);
+    tcp_set_ip(wifi_ip);
+    tcp_listen(80);
+    wifi_log("[wifi] HTTP/JIT server listening on %d.%d.%d.%d:80 "
+             "(GET / , POST /compile)\r\n",
+             wifi_ip[0], wifi_ip[1], wifi_ip[2], wifi_ip[3]);
+}
+
 /* Disconnect: bring the MAC down (leaves the AP / ad-hoc cell) and clear state.
  * Clearing wifi_have_ip also quiesces the persistent ARP/ICMP responder (it
  * early-returns when there's no IP), so no separate thread stop is needed.  A
@@ -1849,6 +1876,7 @@ int wifi_dhcp(void)
     if (t != 5) { wifi_log("[wifi] dhcp: no ACK (timeout)\r\n"); return -1; }
     for (n = 0; n < 4; n++) { wifi_ip[n]=yi[n]; wifi_mask[n]=mask[n]; wifi_gw[n]=gw[n]; wifi_dns[n]=dns[n]; }
     wifi_have_ip = 1;
+    wifi_bind_tcp_server();          /* expose GET / , POST /compile over WiFi */
     wifi_log("[wifi] *** DHCP ACK: ip=%d.%d.%d.%d mask=%d.%d.%d.%d gw=%d.%d.%d.%d dns=%d.%d.%d.%d ***\r\n",
              wifi_ip[0],wifi_ip[1],wifi_ip[2],wifi_ip[3], wifi_mask[0],wifi_mask[1],wifi_mask[2],wifi_mask[3],
              wifi_gw[0],wifi_gw[1],wifi_gw[2],wifi_gw[3], wifi_dns[0],wifi_dns[1],wifi_dns[2],wifi_dns[3]);
@@ -1910,6 +1938,10 @@ static void wifi_handle_frame(u8 *fr, int len, int doff)
                 wifi_data_tx(e, 14 + iptot);
                 wifi_log("[wifi] -> ICMP echo reply\r\n");
             }
+        } else if (ip[9] == 6 && wifi_ip_eq(ip + 16)) {
+            /* inbound TCP to our IP -> hand to the HTTP/JIT server
+             * (tcp_server.c); its replies go out via tcp_set_tx(wifi_eth_tx). */
+            tcp_handle_packet(e, elen);
         }
     }
 }
@@ -2600,6 +2632,7 @@ int wifi_adhoc(const char *ssid, int channel, int n)
     for (i=0;i<4;i++){ wifi_dns[i]=0; }
     for (i = 0; i < sl && i < 39; i++) wifi_cur_ssid[i] = ssid[i]; wifi_cur_ssid[i] = 0;
     wifi_have_ip = 1;
+    wifi_bind_tcp_server();          /* expose GET / , POST /compile over WiFi */
     /* IBSS cell formation: the fw scans for the cell then creates it — poll
      * GET_BSSID until it reports the cell BSSID (~up to 12s). */
     { int t, up = 0;

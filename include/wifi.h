@@ -38,5 +38,6 @@ int  wifi_connected(void);
 const char *wifi_ssid(void);
 void wifi_ipaddr(unsigned char *o);
 void wifi_off(void);                 /* disconnect + bring the radio down       */
+int  wifi_eth_tx(const unsigned char *eth, int len);  /* TX hook for tcp_server  */
 
 #endif /* XINU_RPI5_WIFI_H */
