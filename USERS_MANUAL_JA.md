@@ -177,7 +177,7 @@ kexec /microsd/KERNEL~1.IMG # カード上のフル OS へ
 | `peek <hex>` | 32bit MMIO ワードの読み出し |
 | `uptime` | 汎用タイマ値 |
 | `ps` | コア／EL 状態 |
-| `wifi on/off/status/scan` | WiFi 操作（§9）|
+| `wifi on/off/status/scan/adhoc/aodv` | WiFi + メッシュ操作（§9）|
 | `sdtest` | SD コントローラ診断 |
 | `reboot` | 再起動（PM ウォッチドッグ）|
 | `clear` | 画面クリア |
@@ -211,18 +211,47 @@ curl 'http://192.168.3.101/run?cmd=wifi%20status'
 
 ## 9. WiFi
 
-内蔵 CYW43455 によるフル WiFi（スキャン／WPA2／DHCP／ping）に対応する。資格情報は
-ビルド時にカーネルへ埋め込まれ、**起動時には自動接続しない**。`wifi on` を実行した
-ときのみ接続する。
+内蔵 CYW43455 によるフル WiFi（スキャン／WPA2／DHCP／ping）に対応する。
+**起動時には自動接続しない**。`wifi on` を実行したときのみ接続する。
+
+### 9.1 アクセスポイントへの接続
 
 ```sh
-wifi on        # 接続（埋め込み資格情報を使用）
-wifi status    # 接続状態・SSID・IP
-wifi scan      # 近傍 AP のスキャン
-wifi off       # 切断
+wifi on <ssid> <pass>   # ファームウェア起動（~10 秒）→ WPA2 join → DHCP
+wifi on                 # 直前の資格情報、またはビルド時の wifi.conf を再利用
+wifi scan               # 無線を起こして近傍 AP を一覧
+wifi status             # 接続状態・SSID・IP
+wifi off                # 無線停止
+wifi-invest             # 接続できないときの診断
 ```
 
-画面右下に WiFi の電波アイコンと、その下に SSID・自 IP を表示する。
+`wifi on` 成功時は `wifi: CONNECTED IP=…` で終わる。画面右下に WiFi の電波
+アイコンと、その下に SSID・自 IP を表示する。資格情報はビルド時に `.gitignore`
+済みの `wifi.conf` からカーネルへ埋め込まれる（パスワードはコミットしないこと）。
+
+### 9.2 メッシュネットワーク（MANET ad-hoc）
+
+複数の Pi 5（および Pi 4 / Pi 3）Xinu ノードを **アクセスポイント無し** で直接
+つなぎ、ピアツーピアのメッシュを組める。802.11 の IBSS（ad-hoc）モード +
+オンデマンドの AODV マルチホップルーティングを使う。
+
+```sh
+wifi adhoc <cell-ssid> [ch] [node]   # ad-hoc セルに 10.0.0.<node> で参加
+wifi aodv  <a.b.c.d>                 # マルチホップ経路をオンデマンド探索
+```
+
+- `wifi adhoc mesh1 6 1` は指定セル（BSSID `02:4d:41:4e:45:54` = "MANET"）の
+  チャンネル `6`（既定）で無線を IBSS モードで起こし、静的 IP `10.0.0.1`
+  （`[node]` 番号、既定 `1`）を取る。以降 AODV 中継が自動で動く。
+- **全ノードで同じセル SSID・同じチャンネルを使い、`[node]` 番号は重複させない**
+  （`10.0.0.<node>/24`）。電波の届く範囲のノードは `10.0.0.x` で直接通信できる。
+- 直接届かない宛先には `wifi aodv 10.0.0.3` で RREQ をブロードキャスト（UDP 654）
+  し、中間ノードが中継、宛先が RREP を返してマルチホップ経路を確立する
+  （例 `AODV route: 10.0.0.3 via 10.0.0.2, 2 hop`）。先に `wifi adhoc` で IP を
+  取得しておくこと。
+
+ad-hoc/AODV はインフラ（`wifi on`）モードとは独立で、再起動後は復元しないため、
+各ノードで `wifi adhoc` を再実行する。
 
 ----------------------------------------------------------------------
 

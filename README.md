@@ -116,15 +116,48 @@ Endpoints: `/run?cmd=`, `/fs` (+ `/fs/ls`, `/fs/cat`, `/fs/write`),
 
 ## WiFi
 
+The on-board CYW43455 does infrastructure WiFi (scan / WPA2 / DHCP / ping). It
+**does not auto-connect at boot** — run `wifi on`. From the shell (`xinu-pi5$`,
+USB keyboard) or over HTTP (`/run?cmd=wifi%20...`):
+
 ```sh
-wifi on        # connect (embedded credentials; no auto-connect at boot)
-wifi status    # SSID + IP
-wifi scan      # nearby APs
-wifi off
+wifi on <ssid> <pass>   # bring up firmware (~10 s), join WPA2, DHCP
+wifi on                 # reuse the last creds, or the build-time wifi.conf
+wifi scan               # bring up the radio and list nearby APs
+wifi status             # connection state, SSID, IP
+wifi off                # radio down
+wifi-invest             # diagnostics when it won't come up
 ```
 
-WiFi credentials are embedded at build time from a `.gitignore`d file — never
-commit the password.
+A successful `wifi on` ends with `wifi: CONNECTED IP=…`; a WiFi icon plus the
+SSID/IP is drawn bottom-right on the desktop. Credentials are embedded at build
+time from a `.gitignore`d `wifi.conf` — never commit the password.
+
+## Mesh networking (MANET ad-hoc)
+
+Several Pi 5 (and Pi 4 / Pi 3) Xinu nodes can form a peer-to-peer mesh with **no
+access point**, using 802.11 IBSS (ad-hoc) mode plus on-demand AODV multi-hop
+routing — the same MANET stack the boards use in the drone-HIL demo.
+
+```sh
+wifi adhoc <cell-ssid> [ch] [node]   # join an ad-hoc cell as 10.0.0.<node>
+wifi aodv  <a.b.c.d>                 # discover a multi-hop route on demand
+```
+
+- `wifi adhoc mesh1 6 1` brings the radio up in IBSS mode on the named cell
+  (BSSID `02:4d:41:4e:45:54` = "MANET"), channel `6` (default), and takes the
+  static IP `10.0.0.1` (the `[node]` number, default `1`). The AODV relay then
+  runs automatically.
+- **All nodes use the same cell SSID and channel, with a distinct `[node]`
+  number** (`10.0.0.<node>/24`). Nodes in radio range reach each other directly
+  at `10.0.0.x`.
+- For a destination beyond direct range, `wifi aodv 10.0.0.3` broadcasts an RREQ
+  (UDP 654); intermediate nodes relay it and the destination replies with an
+  RREP, installing a multi-hop route (`AODV route: 10.0.0.3 via 10.0.0.2, 2
+  hop`). Run `wifi adhoc` first so the node has an IP.
+
+Ad-hoc/AODV is independent of the infrastructure `wifi on` mode and is not
+restored after reboot — re-run `wifi adhoc` on each node.
 
 ## Documentation
 

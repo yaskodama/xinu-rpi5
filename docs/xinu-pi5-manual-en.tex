@@ -224,7 +224,9 @@ Command & Description \\
 \cmd{peek <hex>} & read a 32-bit MMIO word \\
 \cmd{uptime} & generic timer value \\
 \cmd{ps} & core / EL status \\
-\cmd{wifi on/off/status/scan} & WiFi operations (Section~\ref{sec:wifi}) \\
+\cmd{wifi on/off/status/scan} & connect / disconnect / state / scan (Section~\ref{sec:wifi}) \\
+\cmd{wifi adhoc <ssid> [ch] [n]} & join a MANET ad-hoc (mesh) cell (Section~\ref{sec:wifi}) \\
+\cmd{wifi aodv <a.b.c.d>} & discover a multi-hop mesh route (Section~\ref{sec:wifi}) \\
 \cmd{sdtest} & SD controller diagnostics \\
 \cmd{reboot} & reboot (PM watchdog) \\
 \cmd{clear} & clear the screen \\
@@ -264,19 +266,49 @@ curl 'http://192.168.3.101/run?cmd=wifi%20status'
 \section{WiFi}
 \label{sec:wifi}
 Full WiFi via the on-board CYW43455 (scan / WPA2 / DHCP / ping) is supported.
-Credentials are embedded into the kernel at build time, and the system
-\textbf{does not auto-connect at boot}. It connects only when \cmd{wifi on}
-is run.
+The system \textbf{does not auto-connect at boot}; it connects only when
+\cmd{wifi on} is run.
+
+\subsection{Connecting to an access point}
+\begin{lstlisting}[language=bash]
+wifi on <ssid> <pass>   # bring up the firmware (~10 s), join WPA2, run DHCP
+wifi on                 # reuse the last creds, or the build-time wifi.conf
+wifi scan               # bring up the radio and list nearby APs
+wifi status             # connection state, SSID, IP
+wifi off                # radio down
+wifi-invest             # diagnostics when the link won't come up
+\end{lstlisting}
+A successful \cmd{wifi on} ends with \texttt{wifi: CONNECTED IP=...}. A WiFi
+signal icon is drawn at the bottom-right of the screen, with the SSID and local
+IP beneath it. Credentials are embedded into the kernel at build time from a
+\texttt{.gitignore}d \texttt{wifi.conf} (never commit the password).
+
+\subsection{Mesh networking (MANET ad-hoc)}
+Several Pi 5 (and Pi 4 / Pi 3) Xinu nodes can form a peer-to-peer mesh with
+\textbf{no access point}, using 802.11 IBSS (ad-hoc) mode plus on-demand AODV
+multi-hop routing.
 
 \begin{lstlisting}[language=bash]
-wifi on        # connect (using the embedded credentials)
-wifi status    # connection state, SSID, IP
-wifi scan      # scan nearby APs
-wifi off       # disconnect
+wifi adhoc <cell-ssid> [ch] [node]   # join an ad-hoc cell as 10.0.0.<node>
+wifi aodv  <a.b.c.d>                 # discover a multi-hop route on demand
 \end{lstlisting}
 
-A WiFi signal icon is drawn at the bottom-right of the screen, with the
-SSID and local IP shown beneath it.
+\begin{itemize}[noitemsep]
+  \item \cmd{wifi adhoc mesh1 6 1} brings the radio up in IBSS mode on the named
+        cell (BSSID \texttt{02:4d:41:4e:45:54} = ``MANET''), channel 6 (default),
+        and takes the static IP \texttt{10.0.0.1} (the \texttt{[node]} number,
+        default 1); the AODV relay then runs automatically.
+  \item All nodes use the \textbf{same cell SSID and channel, with a distinct
+        \texttt{[node]} number} (\texttt{10.0.0.<node>/24}). Nodes in radio range
+        reach each other directly at \texttt{10.0.0.x}.
+  \item For a destination beyond direct range, \cmd{wifi aodv 10.0.0.3}
+        broadcasts an RREQ (UDP 654); intermediate nodes relay it and the
+        destination replies with an RREP, installing a multi-hop route
+        (e.g.\ \texttt{AODV route: 10.0.0.3 via 10.0.0.2, 2 hop}). Run
+        \cmd{wifi adhoc} first so the node has an IP.
+\end{itemize}
+Ad-hoc/AODV is independent of the infrastructure \cmd{wifi on} mode and is not
+restored after reboot --- re-run \cmd{wifi adhoc} on each node.
 
 %======================================================================
 \section{USB (Mouse and Keyboard)}

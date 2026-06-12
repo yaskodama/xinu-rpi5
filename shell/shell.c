@@ -1368,7 +1368,7 @@ static int cmd_wifi(int argc, char **argv)
         } else {
             uart_puts("wifi: not connected\n");
             if (argc < 2)
-                uart_puts("usage: wifi on <ssid> <pass> | wifi on | wifi off | wifi scan | wifi status\n");
+                uart_puts("usage: wifi on <ssid> <pass> | on | off | scan | status | adhoc <ssid> [ch] [node] | aodv <ip>\n");
         }
         return 0;
     }
@@ -1445,7 +1445,37 @@ static int cmd_wifi(int argc, char **argv)
         }
         return 0;
     }
-    uart_puts("wifi: unknown subcommand — use on/off/status/scan\n");
+    if (str_eq(argv[1], "adhoc")) {      /* wifi adhoc <ssid> [ch] [node] — MANET ad-hoc (IBSS), ip 10.0.0.n */
+        extern int wifi_adhoc(const char *ssid, int channel, int n);
+        extern void shell_flush_screen(void);
+        int ch = 6, node = 1; const char *p;
+        if (argc < 3) { uart_puts("usage: wifi adhoc <ssid> [ch] [node]\n"); return 1; }
+        if (argc >= 4) { ch = 0;   for (p = argv[3]; *p>='0'&&*p<='9'; p++) ch   = ch*10   + (*p-'0'); }
+        if (argc >= 5) { node = 0; for (p = argv[4]; *p>='0'&&*p<='9'; p++) node = node*10 + (*p-'0'); }
+        uart_puts("wifi: joining ad-hoc cell (IBSS) — please wait...\n");
+        shell_flush_screen();
+        if (wifi_adhoc(argv[2], ch, node) != 0) { uart_puts("wifi: adhoc FAILED\n"); shell_flush_screen(); return 1; }
+        uart_puts("wifi: ad-hoc up, ip 10.0.0."); puts_dec(node);
+        uart_puts(" (AODV relay active)\n");
+        shell_flush_screen();
+        return 0;
+    }
+    if (str_eq(argv[1], "aodv")) {       /* wifi aodv <a.b.c.d> — on-demand multi-hop route discovery */
+        extern int wifi_aodv(const unsigned char *dst);
+        extern void shell_flush_screen(void);
+        unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0; const char *p;
+        if (argc < 3) { uart_puts("usage: wifi aodv <a.b.c.d>\n"); return 1; }
+        for (p = argv[2]; ; p++) {
+            if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+            else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+        }
+        uart_puts("wifi: AODV route discovery — please wait...\n");
+        shell_flush_screen();
+        wifi_aodv(ip);
+        shell_flush_screen();
+        return 0;
+    }
+    uart_puts("wifi: unknown subcommand — use on/off/status/scan/adhoc/aodv\n");
     return 1;
 }
 
@@ -1520,7 +1550,7 @@ static const struct centry commandtab[] = {
     { "view",     "show viewport / desktop sizes",         cmd_view     },
     { "autopan",  "autopan [on|off]  toggle demo scroll",  cmd_autopan  },
     { "reboot",   "reboot the board (BCM2712 PM watchdog)",  cmd_reboot   },
-    { "wifi",       "wifi on <ssid> <pass> | off | status | scan", cmd_wifi },
+    { "wifi",       "wifi on <ssid> <pass> | off | status | scan | adhoc <ssid> [ch] [node] | aodv <ip>", cmd_wifi },
     { "wifi-invest","wifi diagnostics + maintenance (re-run bring-up, dump trace)", cmd_wifi_invest },
     { "sdtest",     "SD card controller diagnostics (read LBA 0)", cmd_sdtest },
     { "?",      "alias for help",                          cmd_help   },
