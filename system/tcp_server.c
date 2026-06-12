@@ -17,8 +17,15 @@
 #include "actor.h"
 #include "vfs.h"
 #include "wm.h"
+#include "wifi.h"
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
+
+/* TX is pluggable so the same server runs over Ethernet (genet, Pi 4) or the
+ * WiFi data path (wifi_eth_tx, Pi 5).  Defaults to genet; the WiFi bring-up
+ * calls tcp_set_tx(wifi_eth_tx) once it has a DHCP address. */
+static int (*g_tcp_tx)(const unsigned char *frame, int length) = genet_tx_frame;
+void tcp_set_tx(int (*fn)(const unsigned char *frame, int length)) { g_tcp_tx = fn; }
 
 /* --- byte/checksum helpers (duplicated, intentionally — keeps
  *     this file standalone of net_responder/dhcp_client) --- */
@@ -220,7 +227,7 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
         send_len = 60;
     }
 
-    return genet_tx_frame((const unsigned char *)tx_frame, send_len);
+    return g_tcp_tx((const unsigned char *)tx_frame, send_len);
 }
 
 /* =====================================================================
@@ -248,6 +255,13 @@ static int s_putdec(char *b, int pos, long v)
     if (v == 0) { b[pos++] = '0'; return pos; }
     while (v) { t[n++] = (char)('0' + (v % 10)); v /= 10; }
     while (n--) b[pos++] = t[n];
+    return pos;
+}
+
+static int s_puthex(char *b, int pos, unsigned int v)
+{
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 7; i >= 0; i--) b[pos++] = hx[(v >> (i*4)) & 0xF];
     return pos;
 }
 
@@ -403,6 +417,20 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "\",\"result\":");
         bl = s_putdec(body, bl, result);
         bl = s_put(body, bl, "}\n");
+    } else if (path_eq(req, "/api/load")) {
+        /* Node load metric for the mesh load-balancer's placement policy:
+         * managers (Mac/Windows) poll this to pick the least-loaded Xinu node. */
+        extern int cc_actor_live_count(void), cc_actor_capacity(void);
+        ctype = "application/json";
+        int live = cc_actor_live_count(), cap = cc_actor_capacity();
+        int pct = cap > 0 ? (live * 100) / cap : 0;
+        bl = s_put(body, bl, "{\"node\":\"xinu\",\"live_actors\":");
+        bl = s_putdec(body, bl, live);
+        bl = s_put(body, bl, ",\"capacity\":");
+        bl = s_putdec(body, bl, cap);
+        bl = s_put(body, bl, ",\"load_pct\":");
+        bl = s_putdec(body, bl, pct);
+        bl = s_put(body, bl, "}\n");
     } else if (path_eq(req, "/api/actors")) {
         int n = actor_count();
         bl = s_put(body, bl, "{\"actors\":[");
@@ -419,6 +447,20 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "}");
         }
         bl = s_put(body, bl, "]}\n");
+    } else if (str_starts(rpath, "/microsd/write/")) {
+        /* Persistent FAT32 write to the microSD root: POST /microsd/write/<NAME>
+         * with the file content as the request body (8.3 name, <= one cluster). */
+        extern int microsd_write_file(const char *name, const void *data, unsigned long len);
+        ctype = "text/plain";
+        const char *name = rpath + 15;          /* strlen("/microsd/write/") */
+        const char *b = http_body(req);
+        if (name[0] && b) {
+            int blen = 0; while (b[blen]) blen++;
+            int r = microsd_write_file(name, b, (unsigned long)blen);
+            bl = s_put(body, bl, r == 0 ? "microsd write: ok " : "microsd write: FAILED ");
+            bl = s_putdec(body, bl, blen); bl = s_put(body, bl, " bytes -> "); bl = s_put(body, bl, name);
+            bl = s_put(body, bl, "\n");
+        } else bl = s_put(body, bl, "microsd write: bad name or empty body\n");
     } else if (str_starts(rpath, "/fs")) {
         /* Hierarchical in-memory filesystem (fs/vfs.c) over HTTP:
          *   GET  /fs   or  /fs/tree        -> indented tree of the whole FS
@@ -680,6 +722,109 @@ static int http_build(const char *req, char *out, int max)
             rp1usb_set_poll_mode(q_int(req,"on",1));
             bl = s_put(body, bl, "poll_mode="); bl = s_putdec(body, bl, rp1usb_poll_mode_get());
             bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-setup")) {
+            extern int rp1usb_msd_fullsetup(int), rp1usb_msd_slot(void),
+                       rp1usb_msd_in_ep(void), rp1usb_msd_out_ep(void),
+                       rp1usb_msd_in_dci(void), rp1usb_msd_out_dci(void);
+            extern unsigned int rp1usb_msd_setup_cc(void), rp1usb_msd_cfgep_cc(void);
+            int r = rp1usb_msd_fullsetup(q_int(req,"port",2));   /* boot stick = c0p2 */
+            bl = s_put(body, bl, "msd-setup r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " slot="); bl = s_putdec(body, bl, rp1usb_msd_slot());
+            bl = s_put(body, bl, " setcfgCC="); bl = s_putdec(body, bl, rp1usb_msd_setup_cc());
+            bl = s_put(body, bl, " cfgepCC="); bl = s_putdec(body, bl, rp1usb_msd_cfgep_cc());
+            bl = s_put(body, bl, " inEP="); bl = s_putdec(body, bl, rp1usb_msd_in_ep());
+            bl = s_put(body, bl, " outEP="); bl = s_putdec(body, bl, rp1usb_msd_out_ep());
+            bl = s_put(body, bl, " inDCI="); bl = s_putdec(body, bl, rp1usb_msd_in_dci());
+            bl = s_put(body, bl, " outDCI="); bl = s_putdec(body, bl, rp1usb_msd_out_dci());
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-inquiry")) {
+            extern int rp1usb_msd_inquiry(void);
+            extern unsigned int rp1usb_msd_csw_status(void), rp1usb_msd_data_byte(int);
+            extern int rp1usb_msd_p_cbw(void), rp1usb_msd_p_data(void), rp1usb_msd_p_csw(void);
+            extern unsigned int rp1usb_msd_p_cbw_cc(void), rp1usb_msd_p_data_cc(void), rp1usb_msd_p_csw_cc(void);
+            int r = rp1usb_msd_inquiry();
+            bl = s_put(body, bl, "inquiry r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " cswStatus="); bl = s_putdec(body, bl, rp1usb_msd_csw_status());
+            bl = s_put(body, bl, "\n CBW: n="); bl = s_putdec(body, bl, rp1usb_msd_p_cbw());
+            bl = s_put(body, bl, " cc="); bl = s_putdec(body, bl, (int)rp1usb_msd_p_cbw_cc());
+            bl = s_put(body, bl, " | DATA: n="); bl = s_putdec(body, bl, rp1usb_msd_p_data());
+            bl = s_put(body, bl, " cc="); bl = s_putdec(body, bl, (int)rp1usb_msd_p_data_cc());
+            bl = s_put(body, bl, " | CSW: n="); bl = s_putdec(body, bl, rp1usb_msd_p_csw());
+            bl = s_put(body, bl, " cc="); bl = s_putdec(body, bl, (int)rp1usb_msd_p_csw_cc());
+            bl = s_put(body, bl, "\n vendor=");    /* INQUIRY bytes 8..15 = vendor ASCII */
+            for (int i=8;i<16;i++){ unsigned c=rp1usb_msd_data_byte(i); if(c>=32&&c<127) body[bl++]=(char)c; }
+            bl = s_put(body, bl, " product=");   /* bytes 16..31 = product ASCII */
+            for (int i=16;i<32;i++){ unsigned c=rp1usb_msd_data_byte(i); if(c>=32&&c<127) body[bl++]=(char)c; }
+            bl = s_put(body, bl, " first8:");
+            for (int i=0;i<8;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_msd_data_byte(i)); }
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-epstate")) {
+            extern int rp1usb_msd_inquiry(void);
+            extern int rp1usb_msd_p_cbw(void); extern unsigned int rp1usb_msd_p_cbw_cc(void);
+            extern unsigned int rp1usb_msd_slotstate(void), rp1usb_msd_out_epstate(void),
+                       rp1usb_msd_in_epstate(void), rp1usb_msd_out_deqlo(void),
+                       rp1usb_msd_in_deqlo(void), rp1usb_msd_out_ep1(void),
+                       rp1usb_msd_usbsts(void), rp1usb_msd_portsc2(void);
+            extern int rp1usb_msd_out_dci(void), rp1usb_msd_in_dci(void);
+            int r = rp1usb_msd_inquiry();
+            bl = s_put(body, bl, "epstate inq_r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " cbw_n="); bl = s_putdec(body, bl, rp1usb_msd_p_cbw());
+            bl = s_put(body, bl, " cbw_cc="); bl = s_putdec(body, bl, (int)rp1usb_msd_p_cbw_cc());
+            bl = s_put(body, bl, "\n slotstate="); bl = s_putdec(body, bl, (int)rp1usb_msd_slotstate());
+            bl = s_put(body, bl, " outDCI="); bl = s_putdec(body, bl, rp1usb_msd_out_dci());
+            bl = s_put(body, bl, " outEPstate="); bl = s_putdec(body, bl, (int)rp1usb_msd_out_epstate());
+            bl = s_put(body, bl, " outEP_dw1=0x"); bl = s_puthex(body, bl, rp1usb_msd_out_ep1());
+            bl = s_put(body, bl, " outDeqLo=0x"); bl = s_puthex(body, bl, rp1usb_msd_out_deqlo());
+            bl = s_put(body, bl, "\n inDCI="); bl = s_putdec(body, bl, rp1usb_msd_in_dci());
+            bl = s_put(body, bl, " inEPstate="); bl = s_putdec(body, bl, (int)rp1usb_msd_in_epstate());
+            bl = s_put(body, bl, " inDeqLo=0x"); bl = s_puthex(body, bl, rp1usb_msd_in_deqlo());
+            bl = s_put(body, bl, "\n USBSTS=0x"); bl = s_puthex(body, bl, rp1usb_msd_usbsts());
+            bl = s_put(body, bl, " PORTSC2=0x"); bl = s_puthex(body, bl, rp1usb_msd_portsc2());
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-capacity")) {
+            extern int rp1usb_msd_capacity(void);
+            extern unsigned int rp1usb_msd_csw_status(void), rp1usb_msd_blocks(void), rp1usb_msd_blocksize(void);
+            int r = rp1usb_msd_capacity();
+            bl = s_put(body, bl, "capacity r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " cswStatus="); bl = s_putdec(body, bl, rp1usb_msd_csw_status());
+            bl = s_put(body, bl, " blocks="); bl = s_putdec(body, bl, (int)rp1usb_msd_blocks());
+            bl = s_put(body, bl, " blocksize="); bl = s_putdec(body, bl, (int)rp1usb_msd_blocksize());
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-read")) {
+            extern int rp1usb_msd_read_block(unsigned int);
+            extern unsigned int rp1usb_msd_csw_status(void), rp1usb_msd_data_byte(int);
+            unsigned int lba = (unsigned int)q_int(req,"lba",0);
+            int r = rp1usb_msd_read_block(lba);
+            bl = s_put(body, bl, "read lba="); bl = s_putdec(body, bl, (int)lba);
+            bl = s_put(body, bl, " r="); bl = s_putdec(body, bl, r);
+            bl = s_put(body, bl, " cswStatus="); bl = s_putdec(body, bl, rp1usb_msd_csw_status());
+            bl = s_put(body, bl, " mbrSig=");    /* bytes 510,511 should be 85,170 (0x55AA) */
+            bl = s_putdec(body, bl, rp1usb_msd_data_byte(510)); bl = s_put(body, bl, ",");
+            bl = s_putdec(body, bl, rp1usb_msd_data_byte(511));
+            bl = s_put(body, bl, " first16:");
+            for (int i=0;i<16 && bl<680;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_msd_data_byte(i)); }
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/msd-write")) {
+            extern int rp1usb_msd_read_block(unsigned int), rp1usb_msd_write_block(unsigned int);
+            extern void rp1usb_msd_fill_pattern(unsigned int);
+            extern unsigned int rp1usb_msd_csw_status(void), rp1usb_msd_data_byte(int);
+            unsigned int lba = (unsigned int)q_int(req,"lba",0);
+            unsigned int seed = (unsigned int)q_int(req,"seed",0x41);
+            rp1usb_msd_fill_pattern(seed);
+            int w = rp1usb_msd_write_block(lba);
+            unsigned int wstat = rp1usb_msd_csw_status();
+            int rr = rp1usb_msd_read_block(lba);       /* read back to verify */
+            bl = s_put(body, bl, "write lba="); bl = s_putdec(body, bl, (int)lba);
+            bl = s_put(body, bl, " seed="); bl = s_putdec(body, bl, (int)seed);
+            bl = s_put(body, bl, " w="); bl = s_putdec(body, bl, w);
+            bl = s_put(body, bl, " wCSW="); bl = s_putdec(body, bl, (int)wstat);
+            bl = s_put(body, bl, " readback r="); bl = s_putdec(body, bl, rr);
+            bl = s_put(body, bl, " rCSW="); bl = s_putdec(body, bl, (int)rp1usb_msd_csw_status());
+            bl = s_put(body, bl, " first4:");
+            for (int i=0;i<4;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_msd_data_byte(i)); }
+            bl = s_put(body, bl, " (expect "); bl = s_putdec(body, bl, (int)(seed&0xff));
+            bl = s_put(body, bl, " "); bl = s_putdec(body, bl, (int)((seed+1)&0xff));
+            bl = s_put(body, bl, " ...)\n");
         } else {
         bl = s_put(body, bl, "hciver=");   bl = s_putdec(body, bl, rp1usb_ver(0));
         bl = s_put(body, bl, " ports=");   bl = s_putdec(body, bl, rp1usb_ports(0));
@@ -767,6 +912,71 @@ static int http_build(const char *req, char *out, int max)
         } else {
             bl = s_put(body, bl, "staged="); bl = s_putdec(body, bl, g_chain_len);
             bl = s_put(body, bl, " bytes. GET /chainload?go=1&len=<N> to boot it\n");
+        }
+    } else if (str_starts(rpath, "/wifi")) {
+        /* CYW43455 WiFi bring-up, driven over HTTP and brought up in stages
+         * (the SDIO host layer is new; see device/wifi/wifi.c).  Each action
+         * appends to the ~8 KB trace; retrieve it paginated via /wifi-trace. */
+        ctype = "text/plain";
+        if (str_starts(rpath, "/wifi-trace")) {
+            int off = q_int(req, "off", 0);
+            const char *t = wifi_trace(); int tl = wifi_trace_len();
+            int i = 0;
+            for (; off + i < tl && i < 600 && bl < (int)sizeof body - 1; i++)
+                body[bl++] = t[off + i];
+        } else if (str_starts(rpath, "/wifi-pinmux")) {
+            int f = q_int(req, "fsel", -1);
+            if (f >= 0) wifi_set_pin_fsel((unsigned int)f);
+            wifi_pinmux_dump();
+            bl = s_put(body, bl, "pinmux set; GET /wifi-trace?off=0 for the reg dump\n");
+        } else if (str_starts(rpath, "/wifi-stage")) {
+            int hz = q_int(req, "hz", 0); if (hz) wifi_set_fwload_hz((unsigned int)hz);
+            int n  = q_int(req, "n", 0);
+            int rc = wifi_probe_stage(n);
+            bl = s_put(body, bl, "stage n="); bl = s_putdec(body, bl, n);
+            bl = s_put(body, bl, " rc=");     bl = s_putdec(body, bl, rc);
+            bl = s_put(body, bl, " tracelen="); bl = s_putdec(body, bl, wifi_trace_len());
+            bl = s_put(body, bl, " -- GET /wifi-trace?off=0,600,1200,...\n");
+        } else if (str_starts(rpath, "/wifi-bulk")) {
+            int rc = wifi_probe_bulk(q_int(req, "kb", 64), (unsigned int)q_int(req, "hz", 0));
+            bl = s_put(body, bl, "bulk rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else if (str_starts(rpath, "/wifi-win")) {
+            int rc = wifi_probe_winwrite(q_int(req, "w", 0));
+            bl = s_put(body, bl, "win rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/wifi-scan")) {
+            int rc = wifi_scan_run();
+            bl = s_put(body, bl, "scan rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else if (str_starts(rpath, "/wifi-join")) {
+            char ssid[40], pass[68];
+            if (!q_param(req, "ssid", ssid, sizeof ssid)) ssid[0] = 0;
+            if (!q_param(req, "pass", pass, sizeof pass)) pass[0] = 0;
+            int rc = wifi_join_run(ssid, pass);
+            bl = s_put(body, bl, "join rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else if (str_starts(rpath, "/wifi-dhcp")) {
+            int rc = wifi_dhcp();
+            bl = s_put(body, bl, "dhcp rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else if (str_starts(rpath, "/wifi-ping")) {
+            char ip[20]; unsigned char a[4] = {0,0,0,0};
+            if (q_param(req, "ip", ip, sizeof ip)) {
+                int o = 0, v = 0, k = 0;
+                for (; ip[o] && k < 4; o++) {
+                    if (ip[o] == '.') { a[k++] = (unsigned char)v; v = 0; }
+                    else if (ip[o] >= '0' && ip[o] <= '9') v = v*10 + (ip[o]-'0');
+                }
+                if (k < 4) a[k] = (unsigned char)v;
+            }
+            int rc = wifi_ping(a, q_int(req, "n", 4));
+            bl = s_put(body, bl, "ping rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else if (str_starts(rpath, "/wifi-probe")) {
+            int rc = wifi_probe();
+            bl = s_put(body, bl, "probe rc="); bl = s_putdec(body, bl, rc); bl = s_put(body, bl, " -- see /wifi-trace\n");
+        } else {
+            bl = s_put(body, bl,
+              "wifi routes (bring-up is staged; poll /wifi-trace for the log):\n"
+              " /wifi-stage?n=-2..6[&hz=N]   (-2=power+host -1=pinmux+CMD5 0=chipid 1=ramscan\n"
+              "                               2=halt 3=4KB 4=fwload 5=CR4 6=Fn2)\n"
+              " /wifi-trace?off=N   /wifi-pinmux?fsel=N   /wifi-bulk?kb&hz   /wifi-win?w\n"
+              " /wifi-scan   /wifi-join?ssid&pass   /wifi-dhcp   /wifi-ping?ip&n\n");
         }
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";

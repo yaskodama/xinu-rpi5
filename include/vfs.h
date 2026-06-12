@@ -26,11 +26,17 @@ typedef struct vfs_node {
     vfs_kind_t     kind;
     unsigned long  size;       /* bytes (files) or 0 (dirs)         */
     unsigned long  capacity;   /* allocated bytes in `data` buffer  */
-    void          *data;       /* file payload                      */
+    void          *data;       /* file payload (NULL until loaded)  */
+    unsigned int   fat_cluster;/* FAT32 first cluster for on-demand load (0 = tmpfs) */
     struct vfs_node *parent;
     struct vfs_node *children; /* head of child list  (dirs only)   */
     struct vfs_node *next;     /* sibling link                       */
 } vfs_node_t;
+
+/* Register a loader called by vfs_read when a file has a backing store but no
+ * in-RAM payload yet (data==NULL, size>0).  The hook should populate node->data
+ * (e.g. via vfs_write) from the backing FS.  Returns 0 on success. */
+void vfs_set_load_hook(int (*fn)(vfs_node_t *node));
 
 /* The implicit root "/" node.  Statically allocated; never freed. */
 vfs_node_t *vfs_root(void);

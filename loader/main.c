@@ -206,6 +206,8 @@ static void genet_rx_tick(void)
 
     dhcp_drive();          /* run the DHCP state machine (rate-limited inside) */
     gc_drive();            /* periodic global actor GC (rate-limited inside)   */
+    { extern void wifi_net_poll(void);   /* drain WiFi RX + run its ARP/ICMP    */
+      wifi_net_poll(); }                 /* responder (no-op until wifi has IP) */
 #ifdef RP1_ETH_BASE
     {
         extern void rp1usb_mouse_pump(void);
@@ -247,21 +249,128 @@ static void genet_rx_tick(void)
  * the wm render loop is busy.  Empty on Pi 4/QEMU (RX stays on the wm loop). */
 void timer_tick_hook(void)
 {
-#ifdef RP1_ETH_BASE
+#if defined(RP1_ETH_BASE) && !defined(MINIMAL_OS)
+    /* The shell main loop blocks on UART input, so the timer IRQ is the only
+     * thing that reliably drains WiFi RX.  genet_rx_tick() -> wifi_net_poll()
+     * therefore answers ARP/ICMP and now also services the TCP/HTTP server in
+     * interrupt context — the same way the existing RP1-eth path already runs
+     * tcp_handle_packet() here.  A POST /compile runs cc inline (bounded by the
+     * cc runaway guard), causing a brief stall but no wedge. */
     genet_rx_tick();
 #endif
 }
+
+#if defined(MINIMAL_OS) || defined(NO_WM)
+/* ============================================================================
+ * Window-less text-console shell — shared by two kexec-selectable variants:
+ *   OS1 (kernel_min.img, -DMINIMAL_OS): shell only, NO networking, NO windows.
+ *   OS2 (kernel_os2.img, -DNO_WM):      FULL features (networking etc.), but the
+ *                                       window MANAGER is replaced by a full-screen
+ *                                       HDMI text console.
+ * The HDMI text console stays live because we never start the window manager
+ * (only wm.c calls screen_console_disable()), and uart_putc already mirrors to
+ * screen_putc — so every shell line lands on screen.  Input is the USB keyboard.
+ * ========================================================================== */
+static char g_min_line[256];
+static int  g_min_len;
+static volatile int g_min_ready;
+
+/* USB-keyboard char -> line editor with on-screen echo (uart_putc -> console). */
+static void min_kbd_char(char c)
+{
+    if (c == '\n' || c == '\r') {
+        uart_putc('\n');
+        g_min_line[g_min_len] = 0;
+        g_min_ready = 1;
+    } else if (c == '\b' || c == 0x7f) {
+        if (g_min_len > 0) { g_min_len--; uart_puts("\b \b"); }
+    } else if ((unsigned char)c >= 32 && (unsigned char)c < 127
+               && g_min_len < (int)sizeof g_min_line - 1) {
+        g_min_line[g_min_len++] = c;
+        uart_putc(c);
+    }
+}
+
+/* Dispatch a completed keyboard line, then reprint the prompt. */
+static void console_shell_pump(const char *prompt)
+{
+    extern int shell_dispatch_line(char *line);
+    if (g_min_ready) {
+        g_min_ready = 0;
+        if (g_min_len > 0) shell_dispatch_line(g_min_line);
+        g_min_len = 0;
+        uart_puts(prompt);
+    }
+}
+#endif /* MINIMAL_OS || NO_WM */
+
+#ifdef MINIMAL_OS
+/* OS1 main loop — never returns.  Trains PCIe (for USB), unmasks IRQs (timer +
+ * USB), brings up the USB keyboard itself, then runs the console shell.  No net. */
+void minimal_os_run(void)
+{
+    extern int  rp1pcie_init(void);
+    extern int  rp1usb_autostart(void);
+    extern void rp1usb_mouse_pump(void);
+    extern unsigned long timer_ticks(void);
+
+    uart_puts("\n");
+    uart_puts("================================================\n");
+    uart_puts("  Xinu Pi5 — Minimal OS #1 (shell only)\n");
+    uart_puts("  no window manager, no networking\n");
+    uart_puts("  type `help`; `kexec /microsd/KERNEL~1.IMG` -> full OS\n");
+    uart_puts("================================================\n");
+
+    rp1pcie_init();        /* PCIe link to RP1 — needed to reach the USB host */
+    irq_enable_all();      /* 100 Hz timer ticks + (later) USB delivery       */
+
+    uart_puts("usb: bringing up keyboard (a few seconds)...\n");
+    unsigned long start = timer_ticks();
+    int usb_up = 0;
+    uart_puts("\nxinu-min$ ");
+    for (;;) {
+        unsigned long now = timer_ticks();
+        if (!usb_up && (now - start) > 300) {       /* ~3 s after boot */
+            rp1usb_autostart();                     /* enumerate + bind kbd/mouse */
+            usb_up = 1;
+        }
+        if (usb_up) rp1usb_mouse_pump();            /* deliver kbd -> min_kbd_char */
+        console_shell_pump("xinu-min$ ");
+    }
+}
+#endif /* MINIMAL_OS */
+
+#ifdef NO_WM
+/* OS2 main loop — never returns.  Reached AFTER the full boot (networking, USB,
+ * etc. all up — the USB keyboard comes up via the normal genet_rx_tick autostart,
+ * and net/HTTP work).  Just replaces the window manager with the text console. */
+void os2_console_run(void)
+{
+    uart_puts("\n");
+    uart_puts("================================================\n");
+    uart_puts("  Xinu Pi5 — OS #2 (full features, no window system)\n");
+    uart_puts("  networking + shell on the HDMI text console\n");
+    uart_puts("  type `help`; `kexec /microsd/KERNEL~1.IMG` -> full OS\n");
+    uart_puts("================================================\n");
+    uart_puts("\nxinu-os2$ ");
+    for (;;) console_shell_pump("xinu-os2$ ");
+}
+#endif /* NO_WM */
 
 /* USPi is gone (DWC2 only — Pi 4 USB-A keyboards/mice need xHCI).
  * Keyboard input from the future xHCI HID driver will land here. */
 void xhci_keyboard_event(char c)
 {
+#if defined(MINIMAL_OS) || defined(NO_WM)
+    min_kbd_char(c);                 /* no-wm OSes: line-edit + on-screen echo */
+#else
     /* Keys only reach the shell while its window is the selected one — click a
      * different window with the mouse and typing stops going to the shell. */
     extern struct window *wm_focused(void);
     extern window_t shell_win;
     if (wm_focused() == &shell_win)
         shellwin_handle_key(c);
+#endif
 }
 
 static int  g_cursor_x = 320;
@@ -274,6 +383,10 @@ static int g_mouse_inited;
 static unsigned g_prev_btn;
 void xhci_mouse_event(unsigned nButtons, int dx, int dy)
 {
+#if defined(MINIMAL_OS) || defined(NO_WM)
+    (void)nButtons; (void)dx; (void)dy;   /* no window manager / cursor in no-wm OSes */
+    return;
+#else
     int sw = (int)video_screen_width();
     int sh = (int)video_screen_height();
     if (sw <= 0) sw = 1920;
@@ -340,6 +453,7 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
         }
     }
     g_prev_btn = nButtons;
+#endif /* MINIMAL_OS */
 }
 
 extern unsigned char _end[];   /* set by link.ld — top of static image */
@@ -762,34 +876,108 @@ static void sd_visit(const char *name, int is_dir, unsigned long size,
     } else {
         node = vfs_create_file(c->parent[depth], name);
         if (node) {
-            /* Record the real on-disk size without copying contents. */
-            node->size = size;
+            /* Record the real on-disk size + FAT first cluster; contents are
+             * loaded on demand by the vfs_read hook (microsd_load). */
+            node->size        = size;
+            node->fat_cluster = first_cluster;
         }
     }
 }
 
-/* Mount real SD-card FAT32 partition under /sd/.  No-op (graceful
- * fallback) if the controller fails to init or the partition isn't
- * FAT32; that lets the QEMU / Pi 5 builds compile and run identically
- * to before. */
+/* Mount the physical microSD-card slot (BCM2712 sdio1) under /microsd/.
+ * The /microsd directory is ALWAYS created so the slot is referenceable
+ * even when empty — on this Pi 5 the board boots from USB and the microSD
+ * slot is normally empty, so the populate step is a graceful no-op until a
+ * card is inserted (or on QEMU, where there is no controller).  Persistent
+ * /sd storage lives on the USB boot medium instead. */
+/* The mounted microSD FAT32 — kept around so the on-demand content loader
+ * (microsd_load) and the boot kernel selector can read clusters after boot. */
+static fat32_t g_sd_fs;
+static int     g_sd_mounted;
+
+/* vfs_read load hook: pull a FAT-backed file's content off the card on first
+ * read (the directory walk only recorded name+size+first_cluster). */
+static int microsd_load(vfs_node_t *node)
+{
+    if (!g_sd_mounted || node->fat_cluster < 2 || node->size == 0) return -1;
+    void *buf = kmalloc(node->size);
+    if (!buf) return -1;
+    int n = fat32_read_file(&g_sd_fs, node->fat_cluster, node->size, buf, node->size);
+    if (n <= 0) { kfree(buf); return -1; }
+    node->data = buf; node->capacity = node->size; node->size = (unsigned long)n;
+    return 0;
+}
+
 static void vfs_mount_sd(void)
 {
-    vfs_node_t *sd = vfs_mkdir(vfs_root(), "sd");
+    vfs_node_t *sd = vfs_mkdir(vfs_root(), "microsd");
     if (sd == 0) return;
 
     if (sd_init() != 0) return;
-
-    fat32_t fs;
-    if (fat32_mount(&fs) != 0) return;
+    if (fat32_mount(&g_sd_fs) != 0) return;
+    g_sd_mounted = 1;
+    vfs_set_load_hook(microsd_load);
 
     struct sd_walk_ctx ctx = {0};
-    ctx.fs           = &fs;
+    ctx.fs           = &g_sd_fs;
     ctx.parent[0]    = sd;
     ctx.remaining[0] = SD_MAX_DIR_ENTRIES;
-    fat32_walk_dir(&fs, fs.root_cluster, 0, sd_visit, &ctx);
+    fat32_walk_dir(&g_sd_fs, g_sd_fs.root_cluster, 0, sd_visit, &ctx);
 }
 
 /* ---- VFS demo: populate a small tree at boot ------------------- */
+/* Boot a different Xinu kernel image from the microSD card (a kernel "selector"):
+ * read the named /microsd file into the chainload staging area and jump to it via
+ * the RAM-only kexec trampoline (no reflash, no brick — a bad image just needs a
+ * power-cycle).  `path` is an absolute VFS path, e.g. "/microsd/KERNEL_2712.IMG".
+ * Returns -1 on lookup/read failure; on success it does NOT return. */
+#define MICROSD_KEXEC_STAGE  0x4000000UL    /* 64 MB — same staging the net kexec uses */
+int microsd_kexec(const char *path)
+{
+    extern void kernel_chainload(unsigned long, unsigned long);
+    if (!g_sd_mounted) return -1;
+    vfs_node_t *n = vfs_lookup(path);
+    if (!n || n->kind != VFS_FILE || n->fat_cluster < 2 || n->size == 0) return -1;
+    int r = fat32_read_file(&g_sd_fs, n->fat_cluster, n->size,
+                            (void *)MICROSD_KEXEC_STAGE, n->size);
+    if (r <= 0) return -1;
+    /* Refuse an image too large to be one of our bare-metal Xinu kernels: the
+     * chainload trampoline only boots RAW kernels (entry at 0x80000); a Linux
+     * kernel (e.g. KERNEL8.IMG ~9.6 MB) needs its own boot protocol and just
+     * HANGS.  NOTE: both Xinu and Linux are arm64 "Image"s sharing the magic
+     * "ARMd" at byte 0x38, so the magic can't tell them apart — SIZE can.  Our
+     * kernels are well under 1 MB; refuse anything >= 4 MB. */
+    if (n->size >= (4u * 1024u * 1024u)) {
+        uart_puts("kexec: refusing "); uart_puts(path);
+        uart_puts(" — too large (>=4MB) to be a bare-metal Xinu kernel (Linux? can't be kexec'd)\n");
+        return -2;
+    }
+    uart_puts("kexec: booting "); uart_puts(path); uart_puts(" from microSD\n");
+    kernel_chainload(MICROSD_KEXEC_STAGE, (unsigned long)r);   /* no return */
+    return -1;
+}
+
+/* Persistently write a small file (<= one cluster) to the microSD root via FAT32,
+ * and reflect it in the live /microsd VFS so it's immediately visible/readable.
+ * Returns 0 on success, -1 on error.  `name` is an 8.3 name (e.g. "TEST.TXT"). */
+int microsd_write_file(const char *name, const void *data, unsigned long len)
+{
+    if (!g_sd_mounted) return -1;
+    if (fat32_write_file(&g_sd_fs, g_sd_fs.root_cluster, name, data, len) != 0) return -1;
+    /* mirror into the in-RAM VFS (tmpfs-backed copy so cat works without a reread) */
+    vfs_node_t *dir = vfs_lookup("/microsd");
+    if (dir) {
+        vfs_node_t *n = vfs_create_file(dir, name);     /* NULL if it already exists */
+        if (!n) for (vfs_node_t *c = dir->children; c; c = c->next) {
+            const char *a = c->name, *b = name; int eq = 1;
+            while (*a && *b) { if (*a != *b) { eq = 0; break; } a++; b++; }
+            if (eq && !*a && !*b) { n = c; break; }
+        }
+        if (n) { n->fat_cluster = 0; vfs_write(n, data, len); }
+    }
+    return 0;
+}
+
 static void vfs_populate_demo(void)
 {
     vfs_node_t *r = vfs_root();
@@ -827,20 +1015,23 @@ static void vfs_populate_demo(void)
          * Run with:  cc /home/PingPong.abcl   (or  make /home/PingPong.abcl) */
         f = vfs_create_file(home, "PingPong.abcl");
         vfs_write_str(f,
-            "/* PingPong.abcl - AIPL sample: a ball volleyed back and forth. */\n"
-            "int main() {\n"
-            "    int volleys = 8;\n"
-            "    int i = 0;\n"
-            "    int side = 0;\n"
-            "    while (i < volleys) {\n"
-            "        if (side == 0) { puts(\"  Ping  ->\"); side = 1; }\n"
-            "        else           { puts(\"      <-  Pong\"); side = 0; }\n"
-            "        i = i + 1;\n"
+            "/* PingPong.abcl - real AIPL: two Player actors volley a ball.\n"
+            "   Each `hit` prints, then sends `hit` to its peer with n-1, so the\n"
+            "   ball bounces between the two actors until the count reaches 0.\n"
+            "   cc/make translate this with the on-device abcl2c (see `abcl2c`). */\n"
+            "class Player {\n"
+            "    var peer = 0;\n"
+            "    method setup(p) { peer = p; }\n"
+            "    method hit(n) {\n"
+            "        print(\"hit \" + n);\n"
+            "        if (n > 0) send peer.hit(n - 1);\n"
             "    }\n"
-            "    puts(\"PingPong: volleys done =\");\n"
-            "    print(volleys);\n"
-            "    return volleys;\n"
-            "}\n");
+            "}\n"
+            "var a = new Player();\n"
+            "var b = new Player();\n"
+            "send a.setup(b);\n"
+            "send b.setup(a);\n"
+            "send a.hit(6);\n");
         /* AIPL sample — RotateLine: four line segments, each centred on a
          * corner of a square, all spinning in the Graphics window.  The value_t
          * runtime computes the turn count, then the gfx_rotate_line() builtin
@@ -1014,11 +1205,27 @@ static void serial_layout_cmd(const char *s)
     else if (op == 'R') wm_resize_window(id, a, b);
 }
 
+/* Repaint the shell window and flip it to HDMI right now.  A long blocking shell
+ * command (e.g. `wifi on`, ~15 s) stalls the wm render loop, so its progress
+ * lines would otherwise not appear until it returns.  Calling this between steps
+ * lets the user see "bringing up...", "associated", etc. as they happen. */
+void shell_flush_screen(void)
+{
+    extern window_t shell_win;
+    extern int screen_ready(void);
+    if (!screen_ready()) return;
+    video_set_viewport(video_viewport_x(), video_viewport_y());
+    shellwin_draw(&shell_win, 0);
+    video_present();
+}
+
 static void serial_io_tick(void)
 {
     static char cmd[64];
     static int  clen = 0;
     static int  in_cmd = 0;
+    /* No boot auto-connect: WiFi comes up only when the user runs `wifi on`
+     * (which pulls the saved creds from the embedded wifi.conf). */
     int ch, budget = 256;
 
     genet_rx_tick();                 /* keep the (no-op on Pi 5) net drain */
@@ -1213,9 +1420,9 @@ void kernel_main(void)
         uart_puts(" file bytes)\n");
     }
 
-    /* Mount the SD card's FAT32 partition under /sd/.  Silently
-     * skipped on builds where SD_BASE isn't defined (Pi 5 / QEMU) —
-     * the /sd directory will simply not appear in the VFS tree. */
+    /* Expose the physical microSD slot under /microsd/ (always created,
+     * populated only when a card is present — empty on this USB-booted
+     * Pi 5).  On builds without SD_BASE the populate step is a no-op. */
     vfs_mount_sd();
     {
         unsigned long count = vfs_node_count();
@@ -1241,6 +1448,12 @@ void kernel_main(void)
      * firing while g_rxr is still NULL / half-initialised — a boot-time race on
      * g_rxhead and the descriptors that wedged RX. */
     uart_puts("gic+timer: 100 Hz PPI 30 armed (DAIF.I unmasked after NIC up)\n");
+
+#ifdef MINIMAL_OS
+    /* Minimal OS #1: hand off to the shell-only console now — this never returns,
+     * so all the networking + window-manager bring-up below is skipped. */
+    minimal_os_run();
+#endif
 
     /* XHCI-A — PCIe-1 controller MMIO probe.  Skipped at boot: the
      * controller is clock/power-gated until we implement CPRMAN
@@ -1354,6 +1567,13 @@ void kernel_main(void)
 
     uart_puts("\n");
     uart_puts("Round 1: B/U/M1/S0/X0 done.\n");
+
+#ifdef NO_WM
+    /* OS #2: full boot just completed (networking + USB up), but instead of the
+     * window manager we hand off to the full-screen text console shell.  Never
+     * returns, so the wm setup below is skipped. */
+    os2_console_run();
+#endif
 
     /* If the HDMI framebuffer came up, hand off to the window
      * system (auto-driven demos: banner + system status + bouncing
@@ -1481,11 +1701,12 @@ void kernel_main(void)
         softkbd_win.draw_content = softkbd_draw;
         wm_add(&softkbd_win);
 
-        /* Graphics window — 3D wireframe wine glass driven by the `wine` cmd. */
-        graphics_win.x = 1336;
-        graphics_win.y = 305;
-        graphics_win.width  = 567;
-        graphics_win.height = 740;
+        /* Graphics window — 3D wireframe wine glass driven by the `wine` cmd.
+         * Geometry captured from the live (user-arranged) layout via /win/dump. */
+        graphics_win.x = 1334;
+        graphics_win.y = 300;
+        graphics_win.width  = 568;
+        graphics_win.height = 692;
         const char *gwt = "Graphics";
         for (int i = 0; i < WM_TITLE_MAX && gwt[i]; i++) graphics_win.title[i] = gwt[i];
         graphics_win.chrome_color = 0xFF60C0FFU;

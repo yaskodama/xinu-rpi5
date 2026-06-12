@@ -1,0 +1,81 @@
+// MeshDispatcher.abcl
+// ---------------------------------------------------------------------------
+// 実マルチノード版の分散メッシュ負荷分散(型推論クリーン AIPL)。
+//
+// 管理ノード(Mac/Win)上で動く Dispatcher が、実 Xinu ノード群(hostport の
+// 配列)に対して:
+//   1. 各ノードの /api/load を xinu_load(host) で問い合わせ、
+//   2. 最も負荷(live_actors)の低いノードを選び、
+//   3. そのノードの常駐 worker(actor 0) へ xinu_send(host,0,"work",x) で
+//      タスクを投入し、整数の返信を集約する。
+//
+// xinu_load / xinu_send はホストランタイムのビルトイン(curl で Xinu の
+// /api/load と /actor/send を叩く)。Dispatcher の登録・最小負荷選択・配置
+// ロジックは AIPL で表現し、aipl2c --check に型推論クリーンで通る。
+// ---------------------------------------------------------------------------
+
+class Dispatcher {
+  var hosts = array_empty();   // Xinu ノードの "host:port" 文字列の配列
+  var nh    = 0;
+  var done  = 0;
+
+  // Xinu ノードを登録する(route table の provider 登録に相当)。
+  method add_host(h) {
+    hosts = array_push(hosts, h);
+    nh = nh + 1;
+    print("[dispatch] registered node " + nh + ": " + h);
+    reply(nh);
+  }
+
+  // 各ノードの実負荷(/api/load の live_actors)を見て最小ノード index を返す。
+  method least() {
+    var best = 0;
+    var bl = xinu_load(array_get(hosts, 0));      // gradual 値で初期化
+    var i = 1;
+    while (i < nh) do {
+      var li = xinu_load(array_get(hosts, i));
+      if (li < bl) { bl = li; best = i; }
+      i = i + 1;
+    }
+    reply(best);
+  }
+
+  // タスク列を最小負荷ノードへ振り分けて実行する。
+  method run() {
+    var jobs = array_empty();
+    jobs = array_push(jobs, 2);
+    jobs = array_push(jobs, 3);
+    jobs = array_push(jobs, 5);
+    jobs = array_push(jobs, 7);
+    jobs = array_push(jobs, 11);
+
+    var sum = 0.;                                 // float 累算で int/TAny 罠回避
+    var nj = array_len(jobs);
+    var i = 0;
+    while (i < nj) do {
+      // 最小負荷ノードをインライン選択(self への now 同期呼びを避ける)。
+      var idx = 0;
+      var bl = xinu_load(array_get(hosts, 0));
+      var j = 1;
+      while (j < nh) do {
+        var lj = xinu_load(array_get(hosts, j));
+        if (lj < bl) { bl = lj; idx = j; }
+        j = j + 1;
+      }
+      var h = array_get(hosts, idx);
+      var r = xinu_send(h, 0, "work", array_get(jobs, i));   // 実 Xinu で実行
+      done = done + 1;
+      sum = sum + r;
+      print("[dispatch] job " + i + " (= " + array_get(jobs, i) + ") -> " + h + " => " + r);
+      i = i + 1;
+    }
+    print("[dispatch] completed " + done + " tasks; sum = " + sum);
+    reply(sum);
+  }
+}
+
+var disp = new Dispatcher();
+// 実 Xinu ノードを登録(3 台構成なら 3 行に増やすだけ)。
+var n1 = now disp.add_host("192.168.3.101:80");
+var total = now disp.run();
+print("=== mesh dispatch result: " + total + " ===");

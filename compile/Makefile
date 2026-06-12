@@ -98,6 +98,12 @@ PI5_CFLAGS  = $(COMMON) -mcpu=cortex-a76 \
               -DMBOX_BASE=0x107C013880UL \
               -DMBOX_PROBE_BUS \
               -DRP1_ETH_BASE=0x1F00100000UL \
+              -DWIFI_SDIO_BASE=0x1001100000UL \
+              -DWIFI_SDIO_CFG_BASE=0x1001100400UL \
+              -DSD_BASE=0x1000FFF000UL \
+              -DSD_CFG_BASE=0x1000FFF400UL \
+              -DWIFI_GPIO_BASE=0x107D508500UL \
+              -DWIFI_PINCTRL_BASE=0x107D504100UL \
               -DGIC_BASE=0x107FFF8000UL \
               -DGIC_GROUP1 \
               -DHEAP_END=0x40000000UL \
@@ -154,6 +160,26 @@ obj/pi5/llm.o:  llm.c | obj/pi5  ; $(CC) $(PI5_FP_CFLAGS)  -c $< -o $@
 obj/pi4/llm.o:  llm.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
 obj/qemu/llm.o: llm.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
 
+# wifi_fw.c .incbin's wifi-fw/wifi.conf (boot auto-connect creds, .gitignore'd).
+# Ensure an (empty = auto-connect disabled) one exists so a clean checkout builds.
+obj/pi5/wifi_fw.o: wifi_fw.c | obj/pi5
+	@test -f ../wifi-fw/wifi.conf || { mkdir -p ../wifi-fw; : > ../wifi-fw/wifi.conf; \
+	  echo "  (created empty wifi-fw/wifi.conf — WiFi auto-connect disabled)"; }
+	$(CC) $(PI5_CFLAGS)  -c $< -o $@
+
+# main_min.o = loader/main.c built with -DMINIMAL_OS (shell-only "OS #1": no window
+# manager, no networking — see the pi5-osmin target).  Explicit rule (no main_min.c).
+obj/pi5/main_min.o: main.c | obj/pi5
+	$(CC) $(PI5_CFLAGS) -DMINIMAL_OS -c $< -o $@
+
+# main_os2.o = main.c with -DNO_WM ("OS #2": full features but no window manager —
+# shell on the HDMI text console).  video_os3.o = video.c at 1280x720 ("OS #3":
+# full features, HDMI resolution one rank lower).
+obj/pi5/main_os2.o: main.c | obj/pi5
+	$(CC) $(PI5_CFLAGS) -DNO_WM -c $< -o $@
+obj/pi5/video_os3.o: video.c | obj/pi5
+	$(CC) $(PI5_CFLAGS) -DSCREEN_WIDTH=1280 -DSCREEN_HEIGHT=720 -c $< -o $@
+
 obj/pi5/%.o: %.c  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
 obj/pi5/%.o: %.S  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
 obj/pi4/%.o: %.c  | obj/pi4  ; $(CC) $(PI4_CFLAGS)  -c $< -o $@
@@ -168,6 +194,30 @@ pi5 kernel_2712.img: $(PI5_OBJS) link.ld
 	$(LD) -nostdlib $(PI5_OBJS) -T link.ld -o kernel_2712.elf
 	$(OBJCOPY) -O binary kernel_2712.elf kernel_2712.img
 	@ls -la kernel_2712.img
+
+# ----- shell-only "OS #1": the full kernel's main.c rebuilt with -DMINIMAL_OS
+# (no window manager, no networking; HDMI text console + USB keyboard).  Same
+# object set as pi5 but main.o swapped for main_min.o.  -> kernel_min.img,
+# written to the microSD and kexec-selectable against the full OS. -----
+PI5OSMIN_OBJS = $(filter-out obj/pi5/main.o,$(PI5_OBJS)) obj/pi5/main_min.o
+pi5-osmin kernel_min.img: $(PI5OSMIN_OBJS) link.ld
+	$(LD) -nostdlib $(PI5OSMIN_OBJS) -T link.ld -o kernel_min.elf
+	$(OBJCOPY) -O binary kernel_min.elf kernel_min.img
+	@ls -la kernel_min.img
+
+# ----- OS #2: full features, NO window manager (text-console shell) -----
+PI5OS2_OBJS = $(filter-out obj/pi5/main.o,$(PI5_OBJS)) obj/pi5/main_os2.o
+pi5-os2 kernel_os2.img: $(PI5OS2_OBJS) link.ld
+	$(LD) -nostdlib $(PI5OS2_OBJS) -T link.ld -o kernel_os2.elf
+	$(OBJCOPY) -O binary kernel_os2.elf kernel_os2.img
+	@ls -la kernel_os2.img
+
+# ----- OS #3: full features, HDMI one rank lower (1280x720) -----
+PI5OS3_OBJS = $(filter-out obj/pi5/video.o,$(PI5_OBJS)) obj/pi5/video_os3.o
+pi5-os3 kernel_os3.img: $(PI5OS3_OBJS) link.ld
+	$(LD) -nostdlib $(PI5OS3_OBJS) -T link.ld -o kernel_os3.elf
+	$(OBJCOPY) -O binary kernel_os3.elf kernel_os3.img
+	@ls -la kernel_os3.img
 
 pi4 kernel8.img: $(PI4_OBJS) link.ld
 	$(LD) -nostdlib $(PI4_OBJS) -T link.ld -o kernel8.elf
@@ -232,7 +282,7 @@ install: install_pi5
 clean:
 	rm -rf obj kernel_*.elf kernel_*.img kernel8.elf kernel8.img qemu-smoke.log
 
-.PHONY: all pi4 pi5 pi5-min qemu qemu-run qemu-smoke install install_pi4 install_pi5 clean
+.PHONY: all pi4 pi5 pi5-min pi5-osmin pi5-os2 pi5-os3 qemu qemu-run qemu-smoke install install_pi4 install_pi5 clean
 
 # Auto-generated header dependencies (-MMD): a change to e.g. a struct in a
 # header now recompiles every .c that includes it, instead of leaving stale

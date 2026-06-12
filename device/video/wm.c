@@ -222,6 +222,57 @@ static void draw_chrome(window_t *w)
     }
 }
 
+/* WiFi status indicator in the bottom-right corner: a classic "fan" (dot + three
+ * arcs) and, below it, the SSID and our own IP — like a desktop taskbar widget.
+ * Green/white when associated + DHCP'd, gray otherwise.  Drawn in screen space. */
+extern int  wifi_connected(void);
+extern const char *wifi_ssid(void);
+extern void wifi_ipaddr(unsigned char *o);
+static int  wm_strlen(const char *s) { int n = 0; while (s[n]) n++; return n; }
+
+static void draw_wifi_icon(int sw, int sh)
+{
+    /* +-50 deg upward fan, sin/cos x1000 at -50,-30,-10,10,30,50 */
+    static const int si[6] = { -766, -500, -174,  174,  500,  766 };
+    static const int ci[6] = {  643,  866,  985,  985,  866,  643 };
+    int connected = wifi_connected();
+    unsigned int col = connected ? 0xFF2ECC55u : 0xFF707070u;        /* icon: green/gray */
+    unsigned int txt = connected ? 0xFFFFFFFFu : 0xFF909090u;        /* text: white/gray */
+    int cx = sw - 26, cy = sh - 46;      /* fan apex, raised to leave room for text */
+    int a, k, th;
+    /* clear a tall box in the corner (icon + two text lines) */
+    fill_rect(sw - 184, sh - 76, 184, 76, DESKTOP_BG);
+    fill_rect(cx - 2, cy - 2, 5, 5, col);                            /* the dot */
+    for (a = 0; a < 3; a++) {                                        /* arcs r = 9/16/23 */
+        int r = 9 + a * 7;
+        for (th = 0; th < 2; th++) {                                 /* 2 px thick */
+            int rr = r - th, px = -1, py = -1;
+            for (k = 0; k < 6; k++) {
+                int x = cx + (rr * si[k]) / 1000;
+                int y = cy - (rr * ci[k]) / 1000;
+                if (px >= 0) draw_line(px, py, x, y, col);
+                px = x; py = y;
+            }
+        }
+    }
+    if (connected) {
+        const char *ssid = wifi_ssid();
+        unsigned char ip[4]; char ipbuf[16]; int n = 0, i, w;
+        wifi_ipaddr(ip);
+        for (i = 0; i < 4; i++) {                                    /* ip -> "a.b.c.d" */
+            unsigned int v = ip[i]; char t[3]; int m = 0;
+            if (i) ipbuf[n++] = '.';
+            if (v == 0) t[m++] = '0'; else while (v) { t[m++] = (char)('0' + v % 10); v /= 10; }
+            while (m--) ipbuf[n++] = t[m];
+        }
+        ipbuf[n] = 0;
+        w = wm_strlen(ssid)  * 8; draw_string_at(sw - w - 6, sh - 30, ssid,  txt, DESKTOP_BG);
+        w = wm_strlen(ipbuf) * 8; draw_string_at(sw - w - 6, sh - 16, ipbuf, txt, DESKTOP_BG);
+    } else {
+        draw_string_at(sw - 8*9 - 6, sh - 16, "no wifi", txt, DESKTOP_BG);
+    }
+}
+
 void wm_run(void)
 {
     unsigned int frame = 0;
@@ -287,6 +338,10 @@ void wm_run(void)
             draw_chrome(w);
             if (w->draw_content) w->draw_content(w, frame);
         }
+
+        /* WiFi status icon, screen-space (bottom-right), on top of the windows. */
+        video_set_viewport(0, 0);
+        draw_wifi_icon(sw, sh);
 
         /* Cursor is NOT baked into the back buffer (no draw_cursor here): flip
          * the composed frame keeping the live cursor rect intact, then stamp the

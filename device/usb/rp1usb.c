@@ -1017,4 +1017,275 @@ int          rp1usb_connected(void)
     return c;
 }
 
+/* ====================================================================
+ * Phase 4 — USB Mass Storage (Bulk-Only Transport + SCSI) on the boot
+ * stick (c0p2, USB2 HS).  Reuses the xHCI primitives above: SET_CONFIG via
+ * control_nodata(), Configure-Endpoint via cmd_submit(), and Normal-TRB bulk
+ * transfers via bulk_xfer().  Drives the standard BOT handshake
+ * (CBW -> data -> CSW) and the SCSI commands needed for block r/w.  All HTTP-
+ * driven (no boot path) so a bug here can't fault the boot.
+ * ==================================================================== */
+
+static struct trb     g_bo_ring[16] __attribute__((aligned(64)));   /* bulk OUT */
+static struct trb     g_bi_ring[16] __attribute__((aligned(64)));   /* bulk IN  */
+static int            g_bo_idx, g_bo_cyc = 1, g_bi_idx, g_bi_cyc = 1;
+static unsigned char  g_msd_devctx[33*64] __attribute__((aligned(64)));  /* MSD output ctx */
+static unsigned char  g_cbw[64] __attribute__((aligned(64)));
+static unsigned char  g_csw[64] __attribute__((aligned(64)));
+static unsigned char  g_msd_data[4096] __attribute__((aligned(64)));
+static int            g_msd_slot, g_msd_iface, g_msd_out_ep, g_msd_in_ep, g_msd_out_dci, g_msd_in_dci;
+static unsigned int   g_msd_setup_cc, g_msd_cfgep_cc;
+static unsigned int   g_msd_blocks, g_msd_blocksize;
+static unsigned int   g_msd_tag = 1, g_msd_csw_status, g_msd_residue;
+static int            g_msd_last_r;
+static int            g_p_cbw, g_p_data, g_p_csw;          /* per-phase byte counts */
+static unsigned       g_p_cbw_cc, g_p_data_cc, g_p_csw_cc; /* per-phase completion codes */
+
+static void msd_le32(unsigned char *p, unsigned int v){ p[0]=v; p[1]=v>>8; p[2]=v>>16; p[3]=v>>24; }
+
+static void bulk_ring_init(struct trb *ring, int *idx, int *cyc)
+{
+    for (int i=0;i<16;i++){ ring[i].p0=ring[i].p1=ring[i].status=ring[i].control=0; }
+    ring[15].p0 = (unsigned)(XDA(ring)&0xffffffff);
+    ring[15].p1 = (unsigned)(XDA(ring)>>32);
+    ring[15].control = (6u<<10)|(1u<<1)|1u;        /* Link TRB, TC=1, cycle */
+    *idx = 0; *cyc = 1;
+}
+
+/* Queue one Normal TRB on a bulk ring, ring the slot's EP doorbell, wait for the
+ * transfer event.  Returns bytes transferred (len - residual) or a negative
+ * error: -1000 = no event (timeout), else -(completion code). */
+static unsigned g_bulk_cc;        /* completion code of the last bulk_xfer (0xff=timeout) */
+static int bulk_xfer(struct trb *ring, int *idx, int *cyc, int slot, int dci,
+                     void *buf, int len, int is_in)
+{
+    struct trb *t = &ring[*idx];
+    unsigned long ba = XDA(buf);
+    t->p0 = (unsigned)(ba&0xffffffff); t->p1 = (unsigned)(ba>>32);
+    t->status = (unsigned)len & 0x1ffff;                       /* TRB transfer length */
+    t->control = (1u<<10)|(1u<<5)|(is_in?(1u<<2):0u)|((*cyc)&1u); /* Normal, IOC, ISP(in) */
+    __asm__ volatile ("dsb sy":::"memory");
+    (*idx)++;
+    if (*idx==15){ ring[15].control=(ring[15].control&~1u)|((*cyc)&1u);
+                   __asm__ volatile("dsb sy":::"memory"); *idx=0; *cyc^=1; }
+    R32(g_db, slot*4) = (unsigned)dci;
+    __asm__ volatile ("dsb sy":::"memory");
+    struct trb ev = event_wait(32);
+    if (ev.control == 0) { g_bulk_cc = 0xff; return -1000; }    /* no event = timeout */
+    unsigned cc = (ev.status>>24)&0xff;
+    unsigned residual = ev.status & 0xffffff;
+    g_bulk_cc = cc;
+    if (cc==1 || cc==13) return len - (int)residual;           /* 13 = short packet, ok */
+    return -(int)cc;
+}
+
+/* SET_CONFIGURATION(1) + locate the class-8 (mass-storage) interface's bulk IN/OUT
+ * endpoints + Configure-Endpoint them.  Output ctx must already be g_msd_devctx
+ * (address it via rp1usb_msd_fullsetup). */
+int rp1usb_msd_setup(int slot, int port, int speed)
+{
+    g_msd_slot = slot;
+    g_msd_setup_cc = (control_nodata(slot, 0x00, 9, 1, 0) == 0) ? 1 : 0;  /* SET_CONFIG 1 */
+
+    int got = rp1usb_get_descriptor(slot, 2, 0, 9);            /* config header */
+    if (got < 4 || g_xfer_buf[0]!=9 || g_xfer_buf[1]!=2) return -1;
+    int wtot = g_xfer_buf[2] | (g_xfer_buf[3]<<8);
+    if (wtot > (int)sizeof g_xfer_buf) wtot = sizeof g_xfer_buf;
+    rp1usb_get_descriptor(slot, 2, 0, wtot);                   /* full config */
+
+    int pos=0, cur_class=-1, cur_iface=-1, found=0;
+    int in_ep=0, out_ep=0, in_mps=512, out_mps=512;
+    while (pos+2 <= wtot) {
+        int blen=g_xfer_buf[pos], btype=g_xfer_buf[pos+1];
+        if (blen<2) break;
+        if (btype==4) {                                        /* interface */
+            cur_iface=g_xfer_buf[pos+2]; cur_class=g_xfer_buf[pos+5];
+        } else if (btype==5 && cur_class==8) {                 /* bulk EP of MSD iface */
+            int epaddr=g_xfer_buf[pos+2], attr=g_xfer_buf[pos+3];
+            int mps=g_xfer_buf[pos+4]|(g_xfer_buf[pos+5]<<8);
+            if ((attr&3)==2) {                                 /* bulk */
+                if (epaddr&0x80){ in_ep=epaddr; in_mps=mps; } else { out_ep=epaddr; out_mps=mps; }
+                g_msd_iface=cur_iface; found=1;
+            }
+        }
+        pos += blen;
+    }
+    if (!found || !in_ep || !out_ep) return -2;
+
+    int out_dci=(out_ep&0xf)*2, in_dci=(in_ep&0xf)*2+1;
+    int maxdci = out_dci>in_dci ? out_dci : in_dci;
+    g_msd_out_ep=out_ep; g_msd_in_ep=in_ep; g_msd_out_dci=out_dci; g_msd_in_dci=in_dci;
+
+    bulk_ring_init(g_bo_ring,&g_bo_idx,&g_bo_cyc);
+    bulk_ring_init(g_bi_ring,&g_bi_idx,&g_bi_cyc);
+
+    for (unsigned i=0;i<sizeof g_input_ctx;i++) g_input_ctx[i]=0;
+    unsigned int *icc=ctx_at(g_input_ctx,0);
+    icc[1]=(1u<<0)|(1u<<out_dci)|(1u<<in_dci);                 /* add slot + both bulk EPs */
+    unsigned int *sc=ctx_at(g_input_ctx,1);
+    sc[0]=((unsigned)maxdci<<27)|((unsigned)speed<<20);
+    sc[1]=((unsigned)port&0xff)<<16;
+    { unsigned int *ep=ctx_at(g_input_ctx,out_dci+1);          /* bulk OUT */
+      ep[1]=(2u<<3)|(3u<<1)|((unsigned)out_mps<<16);
+      unsigned long trd=XDA(g_bo_ring)|1u;
+      ep[2]=(unsigned)(trd&0xffffffff); ep[3]=(unsigned)(trd>>32);
+      ep[4]=(unsigned)out_mps; }
+    { unsigned int *ep=ctx_at(g_input_ctx,in_dci+1);           /* bulk IN */
+      ep[1]=(6u<<3)|(3u<<1)|((unsigned)in_mps<<16);
+      unsigned long trd=XDA(g_bi_ring)|1u;
+      ep[2]=(unsigned)(trd&0xffffffff); ep[3]=(unsigned)(trd>>32);
+      ep[4]=(unsigned)in_mps; }
+    g_dcbaa[slot]=XDA(g_msd_devctx);
+    __asm__ volatile("dsb sy":::"memory");
+    unsigned long ic=XDA(g_input_ctx);
+    cmd_submit((unsigned)(ic&0xffffffff),(unsigned)(ic>>32),0,(12u<<10)|((unsigned)slot<<24));
+    struct trb ev=event_wait(33);
+    g_msd_cfgep_cc=(ev.status>>24)&0xff;
+    return (g_msd_cfgep_cc==1)?0:-3;
+}
+
+/* One BOT transaction: CBW -> optional data -> CSW.  dir: 0 none, 1 IN, 2 OUT.
+ * Returns 0 on CSW status==0 (good), 1 on CSW fail, negative on transport error. */
+static int msd_scsi(const unsigned char *cdb, int cdblen, int dir, void *data, int datalen)
+{
+    unsigned int tag = g_msd_tag++;
+    for (int i=0;i<31;i++) g_cbw[i]=0;
+    msd_le32(g_cbw+0, 0x43425355u);             /* dCBWSignature "USBC" */
+    msd_le32(g_cbw+4, tag);
+    msd_le32(g_cbw+8, (unsigned)datalen);
+    g_cbw[12] = (dir==1) ? 0x80 : 0x00;         /* bmCBWFlags: IN=0x80 */
+    g_cbw[13] = 0;                              /* bCBWLUN = 0 */
+    g_cbw[14] = (unsigned char)cdblen;
+    for (int i=0;i<cdblen && i<16;i++) g_cbw[15+i]=cdb[i];
+
+    g_p_cbw = bulk_xfer(g_bo_ring,&g_bo_idx,&g_bo_cyc,g_msd_slot,g_msd_out_dci,g_cbw,31,0);
+    g_p_cbw_cc = g_bulk_cc;
+    if (g_p_cbw < 0) return -1;
+    g_p_data = 0; g_p_data_cc = 0;
+    if (dir==1 && datalen>0) {
+        g_p_data = bulk_xfer(g_bi_ring,&g_bi_idx,&g_bi_cyc,g_msd_slot,g_msd_in_dci,data,datalen,1);
+        g_p_data_cc = g_bulk_cc;
+        if (g_p_data < 0) return -2;
+    } else if (dir==2 && datalen>0) {
+        g_p_data = bulk_xfer(g_bo_ring,&g_bo_idx,&g_bo_cyc,g_msd_slot,g_msd_out_dci,data,datalen,0);
+        g_p_data_cc = g_bulk_cc;
+        if (g_p_data < 0) return -3;
+    }
+    for (int i=0;i<13;i++) g_csw[i]=0;
+    g_p_csw = bulk_xfer(g_bi_ring,&g_bi_idx,&g_bi_cyc,g_msd_slot,g_msd_in_dci,g_csw,13,1);
+    g_p_csw_cc = g_bulk_cc;
+    if (g_p_csw < 0) return -4;
+    g_msd_csw_status = g_csw[12];
+    g_msd_residue = g_csw[8]|(g_csw[9]<<8)|(g_csw[10]<<16)|(g_csw[11]<<24);
+    return (g_msd_csw_status==0) ? 0 : 1;
+}
+
+int rp1usb_msd_inquiry(void)
+{
+    unsigned char cdb[6]={0x12,0,0,0,36,0};
+    return (g_msd_last_r = msd_scsi(cdb,6,1,g_msd_data,36));
+}
+int rp1usb_msd_test_ready(void)
+{
+    unsigned char cdb[6]={0,0,0,0,0,0};
+    return (g_msd_last_r = msd_scsi(cdb,6,0,0,0));
+}
+int rp1usb_msd_request_sense(void)
+{
+    unsigned char cdb[6]={0x03,0,0,0,18,0};
+    return (g_msd_last_r = msd_scsi(cdb,6,1,g_msd_data,18));
+}
+int rp1usb_msd_capacity(void)
+{
+    unsigned char cdb[10]={0x25,0,0,0,0,0,0,0,0,0};
+    /* A freshly-configured device often answers the first TEST UNIT READY with a
+     * "unit attention"; clear it with REQUEST SENSE then retry a few times. */
+    for (int i=0;i<4;i++){ if (rp1usb_msd_test_ready()==0) break; rp1usb_msd_request_sense(); }
+    int r = msd_scsi(cdb,10,1,g_msd_data,8);
+    if (r==0) {
+        g_msd_blocks    = ((unsigned)g_msd_data[0]<<24)|((unsigned)g_msd_data[1]<<16)|
+                          ((unsigned)g_msd_data[2]<<8)|g_msd_data[3];
+        g_msd_blocks   += 1;                    /* READ CAPACITY returns last LBA */
+        g_msd_blocksize = ((unsigned)g_msd_data[4]<<24)|((unsigned)g_msd_data[5]<<16)|
+                          ((unsigned)g_msd_data[6]<<8)|g_msd_data[7];
+    }
+    return (g_msd_last_r = r);
+}
+int rp1usb_msd_read_block(unsigned int lba)
+{
+    unsigned int bs = g_msd_blocksize ? g_msd_blocksize : 512;
+    unsigned char cdb[10]={0x28,0,(unsigned char)(lba>>24),(unsigned char)(lba>>16),
+                           (unsigned char)(lba>>8),(unsigned char)lba,0,0,1,0};
+    return (g_msd_last_r = msd_scsi(cdb,10,1,g_msd_data,(int)bs));
+}
+int rp1usb_msd_write_block(unsigned int lba)
+{
+    unsigned int bs = g_msd_blocksize ? g_msd_blocksize : 512;
+    unsigned char cdb[10]={0x2A,0,(unsigned char)(lba>>24),(unsigned char)(lba>>16),
+                           (unsigned char)(lba>>8),(unsigned char)lba,0,0,1,0};
+    return (g_msd_last_r = msd_scsi(cdb,10,2,g_msd_data,(int)bs));
+}
+/* Fill the data buffer with a recognisable test pattern (for write verification). */
+void rp1usb_msd_fill_pattern(unsigned int seed)
+{
+    for (unsigned i=0;i<sizeof g_msd_data;i++) g_msd_data[i]=(unsigned char)(seed + i);
+}
+
+/* Full bring-up of the mass-storage device on controller 0, port `port`
+ * (the boot stick is c0p2): init controller 0 if needed, enable a slot, address
+ * the device into g_msd_devctx, then Configure the bulk endpoints. */
+int rp1usb_msd_fullsetup(int port)
+{
+    extern int rp1usb_address_device(int,int,int,int);
+    rp1usb_select_ctrl(0);
+    if (!g_cm[0].inited) rp1usb_xhci_init();
+    if (!g_cm[0].inited) return -100;
+    int slot = -1;
+    for (int attempt=0; attempt<3 && slot<0; attempt++) slot = rp1usb_enum_slot(port);
+    if (slot < 0) return -10;
+    int speed = (int)((g_enum_portsc >> 10) & 0xf);
+    /* The boot mass-storage stick is USB2 High-Speed, but this RP1/DWC3
+     * controller's PORTSC speed field reports 2 (its non-standard PSI map — the
+     * same quirk noted for the mouse slot context: actual HS=3 while PORTSC reads
+     * 2).  A wrong slot/EP speed makes the periodic+async scheduler mis-handle the
+     * bulk endpoints so transfers never complete (CBW times out).  Force HS. */
+    if (speed < 3) speed = 3;
+    g_addr_ctx = g_msd_devctx;
+    int ar = -1;
+    for (int attempt=0; attempt<2 && ar!=0; attempt++) ar = rp1usb_address_device(slot, port, speed, 0);
+    g_addr_ctx = g_dev_ctx;
+    if (ar != 0) return -20;
+    return rp1usb_msd_setup(slot, port, speed);
+}
+
+unsigned int rp1usb_msd_setup_cc(void) { return g_msd_setup_cc; }
+unsigned int rp1usb_msd_cfgep_cc(void) { return g_msd_cfgep_cc; }
+unsigned int rp1usb_msd_csw_status(void){ return g_msd_csw_status; }
+unsigned int rp1usb_msd_residue(void)  { return g_msd_residue; }
+unsigned int rp1usb_msd_blocks(void)   { return g_msd_blocks; }
+unsigned int rp1usb_msd_blocksize(void){ return g_msd_blocksize; }
+int          rp1usb_msd_slot(void)     { return g_msd_slot; }
+int          rp1usb_msd_in_ep(void)    { return g_msd_in_ep; }
+int          rp1usb_msd_out_ep(void)   { return g_msd_out_ep; }
+int          rp1usb_msd_in_dci(void)   { return g_msd_in_dci; }
+int          rp1usb_msd_out_dci(void)  { return g_msd_out_dci; }
+int          rp1usb_msd_last_r(void)   { return g_msd_last_r; }
+int          rp1usb_msd_p_cbw(void)    { return g_p_cbw; }
+int          rp1usb_msd_p_data(void)   { return g_p_data; }
+int          rp1usb_msd_p_csw(void)    { return g_p_csw; }
+unsigned int rp1usb_msd_p_cbw_cc(void) { return g_p_cbw_cc; }
+unsigned int rp1usb_msd_p_data_cc(void){ return g_p_data_cc; }
+unsigned int rp1usb_msd_p_csw_cc(void) { return g_p_csw_cc; }
+/* device-context introspection (the controller writes EP/slot state here). */
+unsigned int rp1usb_msd_slotstate(void) { return (ctx_at(g_msd_devctx,0)[3]>>27)&0x1f; }
+unsigned int rp1usb_msd_out_epstate(void){ return ctx_at(g_msd_devctx,g_msd_out_dci)[0]&0x7; }
+unsigned int rp1usb_msd_in_epstate(void) { return ctx_at(g_msd_devctx,g_msd_in_dci)[0]&0x7; }
+unsigned int rp1usb_msd_out_deqlo(void)  { return ctx_at(g_msd_devctx,g_msd_out_dci)[2]; }
+unsigned int rp1usb_msd_in_deqlo(void)   { return ctx_at(g_msd_devctx,g_msd_in_dci)[2]; }
+unsigned int rp1usb_msd_out_ep1(void)    { return ctx_at(g_msd_devctx,g_msd_out_dci)[1]; }
+unsigned int rp1usb_msd_usbsts(void)     { return R32(g_oper, OP_USBSTS); }
+unsigned int rp1usb_msd_portsc2(void)    { return R32(g_oper, 0x400 + 0x10); }  /* c0 port2 */
+unsigned int rp1usb_msd_data_byte(int i){ return (i>=0&&i<(int)sizeof g_msd_data)?g_msd_data[i]:0; }
+void         rp1usb_msd_set_byte(int i, unsigned int v){ if(i>=0&&i<(int)sizeof g_msd_data) g_msd_data[i]=(unsigned char)v; }
+
 #endif /* RP1_ETH_BASE */

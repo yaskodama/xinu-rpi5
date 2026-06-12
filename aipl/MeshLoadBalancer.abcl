@@ -1,0 +1,141 @@
+// MeshLoadBalancer.abcl
+// ---------------------------------------------------------------------------
+// 型推論クリーンな分散メッシュ負荷分散ロジック (AIPL)。
+//
+// 構想: Mac 2 + Windows 1 = 管理ノード、Xinu 3 = ワーカーノード。
+// 管理ノードが動かす Scheduler が複数の Worker を登録し、各 Worker の
+// 「累積割当数(=負荷)」を追跡して、最も負荷の低い Worker にタスクを
+// 振り分ける(最小負荷配置)。ノード障害は mark_down で系から外し、
+// 残りのワーカーへ再配置する。
+//
+// 物理ノード間転送(HTTP / cluster_send)はランタイム側の責務で、route
+// table が Worker アクタ名 -> 物理ノード(Xinu) を対応づける。本ファイルは
+// 「登録・負荷追跡・最小負荷配置・障害再配置」のロジックを AIPL で表現し、
+// aipl2c --check に型推論クリーンで通る。
+// ---------------------------------------------------------------------------
+
+class Worker {
+  var id = 0;
+  var completed = 0;
+
+  method set_id(my_id) {
+    id = my_id;
+    reply(my_id);
+  }
+
+  method work(x) {
+    completed = completed + 1;
+    var r = x * x;
+    print("  [worker " + id + "] work(" + x + ") = " + r + " (done " + completed + ")");
+    reply(r);
+  }
+}
+
+class Scheduler {
+  var workers = array_empty();   // Worker ref の配列
+  var est     = array_empty();   // 各 Worker の累積割当数 (int)
+  var up      = array_empty();   // 各 Worker の生存フラグ (1=生存,0=ダウン)
+  var nw      = 0;
+  var done    = 0;
+
+  // n 個のワーカーを生成・登録する(各 Xinu ノードに対応)。
+  method register(n) {
+    var i = 0;
+    while (i < n) do {
+      var w = new Worker();
+      var z = now w.set_id(i);
+      workers = array_push(workers, w);
+      est = array_push(est, 0);
+      up  = array_push(up, 1);
+      i = i + 1;
+    }
+    nw = n;
+    print("[scheduler] registered " + n + " workers");
+    reply(n);
+  }
+
+  // 最も割当の少ない「生存中」ワーカーの index を返す。ダウン中は除外。
+  method least() {
+    var best = 0;
+    // bl は配列要素と同じ gradual 型で初期化(int リテラルだと型不一致)。
+    var bl = array_get(est, 0);
+    if (array_get(up, 0) == 0) {
+      bl = bl + 1000000;
+    }
+    var i = 1;
+    while (i < nw) do {
+      var li = array_get(est, i);
+      if (array_get(up, i) == 0) {
+        li = li + 1000000;
+      }
+      if (li < bl) {
+        bl = li;
+        best = i;
+      }
+      i = i + 1;
+    }
+    reply(best);
+  }
+
+  // ノード障害(以後 least() が選ばない)。
+  method mark_down(idx) {
+    up = array_set(up, idx, 0);
+    print("[scheduler] node " + idx + " marked DOWN; tasks re-place to survivors");
+    reply(idx);
+  }
+
+  // ノード復帰。
+  method mark_up(idx) {
+    up = array_set(up, idx, 1);
+    reply(idx);
+  }
+
+  // タスク列を最小負荷配置で振り分ける。est を累積割当数として毎回最小の
+  // ワーカーを選ぶので、タスクはワーカー間に均等分散する(=負荷分散)。
+  method run() {
+    var jobs = array_empty();
+    jobs = array_push(jobs, 2);
+    jobs = array_push(jobs, 3);
+    jobs = array_push(jobs, 5);
+    jobs = array_push(jobs, 7);
+    jobs = array_push(jobs, 11);
+    jobs = array_push(jobs, 13);
+    jobs = array_push(jobs, 17);
+    jobs = array_push(jobs, 19);
+    jobs = array_push(jobs, 23);
+
+    var sum = 0.;                                  // float 累算で int/TAny 罠回避
+    var nj = array_len(jobs);
+    var i = 0;
+    while (i < nj) do {
+      // 最小割当ノードをインライン選択(self への now 同期呼びは自己デッド
+      // ロックになるため、least() のロジックをここに展開する)。
+      var idx = 0;
+      var bl = array_get(est, 0);
+      if (array_get(up, 0) == 0) { bl = bl + 1000000; }
+      var j = 1;
+      while (j < nw) do {
+        var lj = array_get(est, j);
+        if (array_get(up, j) == 0) { lj = lj + 1000000; }
+        if (lj < bl) { bl = lj; idx = j; }
+        j = j + 1;
+      }
+      var w = array_get(workers, idx);
+      est = array_set(est, idx, array_get(est, idx) + 1);   // 割当 +1
+      var r = now w.work(array_get(jobs, i));      // ワーカーで実行
+      done = done + 1;
+      sum = sum + r;
+      print("[scheduler] job " + i + " (= " + array_get(jobs, i) + ") -> node " + idx);
+      i = i + 1;
+    }
+    print("[scheduler] completed " + done + " tasks; sum of squares = " + sum);
+    reply(sum);
+  }
+}
+
+var sched = new Scheduler();
+var registered = now sched.register(3);
+// 1 ノードをダウンさせて残り 2 ノードへ再配置する様子も示す。
+var d = now sched.mark_down(1);
+var total = now sched.run();
+print("=== mesh load-balance result: " + total + " ===");

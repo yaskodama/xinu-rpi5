@@ -76,6 +76,7 @@ static vfs_node_t *new_node(vfs_kind_t kind, const char *name,
     n->size     = 0;
     n->capacity = 0;
     n->data     = 0;
+    n->fat_cluster = 0;
     n->parent   = parent;
     n->children = 0;
     n->next     = 0;
@@ -128,9 +129,15 @@ int vfs_write(vfs_node_t *file, const void *buf, unsigned long len)
     return 0;
 }
 
+static int (*g_load_hook)(vfs_node_t *);
+void vfs_set_load_hook(int (*fn)(vfs_node_t *)) { g_load_hook = fn; }
+
 int vfs_read(vfs_node_t *file, void *buf, unsigned long max)
 {
     if (file == 0 || file->kind != VFS_FILE) return -1;
+    /* On-demand backing load (e.g. FAT32 file content): the directory walk
+     * records size but leaves data NULL; populate it on first read. */
+    if (file->data == 0 && file->size > 0 && g_load_hook) g_load_hook(file);
     unsigned long n = file->size < max ? file->size : max;
     const unsigned char *s = (const unsigned char *)file->data;
     unsigned char       *d = (unsigned char *)buf;

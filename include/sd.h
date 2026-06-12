@@ -34,4 +34,8 @@ int sd_init(void);
  * timeout / hardware error. */
 int sd_read_block(unsigned long lba, void *buf);
 
+/* Write one 512-byte block (LBA addressing).  Returns 0 on success, -1 on
+ * timeout / hardware error / unsupported (SD_BASE undefined). */
+int sd_write_block(unsigned long lba, const void *buf);
+
 #endif /* XINU_RPI5_SD_H */
