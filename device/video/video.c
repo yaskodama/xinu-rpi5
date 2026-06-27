@@ -486,6 +486,145 @@ void draw_string_at(int px, int py, const char *s,
     }
 }
 
+/* ===================================================================
+ *  Scaled glyph / string drawing (BASIC window toolbar uses scale 1,
+ *  but the helper is general).  Coords are virtual-desktop pixels —
+ *  viewport offset + clip-to-fb applied exactly like draw_glyph_at.
+ * =================================================================== */
+void draw_glyph_scaled(int px, int py, char c,
+                       unsigned int fg, unsigned int bg, int scale)
+{
+    if (!fb_ready) return;
+    if (scale < 1) scale = 1;
+    unsigned char ci = (unsigned char)c;
+    if (ci < 0x20 || ci > 0x7F) ci = '?';
+    const unsigned char *glyph = font8x8[ci - 0x20];
+
+    int sx0 = px - view_x;
+    int sy0 = py - view_y;
+    for (int gy = 0; gy < FONT_HEIGHT; gy++) {
+        unsigned char bits = glyph[gy];
+        for (int sy = 0; sy < scale; sy++) {
+            int rsy = sy0 + gy * scale + sy;
+            if (rsy < 0 || rsy >= (int)fb_height) continue;
+            unsigned int *line = (unsigned int *)(fb_draw + rsy * fb_pitch);
+            for (int gx = 0; gx < FONT_WIDTH; gx++) {
+                unsigned int col = (bits & (0x80 >> gx)) ? fg : bg;
+                for (int sxx = 0; sxx < scale; sxx++) {
+                    int rsx = sx0 + gx * scale + sxx;
+                    if (rsx < 0 || rsx >= (int)fb_width) continue;
+                    line[rsx] = col;
+                }
+            }
+        }
+    }
+}
+
+void draw_string_scaled(int px, int py, const char *s,
+                        unsigned int fg, unsigned int bg, int scale)
+{
+    if (!fb_ready) return;
+    if (scale < 1) scale = 1;
+    while (*s) {
+        draw_glyph_scaled(px, py, *s, fg, bg, scale);
+        px += FONT_WIDTH * scale;
+        s++;
+    }
+}
+
+/* ===================================================================
+ *  BASIC graphics canvas.  The BASIC window's LINE / CIRCLE / PLOT
+ *  statements append commands to a display list (bgfx_line/circle);
+ *  basicwin replays the whole list every frame via bgfx_render() so
+ *  the drawing survives the wm's per-frame wipe.  Coordinates are
+ *  window-content-relative; rendering clips to the window's content
+ *  rect (and the framebuffer).  Mirrors the actor canvas in rpi4 but
+ *  kept BASIC-only here (the Graphics window owns its own renderer).
+ * =================================================================== */
+struct bgfx_cmd { unsigned char type; int a, b, c, d; unsigned int color; };
+#define BGFX_MAX 1024
+static struct bgfx_cmd g_bgfx[BGFX_MAX];
+static int g_bgfx_n;
+static const unsigned int bgfx_palette[8] = {
+    0xFF101010U,  /* 0 near-black */ 0xFFFF5050U, /* 1 red    */
+    0xFF50FF50U,  /* 2 green      */ 0xFF5090FFU, /* 3 blue   */
+    0xFFFFFF50U,  /* 4 yellow     */ 0xFF50FFFFU, /* 5 cyan   */
+    0xFFFF50FFU,  /* 6 magenta    */ 0xFFFFFFFFU, /* 7 white  */
+};
+static unsigned int bgfx_col(int idx) { return bgfx_palette[(unsigned)idx & 7]; }
+static int bgfx_iabs(int v) { return v < 0 ? -v : v; }
+
+/* one pixel, clipped to the content rect [clx,cly,clw,clh] AND the screen */
+static void bgfx_pix(int x, int y, unsigned int color,
+                     int clx, int cly, int clw, int clh)
+{
+    if (x < clx || y < cly || x >= clx + clw || y >= cly + clh) return;
+    int sx = x - view_x, sy = y - view_y;
+    if (sx < 0 || sy < 0 || sx >= (int)fb_width || sy >= (int)fb_height) return;
+    *((unsigned int *)(fb_draw + sy * fb_pitch) + sx) = color;
+}
+
+static void bgfx_seg(int x0, int y0, int x1, int y1, unsigned int color,
+                     int clx, int cly, int clw, int clh)
+{
+    int dx = bgfx_iabs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -bgfx_iabs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy, e2;
+    for (int guard = 0; guard < 8192; guard++) {        /* bound: never spin */
+        bgfx_pix(x0, y0, color, clx, cly, clw, clh);
+        if (x0 == x1 && y0 == y1) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static void bgfx_ring(int cx, int cy, int r, unsigned int color,
+                      int clx, int cly, int clw, int clh)
+{
+    if (r < 0) r = -r;
+    int x = r, y = 0, err = 1 - r;
+    while (x >= y) {
+        bgfx_pix(cx + x, cy + y, color, clx, cly, clw, clh);
+        bgfx_pix(cx + y, cy + x, color, clx, cly, clw, clh);
+        bgfx_pix(cx - y, cy + x, color, clx, cly, clw, clh);
+        bgfx_pix(cx - x, cy + y, color, clx, cly, clw, clh);
+        bgfx_pix(cx - x, cy - y, color, clx, cly, clw, clh);
+        bgfx_pix(cx - y, cy - x, color, clx, cly, clw, clh);
+        bgfx_pix(cx + y, cy - x, color, clx, cly, clw, clh);
+        bgfx_pix(cx + x, cy - y, color, clx, cly, clw, clh);
+        y++;
+        if (err < 0) err += 2 * y + 1;
+        else { x--; err += 2 * (y - x) + 1; }
+    }
+}
+
+void bgfx_clear(void) { g_bgfx_n = 0; }
+void bgfx_line(int x0, int y0, int x1, int y1, int color)
+{
+    if (g_bgfx_n >= BGFX_MAX) return;
+    struct bgfx_cmd *c = &g_bgfx[g_bgfx_n++];
+    c->type = 1; c->a = x0; c->b = y0; c->c = x1; c->d = y1; c->color = bgfx_col(color);
+}
+void bgfx_circle(int cx, int cy, int r, int color)
+{
+    if (g_bgfx_n >= BGFX_MAX) return;
+    struct bgfx_cmd *c = &g_bgfx[g_bgfx_n++];
+    c->type = 2; c->a = cx; c->b = cy; c->c = r; c->d = 0; c->color = bgfx_col(color);
+}
+
+/* Replay the BASIC display list, offset into the content rect (ox,oy,w,h). */
+void bgfx_render(int ox, int oy, int w, int h)
+{
+    for (int i = 0; i < g_bgfx_n; i++) {
+        const struct bgfx_cmd *c = &g_bgfx[i];
+        if (c->type == 1)
+            bgfx_seg(ox + c->a, oy + c->b, ox + c->c, oy + c->d, c->color, ox, oy, w, h);
+        else if (c->type == 2)
+            bgfx_ring(ox + c->a, oy + c->b, c->c, c->color, ox, oy, w, h);
+    }
+}
+
 /* Busy-wait `ms` milliseconds based on the AArch64 generic timer.
  * CNTFRQ_EL0 returns the timer frequency in Hz (usually 54 MHz on
  * Pi 4 / Pi 5 / QEMU virt -cpu cortex-a76).  Used by wm_run() between

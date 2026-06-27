@@ -160,6 +160,12 @@ obj/pi5/llm.o:  llm.c | obj/pi5  ; $(CC) $(PI5_FP_CFLAGS)  -c $< -o $@
 obj/pi4/llm.o:  llm.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
 obj/qemu/llm.o: llm.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
 
+# basic.c is the line-numbered BASIC interpreter (numbers are double) — FP, like
+# cc.o.  basicwin.c stays integer-only (covered by the generic rule).
+obj/pi5/basic.o:  basic.c | obj/pi5  ; $(CC) $(PI5_FP_CFLAGS)  -c $< -o $@
+obj/pi4/basic.o:  basic.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
+obj/qemu/basic.o: basic.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
+
 # wifi_fw.c .incbin's wifi-fw/wifi.conf (boot auto-connect creds, .gitignore'd).
 # Ensure an (empty = auto-connect disabled) one exists so a clean checkout builds.
 obj/pi5/wifi_fw.o: wifi_fw.c | obj/pi5

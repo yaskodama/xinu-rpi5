@@ -34,6 +34,12 @@ typedef struct window {
      * (x+1 .. x+width-2  ×  y+TITLEBAR_H+1 .. y+height-2). */
     void        (*draw_content)(struct window *self, unsigned int frame);
 
+    /* Optional: called once on the left-button PRESS edge when the click lands
+     * inside this window's body (below the title bar).  (lx,ly) are window-local
+     * pixel coords.  Used by the BASIC window for its toolbar buttons.  NULL =
+     * no per-window click handling. */
+    void        (*on_click)(struct window *self, int lx, int ly);
+
     int           focused;        /* 1 = currently selected window (bright chrome) */
     int           tag;            /* free for the owner — shellwin uses it as the
                                    * shell-instance index (0 = the first shell). */

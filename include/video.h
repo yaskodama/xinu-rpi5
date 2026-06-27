@@ -94,6 +94,21 @@ void draw_glyph_at(int px, int py, char c,
 void draw_string_at(int px, int py, const char *s,
                     unsigned int fg, unsigned int bg);
 
+/* Magnified glyph / string (scale 1 == the 8x8 default).  Used by the
+ * BASIC window's toolbar / text grid. */
+void draw_glyph_scaled(int px, int py, char c,
+                       unsigned int fg, unsigned int bg, int scale);
+void draw_string_scaled(int px, int py, const char *s,
+                        unsigned int fg, unsigned int bg, int scale);
+
+/* BASIC graphics canvas (LINE / CIRCLE / PLOT display list).  Coords are
+ * window-content-relative; bgfx_render() offsets them into the content rect
+ * each frame and clips to it.  Colour args are BASIC palette indices (& 7). */
+void bgfx_clear(void);
+void bgfx_line(int x0, int y0, int x1, int y1, int color);
+void bgfx_circle(int cx, int cy, int r, int color);
+void bgfx_render(int ox, int oy, int w, int h);
+
 /* Busy-wait based on the AArch64 generic timer (CNTPCT_EL0).
  * Used for animation pacing in wm_run(). */
 void delay_ms(unsigned int ms);

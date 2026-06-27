@@ -370,7 +370,20 @@ void xhci_keyboard_event(char c)
      * focused one — see shellwin_set_active() in xhci_mouse_event). */
     extern struct window *wm_focused(void);
     extern int shellwin_is_shell(window_t *);
-    if (shellwin_is_shell(wm_focused()))
+    extern int basicwin_is_basic(window_t *);
+    extern void basicwin_handle_key(char);
+    extern int  basic_is_running(void);
+    extern void basic_break(void);
+    struct window *fw = wm_focused();
+    if (basicwin_is_basic(fw)) {
+        /* Ctrl-C interrupts a running program.  The RUN loop blocks the wm main
+         * loop, but this key arrives via the xHCI HID interrupt, so set the
+         * break flag straight away (and don't reenter the editor mid-run). */
+        if (c == 0x03 && basic_is_running())
+            basic_break();
+        else
+            basicwin_handle_key(c);      /* BASIC window owns the keys otherwise */
+    } else if (shellwin_is_shell(fw))
         shellwin_handle_key(c);
 #endif
 }
@@ -532,6 +545,9 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
                         resize_win = w;                     /* bottom-right grip -> resize */
                     } else if (w && dpy >= w->y && dpy < w->y + WM_TITLEBAR_H) {
                         drag_win = w; drag_off_x = dpx - w->x; drag_off_y = dpy - w->y;
+                    } else if (w && w->on_click) {
+                        /* body click -> per-window handler (BASIC toolbar) */
+                        w->on_click(w, dpx - w->x, dpy - w->y);
                     }
                 }
             }
@@ -1803,7 +1819,7 @@ void kernel_main(void)
         shell_win.x = 5;
         shell_win.y = 67;
         shell_win.width  = 755;
-        shell_win.height = 997;
+        shell_win.height = 590;          /* shrunk to make room for BASIC below */
         const char *swt = "Shell (UART)";
         for (int i = 0; i < WM_TITLE_MAX && swt[i]; i++) shell_win.title[i] = swt[i];
         shell_win.chrome_color = 0xFF80E080U;
@@ -1813,6 +1829,32 @@ void kernel_main(void)
         shell_win.draw_content = shellwin_draw;
         shell_win.focused = 1;          /* shell selected by default so you can type at once */
         wm_add(&shell_win);
+
+        /* BASIC window: bottom-left, below the shell.  A clickable toolbar
+         * (FILES / LIST / RUN "<sample>") drives the embedded BASIC samples;
+         * focus it and type to edit/run programs.  Same idea as the rpi4
+         * desktop's BASIC window. */
+        {
+            extern window_t basic_win;
+            extern void basicwin_init(void);
+            extern void basicwin_draw(window_t *, unsigned int);
+            basicwin_init();
+            basic_win.x = 5;
+            basic_win.y = 662;
+            basic_win.width  = 755;
+            basic_win.height = 400;
+            const char *bt = "BASIC";
+            int i = 0;
+            for (; i < WM_TITLE_MAX && bt[i]; i++) basic_win.title[i] = bt[i];
+            basic_win.title[i] = 0;
+            basic_win.chrome_color = 0xFF40A0FFU;
+            basic_win.title_bg     = 0xFF103060U;
+            basic_win.title_fg     = 0xFFFFFFFFU;
+            basic_win.content_bg   = 0xFF000810U;
+            basic_win.draw_content = basicwin_draw;
+            wm_add(&basic_win);
+        }
+
         wm_set_tick(serial_io_tick);   /* drain net + debug-UART layout/keys */
         { extern void wm_set_overlay(void (*)(void));
           wm_set_overlay(desktop_menu_overlay); }   /* right-click desktop menu */
