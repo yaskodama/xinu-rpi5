@@ -1488,6 +1488,11 @@ void kernel_main(void)
      * 4 GB Normal range. */
 #ifdef RP1_ETH_BASE
     { extern void mmu_init(void); mmu_init(); uart_puts("mmu: enabled (identity map, caches off)\n"); }
+    /* Arm the demand-paged virtual-memory window (no physical backing until a
+     * page is first touched — faults are served by vm_fault via the sync
+     * exception trampoline).  Safe no-op until something accesses the window. */
+    { extern void vm_demand_init(void); vm_demand_init();
+      uart_puts("vm:  demand-paged window armed @32GB (4MB, on-demand frames)\n"); }
 #endif
 
     /* Try to bring up the HDMI framebuffer before printing anything,

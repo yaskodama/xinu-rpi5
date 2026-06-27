@@ -46,6 +46,36 @@ static void dump_and_halt(const char *kind)
 __attribute__((used))
 void sync_handler_default(void)   { dump_and_halt("sync exception"); }
 
+/* Recoverable synchronous-exception dispatcher (EL1 with SPx, vector 0x200).
+ * Reached via the sync_entry trampoline in exception_vectors.S, which saves
+ * the GPRs and ERETs on return — so if we handle the fault and return, the
+ * faulting instruction simply re-executes against the now-valid mapping.
+ *
+ * Today it handles exactly one thing: a translation fault inside the
+ * demand-paged virtual window (vm_fault maps a fresh frame).  Anything else
+ * is fatal and dumps + halts as before. */
+__attribute__((used))
+void sync_dispatch_c(void)
+{
+    extern int vm_fault(unsigned long va);
+
+    unsigned long esr, far;
+    __asm__ volatile ("mrs %0, esr_el1" : "=r"(esr));
+    __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+
+    unsigned int ec   = (unsigned int)((esr >> 26) & 0x3f);
+    unsigned int fsc  = (unsigned int)(esr & 0x3f);
+    /* EC 0x25 = data abort (same EL), 0x21 = instruction abort (same EL).
+     * FSC 0b0001LL (0x04..0x07) = translation fault, levels 0..3. */
+    int is_abort = (ec == 0x25 || ec == 0x21);
+    int is_xlat  = (fsc >= 0x04 && fsc <= 0x07);
+
+    if (is_abort && is_xlat && vm_fault(far))
+        return;                       /* mapped on demand -> retry the instruction */
+
+    dump_and_halt("sync exception");  /* unhandled -> fatal */
+}
+
 __attribute__((used))
 void irq_handler_default(void)    { dump_and_halt("IRQ (no dispatcher wired yet)"); }
 

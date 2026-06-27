@@ -121,3 +121,84 @@ void mmu_enable_secondary(void)
     __asm__ volatile ("msr sctlr_el1, %0" :: "r"(sctlr));
     __asm__ volatile ("isb");
 }
+
+/* ====================================================================
+ *  Demand-paged virtual memory.
+ *
+ *  A virtual window with NO physical backing until first touch.  We pick a
+ *  high VA region that is neither RAM (Pi 5: <= 16 GiB) nor a real device
+ *  (Pi 5 devices live at >= 64 GiB), splice an L2 table whose L3 leaves are
+ *  all INVALID into the L1 entry that the identity map left as a (do-nothing)
+ *  device block.  Any access in [VMD_BASE, VMD_END) then translation-faults;
+ *  the sync exception trampoline (exception_vectors.S -> sync_dispatch_c)
+ *  calls vm_fault(), which grabs a physical frame from a pool, installs the
+ *  L3 page-table entry, flushes the TLB, and returns so the faulting
+ *  instruction re-executes against the now-valid mapping.
+ *
+ *  Caches are off here just like the rest of the kernel, so no cache
+ *  maintenance of the freshly-zeroed frame is needed — the CPU reads RAM
+ *  directly.  A single dsb+tlbi for the new VA is enough.
+ * ==================================================================== */
+#define PAGE        4096UL
+#define NENT        512
+#define TWO_MB      0x200000UL
+#define DESC_PAGE   0x3UL                 /* valid L3 page descriptor          */
+
+#define VMD_BASE    0x800000000UL         /* 32 GiB — above RAM, below devices */
+#define VMD_L1_IDX  ((int)(VMD_BASE >> 30))   /* = 32 (into l1_lo)             */
+#define VMD_2MB     2                     /* 2 x 2 MiB = 4 MiB virtual window  */
+#define VMD_END     (VMD_BASE + (unsigned long)VMD_2MB * TWO_MB)
+#define VMD_POOL_PAGES 512                /* physical frames available on demand */
+
+static unsigned long  l2_vmd[NENT]                __attribute__((aligned(4096)));
+static unsigned long  l3_vmd[VMD_2MB][NENT]       __attribute__((aligned(4096)));
+static unsigned char  vmd_pool[VMD_POOL_PAGES][PAGE] __attribute__((aligned(4096)));
+static int            vmd_pool_next;
+volatile unsigned long g_vm_faults, g_vm_mapped, g_vm_oom;
+
+/* Build the page tables for the demand window with every leaf INVALID, then
+ * splice the L2 table into l1_lo[VMD_L1_IDX].  After this, any access in
+ * [VMD_BASE, VMD_END) translation-faults until vm_fault() maps it. */
+void vm_demand_init(void)
+{
+    for (int i = 0; i < NENT; i++) l2_vmd[i] = 0;
+    for (int t = 0; t < VMD_2MB; t++) {
+        for (int p = 0; p < NENT; p++) l3_vmd[t][p] = 0;       /* invalid */
+        l2_vmd[t] = (unsigned long)&l3_vmd[t][0] | DESC_TABLE;
+    }
+    l1_lo[VMD_L1_IDX] = (unsigned long)l2_vmd | DESC_TABLE;     /* was a device block */
+    __asm__ volatile ("dsb sy\n tlbi vmalle1\n dsb sy\n isb\n" ::: "memory");
+}
+
+int vm_demand_region(unsigned long *base, unsigned long *size)
+{ if (base) *base = VMD_BASE; if (size) *size = VMD_END - VMD_BASE; return VMD_POOL_PAGES; }
+
+unsigned long vm_fault_count(void)   { return g_vm_faults; }
+unsigned long vm_mapped_count(void)  { return g_vm_mapped; }
+unsigned long vm_oom_count(void)     { return g_vm_oom; }
+unsigned long vm_pool_pages(void)    { return VMD_POOL_PAGES; }
+unsigned long vm_pool_used(void)     { return (unsigned long)vmd_pool_next; }
+
+/* Page-fault handler (called from sync_dispatch_c on a translation abort).
+ * Returns 1 if `va` is in the demand window and is now mapped (retry the
+ * instruction), 0 otherwise (not ours -> fatal fault path). */
+int vm_fault(unsigned long va)
+{
+    if (va < VMD_BASE || va >= VMD_END) return 0;
+    unsigned long off = va - VMD_BASE;
+    int l2i = (int)(off >> 21);
+    int l3i = (int)((off >> 12) & 0x1FF);
+    if (l2i < 0 || l2i >= VMD_2MB) return 0;
+    unsigned long *pte = &l3_vmd[l2i][l3i];
+    if (*pte & 1UL) return 1;                          /* already present (spurious) */
+    if (vmd_pool_next >= VMD_POOL_PAGES) { g_vm_oom++; return 0; }   /* out of frames */
+    unsigned long pa = (unsigned long)&vmd_pool[vmd_pool_next++][0];
+    for (int i = 0; i < (int)(PAGE / 8); i++)
+        ((volatile unsigned long *)pa)[i] = 0;         /* zero-fill the fresh frame */
+    *pte = (pa & ~(PAGE - 1)) | ATTR_NORMAL | DESC_AF | DESC_PAGE;   /* Normal RW */
+    __asm__ volatile ("dsb ish" ::: "memory");
+    __asm__ volatile ("tlbi vaae1is, %0" :: "r"(va >> 12) : "memory");
+    __asm__ volatile ("dsb ish\n isb\n" ::: "memory");
+    g_vm_faults++; g_vm_mapped++;
+    return 1;
+}

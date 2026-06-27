@@ -856,6 +856,65 @@ static int cmd_mem(int argc, char **argv)
     return 0;
 }
 
+/* ---- demand-paged virtual memory (system/mmu.c) ---- */
+static int cmd_vmstat(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    extern int vm_demand_region(unsigned long *, unsigned long *);
+    extern unsigned long vm_fault_count(void), vm_mapped_count(void), vm_oom_count(void);
+    extern unsigned long vm_pool_pages(void), vm_pool_used(void);
+
+    unsigned long base = 0, size = 0;
+    int frames = vm_demand_region(&base, &size);
+    uart_puts("demand-paged VM window:\n");
+    uart_puts("  VA range   = "); puts_hex(base);
+    uart_puts(" .. ");            puts_hex(base + size);
+    uart_puts("  ("); puts_dec((int)(size >> 10)); uart_puts(" KiB, no backing until touched)\n");
+    uart_puts("  pool       = "); puts_dec((int)vm_pool_used());
+    uart_puts(" / ");             puts_dec(frames);
+    uart_puts(" frames used ("); puts_dec((int)(vm_pool_pages() * 4)); uart_puts(" KiB max)\n");
+    uart_puts("  page faults= "); puts_dec((int)vm_fault_count());  uart_puts("\n");
+    uart_puts("  mapped     = "); puts_dec((int)vm_mapped_count()); uart_puts("\n");
+    uart_puts("  out-of-mem = "); puts_dec((int)vm_oom_count());    uart_puts("\n");
+    return 0;
+}
+
+static int cmd_vmdemand(int argc, char **argv)
+{
+    extern int vm_demand_region(unsigned long *, unsigned long *);
+    extern unsigned long vm_fault_count(void), vm_mapped_count(void);
+
+    unsigned long base = 0, size = 0;
+    vm_demand_region(&base, &size);
+    int npages = 64;
+    if (argc >= 2) {                       /* optional decimal page count */
+        int n = 0; const char *s = argv[1];
+        while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
+        if (n > 0) npages = n;
+    }
+    int maxp = (int)(size / 4096UL);
+    if (npages > maxp) npages = maxp;
+
+    unsigned long f0 = vm_fault_count();
+    volatile unsigned char *p = (volatile unsigned char *)base;
+
+    uart_puts("vmdemand: touching "); puts_dec(npages);
+    uart_puts(" pages in window "); puts_hex(base);
+    uart_puts(" (each first touch faults in a fresh zero page)\n");
+
+    for (int i = 0; i < npages; i++)
+        p[(unsigned long)i * 4096UL] = (unsigned char)(i ^ 0xA5);
+    int ok = 1;
+    for (int i = 0; i < npages; i++)
+        if (p[(unsigned long)i * 4096UL] != (unsigned char)(i ^ 0xA5)) ok = 0;
+
+    uart_puts("  faults this run = "); puts_dec((int)(vm_fault_count() - f0));
+    uart_puts(", total mapped = ");    puts_dec((int)vm_mapped_count());
+    uart_puts(ok ? ", readback OK\n" : ", readback MISMATCH\n");
+    uart_puts("  => each page had no RAM until its first access faulted it in.\n");
+    return ok ? 0 : 1;
+}
+
 static int cmd_peek(int argc, char **argv)
 {
     if (argc < 2) {
@@ -1537,6 +1596,8 @@ static const struct centry commandtab[] = {
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },
+    { "vmstat",   "demand-paged VM window stats (faults/frames)", cmd_vmstat   },
+    { "vmdemand", "vmdemand [n]  touch n on-demand pages (default 64)", cmd_vmdemand },
     { "uptime", "raw CNTPCT_EL0 (generic timer)",          cmd_uptime },
     { "ps",       "core / EL status (no scheduler yet)",   cmd_ps       },
     { "halt",     "PSCI SYSTEM_OFF + WFE park",            cmd_halt     },
