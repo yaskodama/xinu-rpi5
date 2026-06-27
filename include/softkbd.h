@@ -16,6 +16,13 @@
 
 void softkbd_draw(window_t *self, unsigned int frame);
 
+/* Hit-test a click at virtual-desktop point (sx,sy) against the soft-keyboard
+ * key grid and return the character it produces (ASCII, plus 0x08 Bksp / '\t' /
+ * '\r'), or 0 if the point hit no key or a pure modifier (Shift/Caps/Ctrl/Alt,
+ * whose state is updated internally).  Caller routes the char to the focused
+ * window — see xhci_mouse_event() in loader/main.c. */
+char softkbd_hit(int sx, int sy);
+
 extern window_t softkbd_win;
 
 #endif /* XINU_RPI5_SOFTKBD_H */

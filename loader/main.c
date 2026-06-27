@@ -364,17 +364,48 @@ void xhci_keyboard_event(char c)
 #if defined(MINIMAL_OS) || defined(NO_WM)
     min_kbd_char(c);                 /* no-wm OSes: line-edit + on-screen echo */
 #else
-    /* Keys only reach the shell while its window is the selected one — click a
-     * different window with the mouse and typing stops going to the shell. */
+    /* Keys reach the shell only while a shell window is the selected one — click
+     * a different window with the mouse and typing stops going to the shell.
+     * With multiple shells, shellwin routes the key to whichever is active (the
+     * focused one — see shellwin_set_active() in xhci_mouse_event). */
     extern struct window *wm_focused(void);
-    extern window_t shell_win;
-    if (wm_focused() == &shell_win)
+    extern int shellwin_is_shell(window_t *);
+    if (shellwin_is_shell(wm_focused()))
         shellwin_handle_key(c);
 #endif
 }
 
 static int  g_cursor_x = 320;
 static int  g_cursor_y = 240;
+
+#if !defined(MINIMAL_OS) && !defined(NO_WM)
+/* ---- Right-click desktop menu (screen-space popup) ---------------------- */
+static int g_menu_vis;
+static int g_menu_x, g_menu_y;
+#define MENU_W       128
+#define MENU_ITEM_H  18
+#define MENU_PAD     3
+static const char *g_menu_items[] = { "Shell" };
+#define MENU_N ((int)(sizeof(g_menu_items) / sizeof(g_menu_items[0])))
+
+/* Painted by wm_run() after all windows (see wm_set_overlay), so it floats on
+ * top.  Screen-space (viewport reset to 0,0). */
+static void desktop_menu_overlay(void)
+{
+    if (!g_menu_vis) return;
+    extern void video_set_viewport(int, int);
+    extern void fill_rect(int, int, int, int, unsigned int);
+    extern void draw_rect(int, int, int, int, unsigned int);
+    extern void draw_string_at(int, int, const char *, unsigned int, unsigned int);
+    video_set_viewport(0, 0);
+    int h = MENU_N * MENU_ITEM_H + 2 * MENU_PAD;
+    fill_rect(g_menu_x, g_menu_y, MENU_W, h, 0xFF202830U);
+    draw_rect(g_menu_x, g_menu_y, MENU_W, h, 0xFFA0C0D0U);
+    for (int i = 0; i < MENU_N; i++)
+        draw_string_at(g_menu_x + 8, g_menu_y + MENU_PAD + i * MENU_ITEM_H,
+                       g_menu_items[i], 0xFFE8F0F8U, 0xFF202830U);
+}
+#endif
 
 /* Cursor handling modelled 1:1 on the working Pi 3 (xinu-raz) usbMouseInterrupt:
  * raw deltas (no scaling), centre on the first report, and CLAMP to the screen
@@ -402,6 +433,21 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
     if (g_cursor_y > sh - 1)  g_cursor_y = sh - 1;
 
     wm_set_autopan(0);
+
+    /* Edge-pan: the 720p scanout is smaller than the 1920x1080 virtual desktop,
+     * so push the cursor against a screen edge (while moving the mouse) to
+     * scroll the viewport and reveal the off-screen part of the desktop. */
+    {
+        extern void wm_scroll(int, int);
+        const int EDGE = 8, STEP = 22;
+        int pdx = 0, pdy = 0;
+        if      (g_cursor_x >= sw - 1 - EDGE) pdx =  STEP;
+        else if (g_cursor_x <= EDGE)          pdx = -STEP;
+        if      (g_cursor_y >= sh - 1 - EDGE) pdy =  STEP;
+        else if (g_cursor_y <= EDGE)          pdy = -STEP;
+        if (pdx || pdy) wm_scroll(pdx, pdy);
+    }
+
     wm_cursor_set(g_cursor_x, g_cursor_y, 1);
     /* Stamp the cursor straight onto HDMI now (we run at the ~100 Hz mouse-report
      * rate), so the pointer tracks the mouse even between the slow window flips.
@@ -420,14 +466,74 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
         int dpx = g_cursor_x + wm_view_x();   /* screen -> virtual-desktop coords */
         int dpy = g_cursor_y + wm_view_y();
 
-        if ((nButtons & 1u) && !(g_prev_btn & 1u)) {        /* press edge */
-            window_t *w = wm_focus_at(g_cursor_x, g_cursor_y);
-            if (w &&
-                dpx >= w->x + w->width  - RESIZE_GRIP && dpx < w->x + w->width &&
-                dpy >= w->y + w->height - RESIZE_GRIP && dpy < w->y + w->height) {
-                resize_win = w;                             /* bottom-right grip -> resize */
-            } else if (w && dpy >= w->y && dpy < w->y + WM_TITLEBAR_H) {
-                drag_win = w; drag_off_x = dpx - w->x; drag_off_y = dpy - w->y;
+        /* Right button press: pop up the desktop menu at the cursor. */
+        if ((nButtons & 2u) && !(g_prev_btn & 2u)) {
+            g_menu_vis = 1; g_menu_x = g_cursor_x; g_menu_y = g_cursor_y;
+        }
+
+        if ((nButtons & 1u) && !(g_prev_btn & 1u)) {        /* left press edge */
+            extern window_t softkbd_win;
+            extern char softkbd_hit(int, int);
+            extern void xhci_keyboard_event(char);
+            extern void shellwin_set_active(window_t *);
+            extern void shellwin_spawn(void);
+            extern void wm_request_full_redraw(void);
+
+            if (g_menu_vis) {
+                /* A left click while the menu is open selects an item (or
+                 * dismisses if it lands outside).  Never falls through to
+                 * window focus/drag. */
+                int mh = MENU_N * MENU_ITEM_H + 2 * MENU_PAD;
+                if (g_cursor_x >= g_menu_x && g_cursor_x < g_menu_x + MENU_W &&
+                    g_cursor_y >= g_menu_y && g_cursor_y < g_menu_y + mh) {
+                    int it = (g_cursor_y - g_menu_y - MENU_PAD) / MENU_ITEM_H;
+                    if (it == 0) shellwin_spawn();          /* "Shell" -> new window */
+                }
+                g_menu_vis = 0;
+                wm_request_full_redraw();                   /* erase the popup */
+            } else {
+                extern window_t *wm_window_at(int, int);
+                extern int  wm_close_hit(window_t *, int, int);
+                extern int  wm_is_shown(window_t *);
+                extern void wm_remove(window_t *);
+                extern struct window *wm_focused(void);
+
+                /* Close button (red 'x' at the title-bar left): remove the
+                 * topmost window under the cursor.  Checked before anything
+                 * else so it works on every window. */
+                window_t *top = wm_window_at(g_cursor_x, g_cursor_y);
+                int on_kbd = wm_is_shown(&softkbd_win) &&
+                             dpx >= softkbd_win.x && dpx < softkbd_win.x + softkbd_win.width &&
+                             dpy >= softkbd_win.y && dpy < softkbd_win.y + softkbd_win.height;
+
+                if (top && wm_close_hit(top, dpx, dpy)) {
+                    wm_remove(top);
+                    shellwin_set_active(wm_focused());      /* keep shell I/O sane */
+                } else if (on_kbd) {
+                    /* The soft keyboard never steals focus, so a key press is
+                     * delivered to the window that was last focused (e.g. the
+                     * Shell) via the normal keyboard path.  Its title bar still
+                     * drags (also without changing focus).  Skip the close-button
+                     * strip so the 'x' above is reachable. */
+                    if (dpy >= softkbd_win.y + WM_TITLEBAR_H) {
+                        char c = softkbd_hit(dpx, dpy);
+                        if (c) xhci_keyboard_event(c);
+                    } else {
+                        drag_win = &softkbd_win;
+                        drag_off_x = dpx - softkbd_win.x;
+                        drag_off_y = dpy - softkbd_win.y;
+                    }
+                } else {
+                    window_t *w = wm_focus_at(g_cursor_x, g_cursor_y);
+                    shellwin_set_active(w);                  /* shell -> route I/O here */
+                    if (w &&
+                        dpx >= w->x + w->width  - RESIZE_GRIP && dpx < w->x + w->width &&
+                        dpy >= w->y + w->height - RESIZE_GRIP && dpy < w->y + w->height) {
+                        resize_win = w;                     /* bottom-right grip -> resize */
+                    } else if (w && dpy >= w->y && dpy < w->y + WM_TITLEBAR_H) {
+                        drag_win = w; drag_off_x = dpx - w->x; drag_off_y = dpy - w->y;
+                    }
+                }
             }
         }
         if (!(nButtons & 1u)) { drag_win = 0; resize_win = 0; }   /* release ends both */
@@ -437,8 +543,12 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
             if (nw < 100) nw = 100;                         /* sensible minimums */
             if (nh < 48)  nh = 48;
             if (nw != resize_win->width || nh != resize_win->height) {
+                extern void wm_clear_bg_rect(int,int,int,int);
+                int ow = resize_win->width, oh = resize_win->height;
                 resize_win->width = nw; resize_win->height = nh;
-                wm_request_full_redraw();
+                /* clear the old (larger) footprint so a shrink leaves no trail */
+                wm_clear_bg_rect(resize_win->x, resize_win->y,
+                                 nw > ow ? nw : ow, nh > oh ? nh : oh);
             }
         } else if (drag_win) {                              /* dragging: follow cursor */
             int nx = dpx - drag_off_x, ny = dpy - drag_off_y;
@@ -447,8 +557,15 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
             if (nx > WM_DESKTOP_W - 60) nx = WM_DESKTOP_W - 60;
             if (ny > WM_DESKTOP_H - WM_TITLEBAR_H) ny = WM_DESKTOP_H - WM_TITLEBAR_H;
             if (nx != drag_win->x || ny != drag_win->y) {
+                extern void wm_clear_bg_rect(int,int,int,int);
+                /* erase only the union of the old and new footprints, not the
+                 * whole screen — keeps dragging smooth. */
+                int ox = drag_win->x, oy = drag_win->y;
+                int ux = ox < nx ? ox : nx, uy = oy < ny ? oy : ny;
+                int uw = (ox > nx ? ox : nx) + drag_win->width  - ux;
+                int uh = (oy > ny ? oy : ny) + drag_win->height - uy;
+                wm_clear_bg_rect(ux, uy, uw, uh);
                 drag_win->x = nx; drag_win->y = ny;
-                wm_request_full_redraw();                   /* clear the old position */
             }
         }
     }
@@ -1489,6 +1606,18 @@ void kernel_main(void)
     uart_puts("net: NIC up — unmasking DAIF.I (100 Hz RX drain live)\n");
     irq_enable_all();
 
+    /* Bring up the other 3 Cortex-A76 cores as compute workers (worker-pool
+     * SMP; see system/smp.c + include/smp.h).  Core 0 keeps running the whole
+     * single-core OS unchanged.  Safe if the cores never respond — they just
+     * stay offline and parallel jobs fall back to core 0.  Try /smp-bench. */
+    { extern void smp_init(void); extern int smp_cores_online(void);
+      extern void smp_run_boot_bench(long n);
+      smp_init();
+      uart_puts("smp: cores online = ");
+      uart_putc((char)('0' + smp_cores_online())); uart_puts("\n");
+      /* One-shot prime-count benchmark to serial: 1-core vs all-cores. */
+      smp_run_boot_bench(200000); }
+
     /* Pass our MAC to the responder so ARP replies carry the
      * right source MAC.  d8:3a:dd:a7:fd:bf — confirmed from
      * pre-reset UMAC read on this Pi 4. */
@@ -1685,6 +1814,8 @@ void kernel_main(void)
         shell_win.focused = 1;          /* shell selected by default so you can type at once */
         wm_add(&shell_win);
         wm_set_tick(serial_io_tick);   /* drain net + debug-UART layout/keys */
+        { extern void wm_set_overlay(void (*)(void));
+          wm_set_overlay(desktop_menu_overlay); }   /* right-click desktop menu */
 
         /* Soft keyboard window: bottom-left of the initial 640×480
          * viewport.  Half-size as the user requested. */

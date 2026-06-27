@@ -88,3 +88,36 @@ void mmu_init(void)
     __asm__ volatile ("msr sctlr_el1, %0" :: "r"(sctlr));
     __asm__ volatile ("isb");
 }
+
+/* Secondary-core MMU bring-up — called from smp_secondary_entry()
+ * (system/smp.c) on cores 1-3.  Reuses the page tables core 0 built in
+ * mmu_init(): just point this core's MAIR/TCR/TTBR0 at the same l0 root and
+ * enable the MMU (M=1).  Caches stay OFF exactly like core 0 (SCTLR.C/I left
+ * untouched) — that is what makes the lock-free worker-pool coherent: every
+ * access goes straight to RAM.  Does NOT rebuild the tables. */
+void mmu_enable_secondary(void)
+{
+    /* EL1 FP/SIMD access, same as mmu_init — avm/cc do double arithmetic that
+     * may run on a worker core via smp_parallel_sum. */
+    __asm__ volatile ("msr cpacr_el1, %0\n isb\n" :: "r"(3UL << 20) : "memory");
+
+    unsigned long mair = (0x00UL << 0) | (0xFFUL << 8);
+    unsigned long tcr =
+          (16UL <<  0)      /* T0SZ = 16 -> 48-bit VA                 */
+        | (1UL  <<  8)      /* IRGN0 = WBWA                           */
+        | (1UL  << 10)      /* ORGN0 = WBWA                           */
+        | (3UL  << 12)      /* SH0   = inner shareable                */
+        | (0UL  << 14)      /* TG0   = 4KB                            */
+        | (1UL  << 23)      /* EPD1  = 1 (no TTBR1 walks)             */
+        | (5UL  << 32);     /* IPS   = 48-bit                         */
+    __asm__ volatile ("msr mair_el1, %0"  :: "r"(mair));
+    __asm__ volatile ("msr tcr_el1,  %0"  :: "r"(tcr));
+    __asm__ volatile ("msr ttbr0_el1, %0" :: "r"((unsigned long)l0));
+    __asm__ volatile ("dsb sy\n tlbi vmalle1\n dsb sy\n isb\n");
+
+    unsigned long sctlr;
+    __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
+    sctlr |= 1UL;                          /* M = 1 (caches stay off) */
+    __asm__ volatile ("msr sctlr_el1, %0" :: "r"(sctlr));
+    __asm__ volatile ("isb");
+}

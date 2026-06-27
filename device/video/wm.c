@@ -16,7 +16,27 @@
 static window_t *wm_head;
 static int       s_force_wipe;          /* repaint the whole desktop next frame */
 void wm_request_full_redraw(void) { s_force_wipe = 1; }
+
+/* A single pending background-clear rectangle (virtual-desktop coords), applied
+ * once at the start of the next compose.  Used while dragging/resizing a window
+ * to erase its old footprint WITHOUT wiping the whole screen — far cheaper than
+ * s_force_wipe, so the drag stays smooth.  Successive requests union together
+ * so several mouse moves within one frame all get cleared. */
+static int s_clr_pending, s_clr_x0, s_clr_y0, s_clr_x1, s_clr_y1;
+void wm_clear_bg_rect(int x, int y, int w, int h)
+{
+    int x1 = x + w, y1 = y + h;
+    if (!s_clr_pending) { s_clr_x0 = x; s_clr_y0 = y; s_clr_x1 = x1; s_clr_y1 = y1; }
+    else {
+        if (x  < s_clr_x0) s_clr_x0 = x;
+        if (y  < s_clr_y0) s_clr_y0 = y;
+        if (x1 > s_clr_x1) s_clr_x1 = x1;
+        if (y1 > s_clr_y1) s_clr_y1 = y1;
+    }
+    s_clr_pending = 1;
+}
 static void    (*wm_tick)(void);
+static void    (*wm_overlay)(void);
 
 /* Cursor overlay state — repainted on top of all windows every
  * frame so it never disappears under another redraw.  Cursor
@@ -58,11 +78,21 @@ void wm_set_viewport(int x, int y) { vp_x = x; vp_y = y; }
 int  wm_view_x(void) { return vp_x; }
 int  wm_view_y(void) { return vp_y; }
 
+/* Scroll the viewport over the virtual desktop by (dx,dy).  Bounds are clamped
+ * by clamp_viewport() at the top of each frame, so out-of-range deltas are
+ * harmless.  Used by the mouse edge-pan in xhci_mouse_event(). */
+void wm_scroll(int dx, int dy) { vp_x += dx; vp_y += dy; }
+
 void wm_set_autopan(int on) { autopan_on = on ? 1 : 0; }
 
 void wm_set_tick(void (*fn)(void))
 {
     wm_tick = fn;
+}
+
+void wm_set_overlay(void (*fn)(void))
+{
+    wm_overlay = fn;
 }
 
 void wm_cursor_set(int x, int y, int visible)
@@ -186,6 +216,54 @@ window_t *wm_focus_at(int sx, int sy)
     return hit;
 }
 
+/* Topmost window under a screen-space point, WITHOUT changing focus/raise. */
+window_t *wm_window_at(int sx, int sy)
+{
+    int dx = sx + vp_x, dy = sy + vp_y;
+    window_t *hit = 0;
+    for (window_t *w = wm_head; w; w = w->next)
+        if (dx >= w->x && dx < w->x + w->width &&
+            dy >= w->y && dy < w->y + w->height)
+            hit = w;                           /* last == topmost in draw order */
+    return hit;
+}
+
+/* True if (vx,vy) — virtual-desktop coords — falls on `w`'s close button
+ * (the red 'x' square at the top-left of the title bar). */
+int wm_close_hit(window_t *w, int vx, int vy)
+{
+    if (!w) return 0;
+    int bx = w->x + 1, by = w->y + 1, bw = WM_TITLEBAR_H;
+    return vx >= bx && vx < bx + bw && vy >= by && vy < by + WM_TITLEBAR_H;
+}
+
+/* Is `w` currently in the window list (i.e. shown / interactive)? */
+int wm_is_shown(window_t *w)
+{
+    for (window_t *p = wm_head; p; p = p->next) if (p == w) return 1;
+    return 0;
+}
+
+/* Remove `w` from the window list (close it).  Focus passes to the new topmost
+ * window.  The caller should arrange any owner cleanup (e.g. shell instance). */
+void wm_remove(window_t *w)
+{
+    if (!w || !wm_head) return;
+    if (wm_head == w) wm_head = w->next;
+    else {
+        window_t *p = wm_head;
+        while (p->next && p->next != w) p = p->next;
+        if (p->next == w) p->next = w->next;
+    }
+    w->next = 0;
+    if (w->focused) {
+        w->focused = 0;
+        window_t *t = wm_head; while (t && t->next) t = t->next;   /* topmost */
+        if (t) t->focused = 1;
+    }
+    s_force_wipe = 1;        /* erase the closed window's pixels next frame */
+}
+
 static void draw_chrome(window_t *w)
 {
     /* Focused window gets a bright white border + lightened title bar. */
@@ -200,8 +278,17 @@ static void draw_chrome(window_t *w)
     /* title bar background (one pixel inside the border) */
     fill_rect(w->x + 1, w->y + 1, w->width - 2, WM_TITLEBAR_H, tbg);
 
-    /* title text — left-aligned with a 4 px gutter */
-    draw_string_at(w->x + 4, w->y + 2, w->title, w->title_fg, tbg);
+    /* close button: a red square with an 'x' at the top-left of the title bar.
+     * Clicking it removes the window (see wm_close_hit / wm_remove). */
+    {
+        int bx = w->x + 1, by = w->y + 1, bw = WM_TITLEBAR_H;
+        fill_rect(bx, by, bw, WM_TITLEBAR_H, 0xFFC83C2Cu);          /* red */
+        draw_string_at(bx + (bw - FONT_WIDTH) / 2, by + 2, "x",
+                       0xFFFFFFFFu, 0xFFC83C2Cu);
+    }
+
+    /* title text — to the right of the close button */
+    draw_string_at(w->x + WM_TITLEBAR_H + 5, w->y + 2, w->title, w->title_fg, tbg);
 
     /* separator under the title */
     fill_rect(w->x + 1, w->y + WM_TITLEBAR_H + 1,
@@ -329,11 +416,19 @@ void wm_run(void)
         if (vp_x != s_last_vp_x || vp_y != s_last_vp_y || s_force_wipe) {
             fill_rect(0, 0, sw, sh, DESKTOP_BG);
             s_last_vp_x = vp_x; s_last_vp_y = vp_y; s_force_wipe = 0;
+            s_clr_pending = 0;                       /* full wipe subsumes it */
         }
 
         /* Now switch to the panned camera and draw all windows in
          * virtual desktop coordinates. */
         video_set_viewport(vp_x, vp_y);
+
+        /* Erase just the dragged window's old footprint (virtual coords) before
+         * the windows repaint — cheap alternative to a full-screen wipe. */
+        if (s_clr_pending) {
+            fill_rect(s_clr_x0, s_clr_y0, s_clr_x1 - s_clr_x0, s_clr_y1 - s_clr_y0, DESKTOP_BG);
+            s_clr_pending = 0;
+        }
         for (window_t *w = wm_head; w; w = w->next) {
             draw_chrome(w);
             if (w->draw_content) w->draw_content(w, frame);
@@ -343,6 +438,9 @@ void wm_run(void)
         video_set_viewport(0, 0);
         draw_wifi_icon(sw, sh);
 
+        /* Transient overlay (e.g. the right-click desktop menu) on top of all. */
+        if (wm_overlay) wm_overlay();
+
         /* Cursor is NOT baked into the back buffer (no draw_cursor here): flip
          * the composed frame keeping the live cursor rect intact, then stamp the
          * cursor straight onto HDMI several times before the next slow flip so it
@@ -350,7 +448,8 @@ void wm_run(void)
         (void)draw_cursor; (void)CURSOR_SUBFRAMES; (void)CURSOR_SUBMS;  /* retained */
         video_present_hole();                    /* flip, keeping the live cursor */
         video_cursor_to_front(cursor_x, cursor_y, cursor_visible);  /* re-stamp after flip */
-        delay_ms(2);   /* the (slow) flip already paces the loop; don't add idle */
+        /* No idle delay: the parallel 720p flip already paces the loop, so run
+         * frames back-to-back for the lowest input-echo / drag latency. */
         frame++;
     }
 }

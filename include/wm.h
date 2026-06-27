@@ -35,6 +35,8 @@ typedef struct window {
     void        (*draw_content)(struct window *self, unsigned int frame);
 
     int           focused;        /* 1 = currently selected window (bright chrome) */
+    int           tag;            /* free for the owner — shellwin uses it as the
+                                   * shell-instance index (0 = the first shell). */
     struct window *next;          /* internal — set by wm_add() */
 } window_t;
 
@@ -46,9 +48,31 @@ struct window *wm_focus_at(int screen_x, int screen_y);
 /* The window currently focused via wm_focus_at(), or NULL. */
 struct window *wm_focused(void);
 
+/* Topmost window under a screen-space point, without focusing/raising it. */
+struct window *wm_window_at(int screen_x, int screen_y);
+
+/* True if virtual-desktop point (vx,vy) hits `w`'s title-bar close button. */
+int wm_close_hit(struct window *w, int vx, int vy);
+
+/* True if `w` is currently in the window list (shown / interactive). */
+int wm_is_shown(struct window *w);
+
+/* Close (remove) `w` from the window list; focus passes to the new topmost. */
+void wm_remove(struct window *w);
+
 /* Force a full desktop repaint on the next frame (call after moving a window so
  * its old position doesn't leave a trail now that the per-frame wipe is skipped). */
 void wm_request_full_redraw(void);
+
+/* Queue a background-clear of one virtual-desktop rectangle for the next frame
+ * (unions with any already queued).  Cheaper than wm_request_full_redraw() —
+ * used while dragging/resizing to erase a window's old footprint without
+ * wiping the whole screen, keeping the drag smooth. */
+void wm_clear_bg_rect(int x, int y, int w, int h);
+
+/* Scroll the viewport over the (larger) virtual desktop by (dx,dy) pixels.
+ * Clamped to the desktop bounds each frame.  Driven by the mouse edge-pan. */
+void wm_scroll(int dx, int dy);
 
 /* Push `w` onto the global window list (it will be redrawn after
  * everything previously added, so later windows are "on top" in
@@ -71,6 +95,12 @@ void wm_run(void);
  * iteration, before window repainting.  Used by shellwin to drive
  * the non-blocking REPL on each frame.  Pass NULL to detach. */
 void wm_set_tick(void (*fn)(void));
+
+/* Register a function called once per frame AFTER every window (and the WiFi
+ * icon) is drawn but BEFORE the frame is flipped — i.e. it paints on top of
+ * everything.  Used for transient overlays like the right-click desktop menu.
+ * Pass NULL to detach. */
+void wm_set_overlay(void (*fn)(void));
 
 /* Move / hide the on-screen mouse cursor overlay.  Painted by
  * wm_run() after all windows so it stays on top.  Visible=0 hides

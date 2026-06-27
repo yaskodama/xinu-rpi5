@@ -57,12 +57,30 @@ _start:
 
 _real_start:
     // ---- (1) pin secondary cores ---------------------------------
+    // Core id: DynamIQ (Pi 5 A76) sets MPIDR.MT=1 with the core in Aff1
+    // (bits 15:8 — cpu@c reg = 0x100*c); a plain cluster (Pi 4 A72) has
+    // MT=0 with the core in Aff0 (bits 7:0).  Pick the right field.
     mrs     x1, mpidr_el1
+    tst     x1, #(1 << 24)          // MPIDR.MT?
+    lsr     x9, x1, #8
+    and     x9, x9, #0xff           // Aff1
+    and     x1, x1, #0xff           // Aff0
+    csel    x1, x9, x1, ne          // MT -> Aff1, else Aff0
     and     x1, x1, #3
     cbz     x1, 2f
 
-1:  wfe
-    b       1b
+    // ---- secondary cores (1-3): wait for core 0 to publish a start
+    //      address in smp_release[core] (set by smp_init), then converge
+    //      on _smp_start.  On Pi 5 the firmware armstub usually holds cores
+    //      1-3 in its spin-table (phys 0xe0/0xe8/0xf0) so they never reach
+    //      here; smp_init() also writes that mailbox, jumping them straight
+    //      to _smp_start.  Either path converges on _smp_start.
+.Lsmp_park:
+    wfe
+    ldr     x2, =smp_release
+    ldr     x3, [x2, x1, lsl #3]
+    cbz     x3, .Lsmp_park
+    b       _smp_start
 
     // ---- (1b) drop EL2 -> EL1 if firmware left us at EL2 --------
     //
@@ -121,7 +139,54 @@ el1_entry:
 
     // ---- (5) jump to C ------------------------------------------
     bl      kernel_main
-    b       1b
+.Lprimary_halt:
+    wfe
+    b       .Lprimary_halt
+
+// ============================================================
+// _smp_start — a released secondary core (1-3) lands here, from either
+// .Lsmp_park (this image parked it) or the firmware spin-table mailbox
+// (smp_init wrote _smp_start's address there).  Drop EL2->EL1 like the
+// primary, set a per-core stack, and enter the C worker entry.
+// ============================================================
+.global _smp_start
+_smp_start:
+    // Core id from MPIDR — Aff1 on DynamIQ (Pi 5), Aff0 on a plain cluster.
+    mrs     x20, mpidr_el1
+    tst     x20, #(1 << 24)         // MPIDR.MT?
+    lsr     x21, x20, #8
+    and     x21, x21, #0xff         // Aff1
+    and     x20, x20, #0xff         // Aff0
+    csel    x20, x21, x20, ne       // MT -> Aff1, else Aff0
+    and     x20, x20, #3
+    mrs     x0, CurrentEL
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    b.ne    .Lsmp_el1                // already EL1 (e.g. QEMU)
+    mrs     x0, hcr_el2
+    orr     x0, x0, #(1 << 31)       // HCR_EL2.RW = 1: EL1 is AArch64
+    msr     hcr_el2, x0
+    mrs     x0, cnthctl_el2
+    orr     x0, x0, #3
+    msr     cnthctl_el2, x0
+    msr     cntvoff_el2, xzr
+    mov     x0, #0x0800              // SCTLR_EL1 sane reset (MMU/caches off)
+    movk    x0, #0x30d0, lsl #16
+    msr     sctlr_el1, x0
+    mov     x0, #0x3c5               // SPSR_EL2: EL1h, DAIF masked
+    msr     spsr_el2, x0
+    adr     x0, .Lsmp_el1
+    msr     elr_el2, x0
+    eret
+.Lsmp_el1:
+    ldr     x2, =smp_stacktop
+    ldr     x4, [x2, x20, lsl #3]    // per-core stack top
+    mov     sp, x4
+    mov     x0, x20                  // arg0 = core id
+    bl      smp_secondary_entry
+.Lsmp_dead:
+    wfe
+    b       .Lsmp_dead
 
 // .data so we don't get wiped by the BSS-clear loop.  Initialised
 // to zero — boot.S writes the real value after BSS clear.
@@ -129,3 +194,14 @@ el1_entry:
 .align 3
 dtb_addr:
     .quad   0
+
+// SMP handoff tables (in .data so they read as 0 from image load, before
+// core 0 clears .bss — a secondary polling smp_release must never observe a
+// stale non-zero entry).  Indexed by MPIDR_EL1[1:0]; entry 0 (core 0) unused.
+.global smp_release
+.global smp_stacktop
+.align 3
+smp_release:
+    .quad   0, 0, 0, 0
+smp_stacktop:
+    .quad   0, 0, 0, 0

@@ -119,3 +119,94 @@ void softkbd_draw(window_t *self, unsigned int frame)
         }
     }
 }
+
+/* ---- click → character dispatch (interactivity) ---- */
+
+static int g_kb_shift = 0;     /* one-shot Shift (cleared after the next char) */
+static int g_kb_caps  = 0;     /* Caps Lock toggle */
+
+static int kb_slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
+static int kb_seq(const char *a, const char *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+/* US-QWERTY shifted symbol for the number / punctuation keys. */
+static char kb_shift_symbol(char c)
+{
+    switch (c) {
+        case '`': return '~';  case '1': return '!';  case '2': return '@';
+        case '3': return '#';  case '4': return '$';  case '5': return '%';
+        case '6': return '^';  case '7': return '&';  case '8': return '*';
+        case '9': return '(';  case '0': return ')';  case '-': return '_';
+        case '=': return '+';  case '[': return '{';  case ']': return '}';
+        case ';': return ':';  case '\'': return '"'; case ',': return '<';
+        case '.': return '>';  case '/': return '?';
+        default:  return c;
+    }
+}
+
+/* Map a key label to the character it emits, applying + updating shift/caps. */
+static char kb_key_char(const char *lbl)
+{
+    if (kb_slen(lbl) == 1) {
+        char c = lbl[0];
+        if (c >= 'a' && c <= 'z') {
+            int upper = g_kb_shift ^ g_kb_caps;   /* XOR: Caps + Shift -> lower */
+            g_kb_shift = 0;
+            return upper ? (char)(c - 32) : c;
+        }
+        char r = g_kb_shift ? kb_shift_symbol(c) : c;
+        g_kb_shift = 0;
+        return r;
+    }
+    if (kb_seq(lbl, "Bksp"))  { g_kb_shift = 0; return 0x08; }
+    if (kb_seq(lbl, "Tab"))   { g_kb_shift = 0; return '\t'; }
+    if (kb_seq(lbl, "Ret"))   { g_kb_shift = 0; return '\r'; }
+    if (kb_seq(lbl, "Space")) { g_kb_shift = 0; return ' ';  }
+    if (kb_seq(lbl, "Shift")) { g_kb_shift = !g_kb_shift;     return 0; }
+    if (kb_seq(lbl, "Caps"))  { g_kb_caps  = !g_kb_caps;      return 0; }
+    return 0;   /* Ctrl / Alt: no-op for now */
+}
+
+char softkbd_hit(int sx, int sy)
+{
+    window_t *self = &softkbd_win;
+
+    /* Recompute the exact grid geometry softkbd_draw() used. */
+    int cx0 = self->x + 4;
+    int cy0 = self->y + WM_TITLEBAR_H + 4;
+    int cw  = self->width  - 8;
+    int ch  = self->height - WM_TITLEBAR_H - 7;
+
+    int row_count = 5;
+    if (ch < row_count * 12) return 0;
+    int row_h = ch / row_count;
+    int row_pad = 2;
+    int cell_h = row_h - row_pad;
+
+    int max_units = 0;
+    for (int r = 0; r < row_count; r++) {
+        int n = row_unit_count(rows[r]);
+        if (n > max_units) max_units = n;
+    }
+    if (max_units == 0) return 0;
+    int unit_w = cw / max_units;
+    if (unit_w < 8) unit_w = 8;
+
+    for (int r = 0; r < row_count; r++) {
+        int n_units = row_unit_count(rows[r]);
+        int row_w = n_units * unit_w;
+        int x = cx0 + (cw - row_w) / 2;
+        int y = cy0 + r * row_h;
+        if (sy < y || sy >= y + cell_h) continue;       /* not this row */
+        for (const key_t *k = rows[r]; k->label; k++) {
+            int kw = (k->w ? k->w : 1) * unit_w;
+            int pad = 2;
+            if (sx >= x + pad && sx < x + kw - pad) return kb_key_char(k->label);
+            x += kw;
+        }
+    }
+    return 0;
+}

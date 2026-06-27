@@ -389,6 +389,39 @@ static int path_eq(const char *req, const char *lit)
     return *lit == 0 && (*p == ' ' || *p == '?');
 }
 
+/* ---- SMP worker pool (system/smp.c) ---- */
+extern int  smp_cores_online(void);
+typedef long (*smp_range_fn)(long lo, long hi, int core);
+extern long smp_parallel_sum(smp_range_fn fn, long n, int ncores);
+
+/* Free-running counter in milliseconds (CNTPCT_EL0 / CNTFRQ_EL0 * 1000). */
+static unsigned long now_ms(void)
+{
+    unsigned long ct, hz;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
+    if (!hz) return 0;
+    return (ct * 1000UL) / hz;
+}
+
+/* SMP benchmark kernel: count primes in [lo,hi) by trial division.  Pure
+ * integer compute (mul/mod in registers) so it scales with CPU cores, not
+ * memory bandwidth (the D-cache is off — see mmu.c).  Matches smp_range_fn. */
+static long bench_count_primes(long lo, long hi, int core)
+{
+    (void)core;
+    if (lo < 2) lo = 2;
+    long cnt = 0;
+    for (long n = lo; n < hi; n++) {
+        int prime = 1;
+        for (long d = 2; d * d <= n; d++) {
+            if (n % d == 0) { prime = 0; break; }
+        }
+        cnt += prime;
+    }
+    return cnt;
+}
+
 /* Build the HTTP response for NUL-terminated request `req` into `out`
  * (capacity `max`).  Returns the byte length. */
 static int http_build(const char *req, char *out, int max)
@@ -978,9 +1011,38 @@ static int http_build(const char *req, char *out, int max)
               " /wifi-trace?off=N   /wifi-pinmux?fsel=N   /wifi-bulk?kb&hz   /wifi-win?w\n"
               " /wifi-scan   /wifi-join?ssid&pass   /wifi-dhcp   /wifi-ping?ip&n\n");
         }
+    } else if (path_eq(req, "/smp-bench")) {
+        /* SMP benchmark: count primes in [0,n) on 1 core, then on all online
+         * cores, and report wall-clock times + speedup.  The two counts MUST
+         * match (correctness check).  Query: ?n=<upper bound> (default 300000).
+         *   curl 'http://192.168.3.101/smp-bench?n=300000' */
+        ctype = "text/plain";
+        long n = (long)q_int(req, "n", 300000);
+        if (n < 1) n = 1;
+        int online = smp_cores_online();
+
+        unsigned long t0 = now_ms();
+        long c1 = smp_parallel_sum(bench_count_primes, n, 1);
+        unsigned long t1 = now_ms();
+        long cN = smp_parallel_sum(bench_count_primes, n, online);
+        unsigned long t2 = now_ms();
+
+        unsigned long ms1 = t1 - t0;
+        unsigned long msN = t2 - t1;
+        bl = s_put(body, bl, "SMP prime-count benchmark\n");
+        bl = s_put(body, bl, "cores_online = "); bl = s_putdec(body, bl, (long)online); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "n            = "); bl = s_putdec(body, bl, n); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "primes       = "); bl = s_putdec(body, bl, c1);
+        bl = s_put(body, bl, (c1 == cN) ? " (match)\n" : " MISMATCH!\n");
+        bl = s_put(body, bl, "1-core   ms  = "); bl = s_putdec(body, bl, (long)ms1); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "N-core   ms  = "); bl = s_putdec(body, bl, (long)msN); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "speedup x100 = ");
+        bl = s_putdec(body, bl, msN ? (long)((ms1 * 100UL) / msN) : 0);
+        bl = s_put(body, bl, "  (e.g. 385 = 3.85x)\n");
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";
         bl = s_put(body, bl, "xinu-rpi5 (Pi 5) actor HTTP gateway\n"
+                             "GET /smp-bench?n=<N>  (4-core prime-count benchmark)\n"
                              "GET /api/actors\n"
                              "GET /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n"
                              "POST /cc  (C source in body) -> JIT compile & run\n"

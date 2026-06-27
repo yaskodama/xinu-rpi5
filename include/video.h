@@ -13,8 +13,10 @@
 #ifndef XINU_RPI5_VIDEO_H
 #define XINU_RPI5_VIDEO_H
 
-/* Default HDMI mode 1920x1080.  Overridable from the Makefile (-DSCREEN_WIDTH=...)
- * — the "OS #3" variant (pi5-os3) builds video.o at 1280x720, one rank lower. */
+/* HDMI scanout mode 1920x1080 — full screen.  The window manager's virtual
+ * desktop (WM_DESKTOP_W x WM_DESKTOP_H in wm.h) is the same 1920x1080, so the
+ * viewport never has anywhere to pan: the whole desktop is on screen at once
+ * (no scrolling).  Overridable from the Makefile. */
 #ifndef SCREEN_WIDTH
 #define SCREEN_WIDTH    1920
 #endif

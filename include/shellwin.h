@@ -55,4 +55,9 @@ void shellwin_handle_key(char c);
  * loader/main.c.  draw_content already points at shellwin_draw. */
 extern window_t shell_win;
 
+/* Multi-instance support (right-click desktop menu → "Shell"). */
+int  shellwin_is_shell(window_t *w);   /* is `w` a shell-console window? */
+void shellwin_set_active(window_t *w); /* route uart capture + keys to w's shell */
+void shellwin_spawn(void);             /* open an additional shell window */
+
 #endif /* XINU_RPI5_SHELLWIN_H */
