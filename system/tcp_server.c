@@ -422,8 +422,92 @@ static long bench_count_primes(long lo, long hi, int core)
     return cnt;
 }
 
+/* ---- N-Queens (SMP): count solutions with the first queen pinned to each
+ * column in [lo,hi).  Summing over all n columns gives the full count, so the
+ * 1-core and N-core runs MUST agree (correctness check).  g_nq_n holds the
+ * board size, set by the /bench route before dispatch.  Bitmask backtracking,
+ * pure integer compute → scales with cores (D-cache is off). */
+static int g_nq_n = 13;
+static long nq_solve(int row, unsigned cols, unsigned d1, unsigned d2, unsigned all)
+{
+    (void)row;
+    if (cols == all) return 1;
+    long count = 0;
+    unsigned avail = ~(cols | d1 | d2) & all;
+    while (avail) {
+        unsigned bit = avail & (unsigned)(-(long)avail);   /* lowest set bit */
+        avail -= bit;
+        count += nq_solve(row + 1, cols | bit, (d1 | bit) << 1, (d2 | bit) >> 1, all);
+    }
+    return count;
+}
+static long bench_nqueens(long lo, long hi, int core)
+{
+    (void)core;
+    int n = g_nq_n;
+    unsigned all = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    long total = 0;
+    for (long c = lo; c < hi && c < n; c++) {
+        unsigned bit = 1u << c;
+        total += nq_solve(1, bit, bit << 1, bit >> 1, all);
+    }
+    return total;
+}
+
+/* ---- Dining Philosophers (SMP): run independent dining tables in [lo,hi).
+ * Each table = g_din_n philosophers doing DIN_ROUNDS deadlock-free meal cycles
+ * (Dijkstra resource hierarchy: acquire the lower-numbered fork first), with a
+ * little per-meal compute so wall-time is meaningful.  Tables are independent,
+ * so splitting them across cores is an honest throughput speedup.  1-core and
+ * N-core run the same total table count → meal totals MUST agree.  Returns the
+ * total number of meals eaten across [lo,hi). */
+#define DIN_ROUNDS 24
+static int g_din_n = 5;
+static volatile unsigned g_din_sink = 0;
+static long bench_dining(long lo, long hi, int core)
+{
+    (void)core;
+    int np = g_din_n;
+    long meals = 0;
+    unsigned acc = (unsigned)lo * 2654435761u;
+    for (long t = lo; t < hi; t++) {
+        for (int round = 0; round < DIN_ROUNDS; round++) {
+            for (int p = 0; p < np; p++) {
+                int l = p, r = (p + 1) % np;
+                int fa = (l < r) ? l : r;          /* lower-numbered fork first */
+                int fb = (l < r) ? r : l;
+                acc = acc * 1103515245u + 12345u + (unsigned)(fa * 131 + fb);
+                meals++;
+            }
+        }
+    }
+    g_din_sink ^= acc;
+    return meals;
+}
+
 /* Build the HTTP response for NUL-terminated request `req` into `out`
  * (capacity `max`).  Returns the byte length. */
+/* ---- /wifi-adhoc : join the WiFi ad-hoc (IBSS) mesh, keep Ethernet ----
+ * The Mesh Control Center hits GET /wifi-adhoc?ssid=NAME&ch=N&n=M to put this
+ * board on the 10.0.0.M MANET cell.  WiFi bring-up blocks the (single) main
+ * loop for ~1 min, so we DON'T run it inside the request — we stash the params
+ * and let the main-loop poller (wifi_adhoc_poll_pending, called from
+ * serial_io_tick) run it once, AFTER this response is flushed.  keep_eth=1
+ * keeps the HTTP gateway + /fb mirror on Ethernet while WiFi joins the mesh. */
+static volatile int  g_adhoc_pending = 0;
+static char          g_adhoc_ssid[40];
+static int           g_adhoc_ch = 6, g_adhoc_n = 0;
+
+void wifi_adhoc_poll_pending(void)
+{
+    if (!g_adhoc_pending) return;
+    g_adhoc_pending = 0;
+    extern int wifi_adhoc_keep_eth;
+    extern int wifi_adhoc(const char *ssid, int channel, int n);
+    wifi_adhoc_keep_eth = 1;                 /* stay on Ethernet (mesh+mirror) */
+    wifi_adhoc(g_adhoc_ssid, g_adhoc_ch, g_adhoc_n);
+}
+
 static int http_build(const char *req, char *out, int max)
 {
     char body[640];
@@ -433,6 +517,120 @@ static int http_build(const char *req, char *out, int max)
 
     char rpath[300];
     http_path(req, rpath, sizeof rpath);          /* request path, for /fs/* */
+
+    if (path_eq(req, "/wifi-adhoc")) {
+        char sb[40];
+        if (!q_param(req, "ssid", sb, sizeof sb) || !sb[0]) {
+            sb[0]='M'; sb[1]='A'; sb[2]='N'; sb[3]='E'; sb[4]='T'; sb[5]=0;
+        }
+        int ch = q_int(req, "ch", 6);
+        int nn = q_int(req, "n", 0);
+        int i = 0; for (; sb[i] && i < (int)sizeof(g_adhoc_ssid)-1; i++) g_adhoc_ssid[i] = sb[i];
+        g_adhoc_ssid[i] = 0;
+        g_adhoc_ch = ch; g_adhoc_n = nn;
+        g_adhoc_pending = 1;                 /* main loop runs the join shortly */
+
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "adhoc queued ssid=");
+        p = s_put(out, p, g_adhoc_ssid);
+        p = s_put(out, p, " ch=");      p = s_putdec(out, p, ch);
+        p = s_put(out, p, " ip=10.0.0."); p = s_putdec(out, p, nn);
+        p = s_put(out, p, " (gateway stays on ethernet; wifi joins mesh in ~1 min)\n");
+        return p;
+    }
+
+    if (path_eq(req, "/avm-par")) {
+        /* Toggle/inspect the multi-core actor scheduler at runtime (no reflash).
+         *   GET /avm-par           -> report state + diag counters
+         *   GET /avm-par?on=1|0    -> enable/disable parallel dispatch */
+        extern void avm_set_par(int on);
+        extern int  avm_get_par(void), avm_get_par_nbatch(void), avm_get_par_lastbn(void);
+        extern int  smp_cores_online(void);
+        int on = q_int(req, "on", -1);       /* absent -> -1 -> leave unchanged */
+        if (on >= 0) avm_set_par(on);
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "avm-par enable=");  p = s_putdec(out, p, avm_get_par());
+        p = s_put(out, p, " cores_online="); p = s_putdec(out, p, smp_cores_online());
+        p = s_put(out, p, " nbatch=");       p = s_putdec(out, p, avm_get_par_nbatch());
+        p = s_put(out, p, " lastbn=");       p = s_putdec(out, p, avm_get_par_lastbn());
+        p = s_put(out, p, "\n");
+        return p;
+    }
+
+    /* ---- /fb : remote screen mirror ------------------------------------
+     * This minimal TCP stack sends a response in ONE segment (<=~1464 B), so
+     * the 1280x720 framebuffer can't go in one reply.  Instead serve a small
+     * RGB565 thumbnail in chunks the browser stitches back together:
+     *   GET /fb[?w=W]          -> "DW DH SRCW SRCH"  (text dims)
+     *   GET /fb?off=N[&w=W]    -> up to 1024 bytes of the thumbnail's RGB565
+     *                            pixel stream starting at byte offset N
+     * Self-contained: builds the WHOLE response into `out` (with a CORS
+     * header) and returns here, so the aice-avm desktop page served from the
+     * Mac can fetch it cross-origin and mirror the Pi 5 HDMI in a window. */
+    if (path_eq(req, "/fb")) {
+        extern const volatile unsigned char *video_fb_base(void);
+        extern unsigned int video_fb_pitch(void);
+        extern unsigned int video_screen_width(void), video_screen_height(void);
+
+        unsigned srcw = video_screen_width(), srch = video_screen_height();
+        const volatile unsigned char *fb = video_fb_base();
+        unsigned pitch = video_fb_pitch();
+
+        int dw = q_int(req, "w", 160);
+        if (dw < 16)  dw = 16;
+        if (dw > 480) dw = 480;
+        int dh = (srcw && srch) ? (int)((unsigned)dw * srch / srcw) : (dw * 3 / 4);
+        if (dh < 1) dh = 1;
+
+        char offbuf[12];
+        int has_off = q_param(req, "off", offbuf, sizeof offbuf);
+
+        static char fbody[1100];
+        int fl = 0;
+        const char *fbctype;
+        if (!has_off) {                              /* /fb or /fb?w= -> dims */
+            fbctype = "text/plain";
+            fl = s_putdec(fbody, fl, dw);          fl = s_put(fbody, fl, " ");
+            fl = s_putdec(fbody, fl, dh);          fl = s_put(fbody, fl, " ");
+            fl = s_putdec(fbody, fl, (long)srcw);  fl = s_put(fbody, fl, " ");
+            fl = s_putdec(fbody, fl, (long)srch);  fl = s_put(fbody, fl, "\n");
+        } else {                                     /* /fb?off=N -> RGB565 chunk */
+            fbctype = "application/octet-stream";
+            int total = dw * dh * 2;
+            int off = q_int(req, "off", 0);
+            if (off < 0) off = 0;
+            if (off & 1) off++;
+            int chunk = 1024;
+            if (off + chunk > total) chunk = total - off;
+            if (chunk < 0) chunk = 0;
+            if (fb && pitch) {
+                int p0 = off / 2, np = chunk / 2;
+                for (int i = 0; i < np; i++) {
+                    int pi = p0 + i, ox = pi % dw, oy = pi / dw;
+                    unsigned sx = (unsigned)ox * srcw / (unsigned)dw;
+                    unsigned sy = (unsigned)oy * srch / (unsigned)dh;
+                    unsigned px = *(const volatile unsigned int *)(fb + sy * pitch + sx * 4);
+                    unsigned r = (px >> 16) & 0xFF, g = (px >> 8) & 0xFF, b = px & 0xFF;
+                    unsigned v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                    fbody[fl++] = (char)(v & 0xFF);
+                    fbody[fl++] = (char)((v >> 8) & 0xFF);
+                }
+            }
+        }
+
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: ");
+        p = s_put(out, p, fbctype);
+        p = s_put(out, p, "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: ");
+        p = s_putdec(out, p, fl);
+        p = s_put(out, p, "\r\n\r\n");
+        for (int i = 0; i < fl; i++) out[p++] = fbody[i];
+        return p;
+    }
 
     if (path_eq(req, "/send")) {
         int  to  = q_int(req, "to", -1);
@@ -449,6 +647,65 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, method);
         bl = s_put(body, bl, "\",\"result\":");
         bl = s_putdec(body, bl, result);
+        bl = s_put(body, bl, "}\n");
+    } else if (path_eq(req, "/basic/run")) {
+        /* Queue a BASIC direct command for the on-screen BASIC window, e.g.
+         *   GET /basic/run?line=rescue
+         * It runs from the wm tick (not here), so this returns immediately and
+         * a long RUN does not wedge the HTTP server. */
+        extern void basicwin_post_line(const char *);
+        extern int  basicwin_running(void);
+        char line[80];
+        if (!q_param(req, "line", line, sizeof line)) line[0] = 0;
+        /* URL-decode in place: %XX -> byte, '+' -> space.  Lets a command with
+         * spaces/quotes survive q_param (which stops at a raw space), e.g.
+         *   /basic/run?line=RUN%20%22rescue%22   ->   RUN "rescue" */
+        {
+            char *s = line, *d = line;
+            while (*s) {
+                if (*s == '%' && s[1] && s[2]) {
+                    int hi = s[1], lo = s[2];
+                    hi = (hi<='9')?hi-'0':((hi|0x20)-'a'+10);
+                    lo = (lo<='9')?lo-'0':((lo|0x20)-'a'+10);
+                    if (hi>=0 && hi<16 && lo>=0 && lo<16) { *d++ = (char)((hi<<4)|lo); s += 3; continue; }
+                }
+                *d++ = (*s == '+') ? ' ' : *s;
+                s++;
+            }
+            *d = 0;
+        }
+        if (line[0]) basicwin_post_line(line);
+        bl = s_put(body, bl, "{\"ok\":");
+        bl = s_putdec(body, bl, line[0] ? 1 : 0);
+        bl = s_put(body, bl, ",\"queued\":\"");
+        bl = s_put(body, bl, line);
+        bl = s_put(body, bl, "\",\"running\":");
+        bl = s_putdec(body, bl, basicwin_running());
+        bl = s_put(body, bl, "}\n");
+    } else if (path_eq(req, "/basic/key")) {
+        /* Inject a key into the BASIC window, e.g. GET /basic/key?c=3 (Ctrl-C).
+         * Delivered even mid-RUN: the 100 Hz timer IRQ runs this handler. */
+        extern void basicwin_inject_key(char);
+        extern int  basicwin_running(void);
+        int c = q_int(req, "c", 0);
+        if (c) basicwin_inject_key((char)c);
+        bl = s_put(body, bl, "{\"ok\":1,\"sent\":");
+        bl = s_putdec(body, bl, c);
+        bl = s_put(body, bl, ",\"running\":");
+        bl = s_putdec(body, bl, basicwin_running());
+        bl = s_put(body, bl, "}\n");
+    } else if (path_eq(req, "/basic/break")) {
+        /* Convenience: same as /basic/key?c=3 — request a Ctrl-C break. */
+        extern void basicwin_inject_key(char);
+        extern int  basicwin_running(void);
+        basicwin_inject_key((char)0x03);
+        bl = s_put(body, bl, "{\"ok\":1,\"running\":");
+        bl = s_putdec(body, bl, basicwin_running());
+        bl = s_put(body, bl, "}\n");
+    } else if (path_eq(req, "/basic/state")) {
+        extern int basicwin_running(void);
+        bl = s_put(body, bl, "{\"running\":");
+        bl = s_putdec(body, bl, basicwin_running());
         bl = s_put(body, bl, "}\n");
     } else if (path_eq(req, "/api/load")) {
         /* Node load metric for the mesh load-balancer's placement policy:
@@ -557,6 +814,43 @@ static int http_build(const char *req, char *out, int max)
             int rc = cc_run_source(bodyp, srclen, ccout, (int)sizeof ccout, &rv);
             bl = s_put(body, bl, ccout);
             if (rc == 0) { bl = s_put(body, bl, "=> "); bl = s_putdec(body, bl, rv); bl = s_put(body, bl, "\n"); }
+        }
+    } else if (str_starts(rpath, "/actor/loadvm")) {
+        /* Upload an AIPL .avm actor module and run it in the kernel AVM VM (the
+         * "Blender" polygon display).  Checked BEFORE /actor/load (which would
+         * prefix-match "loadvm").  Chunked (g_req is 16 KB, so keep chunks
+         * <= ~12 KB):
+         *   POST /actor/loadvm?off=<byte>   body = a chunk of the .avm
+         *   GET  /actor/loadvm?go=1&len=<N>  load + spawn + run -> VM gfx window */
+        extern void avm_stage_reset(void);
+        extern int  avm_stage_put(int, const unsigned char *, int);
+        extern void avm_load_progress(int, int);
+        extern int  avm_loadrun(int);
+        ctype = "text/plain";
+        if (req[0] == 'P') {                       /* POST a chunk */
+            int off = q_int(req, "off", -1);
+            int cl  = content_length(req);
+            int tot = q_int(req, "total", 0);      /* for the on-screen bar */
+            const char *bp = http_body(req);
+            if (off == 0) avm_stage_reset();       /* new upload */
+            if (off >= 0 && cl > 0 && bp) {
+                int rc = avm_stage_put(off, (const unsigned char *)bp, cl);
+                avm_load_progress(off + cl, tot);
+                bl = s_put(body, bl, rc == 0 ? "ok off=" : "ERR off=");
+                bl = s_putdec(body, bl, off);
+                bl = s_put(body, bl, " n="); bl = s_putdec(body, bl, cl);
+                bl = s_put(body, bl, "\n");
+            } else {
+                bl = s_put(body, bl, "usage: POST /actor/loadvm?off=<byte> body=<chunk>\n");
+            }
+        } else if (q_int(req, "go", 0)) {          /* GET ?go=1&len=N -> run */
+            int len = q_int(req, "len", 0);
+            int id  = avm_loadrun(len);
+            bl = s_put(body, bl, "loadvm: len="); bl = s_putdec(body, bl, len);
+            bl = s_put(body, bl, " spawned actor id="); bl = s_putdec(body, bl, id);
+            bl = s_put(body, bl, "\n");
+        } else {
+            bl = s_put(body, bl, "POST chunks to ?off=, then GET /actor/loadvm?go=1&len=<N>\n");
         }
     } else if (str_starts(rpath, "/actor/load")) {
         /* AIPL: POST the --xinu-jit C of an actor program; JIT it, spawn the
@@ -1039,6 +1333,65 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "speedup x100 = ");
         bl = s_putdec(body, bl, msN ? (long)((ms1 * 100UL) / msN) : 0);
         bl = s_put(body, bl, "  (e.g. 385 = 3.85x)\n");
+    } else if (path_eq(req, "/bench")) {
+        /* Unified SMP benchmark: kind=nqueens|dining|primes.  Reports the SAME
+         * 1-core vs N-core wall times + speedup fields as /smp-bench so the Mesh
+         * Control Center tabulates them uniformly.
+         *   curl 'http://192.168.3.101/bench?kind=nqueens&n=13'
+         *   curl 'http://192.168.3.101/bench?kind=dining&n=5' */
+        ctype = "text/plain";
+        int online = smp_cores_online();
+        char kind[16];
+        if (!q_param(req, "kind", kind, sizeof kind)) { kind[0] = 'n'; kind[1] = 'q'; kind[2] = 0; }
+        int is_dining = str_starts(kind, "dining");
+        int is_primes = str_starts(kind, "primes");
+        smp_range_fn fn;
+        long units;
+        const char *label;
+        if (is_dining) {
+            g_din_n = q_int(req, "n", 5);
+            if (g_din_n < 2)  g_din_n = 2;
+            if (g_din_n > 64) g_din_n = 64;
+            units = 200000;            /* independent tables, split across cores */
+            fn = bench_dining;  label = "dining";
+        } else if (is_primes) {
+            units = q_int(req, "n", 300000);
+            if (units < 1) units = 1;
+            fn = bench_count_primes;  label = "primes";
+        } else {
+            g_nq_n = q_int(req, "n", 13);
+            if (g_nq_n < 1)  g_nq_n = 1;
+            if (g_nq_n > 15) g_nq_n = 15;
+            units = g_nq_n;            /* first-queen columns, split across cores */
+            fn = bench_nqueens;  label = "nqueens";
+        }
+
+        unsigned long t0 = now_ms();
+        long r1 = smp_parallel_sum(fn, units, 1);
+        unsigned long t1 = now_ms();
+        long rN = smp_parallel_sum(fn, units, online);
+        unsigned long t2 = now_ms();
+        unsigned long ms1 = t1 - t0;
+        unsigned long msN = t2 - t1;
+
+        bl = s_put(body, bl, "SMP bench kind="); bl = s_put(body, bl, label); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "cores_online = "); bl = s_putdec(body, bl, (long)online); bl = s_put(body, bl, "\n");
+        if (is_dining) {
+            bl = s_put(body, bl, "philosophers = "); bl = s_putdec(body, bl, (long)g_din_n); bl = s_put(body, bl, "\n");
+            bl = s_put(body, bl, "meals        = "); bl = s_putdec(body, bl, r1);
+        } else if (is_primes) {
+            bl = s_put(body, bl, "n            = "); bl = s_putdec(body, bl, units); bl = s_put(body, bl, "\n");
+            bl = s_put(body, bl, "primes       = "); bl = s_putdec(body, bl, r1);
+        } else {
+            bl = s_put(body, bl, "board_size   = "); bl = s_putdec(body, bl, (long)g_nq_n); bl = s_put(body, bl, "\n");
+            bl = s_put(body, bl, "solutions    = "); bl = s_putdec(body, bl, r1);
+        }
+        bl = s_put(body, bl, (r1 == rN) ? " (match)\n" : " MISMATCH!\n");
+        bl = s_put(body, bl, "1-core   ms  = "); bl = s_putdec(body, bl, (long)ms1); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "N-core   ms  = "); bl = s_putdec(body, bl, (long)msN); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "speedup x100 = ");
+        bl = s_putdec(body, bl, msN ? (long)((ms1 * 100UL) / msN) : 0);
+        bl = s_put(body, bl, "  (e.g. 385 = 3.85x)\n");
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";
         bl = s_put(body, bl, "xinu-rpi5 (Pi 5) actor HTTP gateway\n"
@@ -1177,7 +1530,7 @@ int tcp_handle_packet(const unsigned char *frame, int len)
              * /actor/load body (AIPL C) easily exceeds one MSS.  We only act
              * once http_complete() says headers + Content-Length bytes are in;
              * until then we just ACK and wait for the next segment. */
-            static char g_req[16384];
+            static char g_req[65536];   /* 64 KB: bigger /actor/loadvm chunks (~60 KB) */
             static char http_resp[1400];
 
             /* Only accept in-order data (seq == what we expect); ignore the
