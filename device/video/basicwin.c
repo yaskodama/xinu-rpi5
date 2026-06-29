@@ -31,7 +31,19 @@ extern void basic_set_btn(int (*fn)(int));
 extern void basic_set_buttons_reset(void (*fn)(void));
 extern void basic_select(int inst);        /* pick which bs[] instance is current */
 extern int  basic_break_pending(void);     /* 1 if a Ctrl-C break is queued */
+extern int  basic_is_running(void);        /* 1 while a program executes */
 extern void video_present(void);           /* flip back buffer -> HDMI */
+extern void rp1usb_mouse_pump(void);       /* poll the (polled) USB kbd + mouse */
+
+/* Pump the polled USB HID while a program RUNs (the interpreter blocks the wm
+ * main loop, so its normal pump never runs).  This is how a mid-run Ctrl-C —
+ * and program BUTTON clicks — actually reach us.  Returns 1 if a break is now
+ * pending so callers can stop early. */
+static int bw_pump_input(void)
+{
+    rp1usb_mouse_pump();
+    return basic_break_pending();
+}
 
 #define BW_COLS   96            /* chars per row (fixed grid)              */
 #define BW_ROWS   360           /* ~10 screens of scrollback              */
@@ -185,21 +197,24 @@ static void bw_present_gfx(void)
     video_present();
 }
 
-/* No Ctrl-C break wired on rpi5 (no xhci ctrl-c poll seam) — programs run to
- * completion.  Returning 0 means "no break requested". */
-static int bw_break_poll(void) { return 0; }
+/* Called periodically by the RUN loop (~every 32k statements).  Pump the polled
+ * USB keyboard so a mid-run Ctrl-C is delivered (-> basic_break) and report
+ * whether a break is now pending.  Without this the keyboard never gets polled
+ * during a RUN (the wm main loop that normally pumps it is blocked). */
+static int bw_break_poll(void) { return bw_pump_input(); }
 
 static void bw_pause(int ms)
 {
     if (gfx_on && gfx_dirty) { bw_present_gfx(); gfx_dirty = 0; }
-    /* Sleep in small slices so a Ctrl-C (set from the keyboard interrupt while
-     * the RUN loop is blocked here) aborts the PAUSE promptly instead of after
-     * the full delay. */
+    /* Sleep in small slices, pumping the USB keyboard each slice so a Ctrl-C
+     * during a PAUSE / WAIT animation loop (e.g. rescue's frame loop) is
+     * delivered and aborts the wait promptly instead of after the full delay. */
+    if (bw_pump_input()) return;
     while (ms > 0) {
-        if (basic_break_pending()) return;
         int slice = ms < 20 ? ms : 20;
         delay_ms((unsigned int)slice);
         ms -= slice;
+        if (bw_pump_input()) return;
     }
 }
 
@@ -227,6 +242,11 @@ static void bw_on_click(window_t *self, int lx, int ly)
             return;
         }
     }
+    /* Toolbar command buttons run a direct line through the interpreter.  While
+     * a program is already RUNning the click arrives via the in-run USB pump —
+     * executing here would reenter basic_exec_line, so ignore it (program
+     * BUTTONs above were already registered).  Use Ctrl-C to stop first. */
+    if (basic_is_running()) return;
     for (int b = 0; b < BW_NBTN; b++) {
         int bx, by, bw, bh;
         bw_btn_rect(b, self->width, &bx, &by, &bw, &bh);
@@ -407,3 +427,50 @@ void basicwin_handle_key(char c)
 }
 
 int basicwin_is_basic(window_t *w) { return w == &basic_win; }
+
+/* ===================================================================
+ *  Remote control (HTTP test harness — system/tcp_server.c).
+ *
+ *  basicwin_post_line() queues a direct command; basicwin_poll_pending()
+ *  (called from the wm tick, OUTSIDE genet_rx_tick) runs it.  Running there —
+ *  not inside the HTTP handler — matters: a RUN blocks its caller, and the
+ *  100 Hz timer IRQ keeps serving HTTP (genet_rx_tick) only while g_rx_busy is
+ *  clear, which it is in the wm tick but NOT inside an HTTP handler.  So a
+ *  /basic/key Ctrl-C posted during a remotely-started rescue is delivered by
+ *  the timer IRQ and breaks the program.
+ * =================================================================== */
+static char s_pending[96];
+static int  s_have_pending;
+
+void basicwin_post_line(const char *s)
+{
+    int i = 0;
+    for (; s[i] && i < (int)sizeof(s_pending) - 1; i++) s_pending[i] = s[i];
+    s_pending[i] = 0;
+    s_have_pending = 1;
+}
+
+void basicwin_poll_pending(void)
+{
+    if (!s_have_pending || !inited) return;
+    s_have_pending = 0;
+    basic_select(0);
+    bw_emit(s_pending);
+    bw_putc('\n');
+    basic_exec_line(s_pending);          /* blocks here for the duration of a RUN */
+}
+
+/* Inject a key as if it came from the keyboard (mirrors loader/main.c's BASIC
+ * branch of xhci_keyboard_event): while a program runs, only Ctrl-C acts (it
+ * requests a break); otherwise the key edits the program. */
+void basicwin_inject_key(char c)
+{
+    if (!inited) return;
+    if (basic_is_running()) {
+        if (c == 0x03) { extern void basic_break(void); basic_break(); }
+    } else {
+        basicwin_handle_key(c);
+    }
+}
+
+int basicwin_running(void) { return basic_is_running(); }

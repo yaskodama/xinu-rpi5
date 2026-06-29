@@ -376,13 +376,16 @@ void xhci_keyboard_event(char c)
     extern void basic_break(void);
     struct window *fw = wm_focused();
     if (basicwin_is_basic(fw)) {
-        /* Ctrl-C interrupts a running program.  The RUN loop blocks the wm main
-         * loop, but this key arrives via the xHCI HID interrupt, so set the
-         * break flag straight away (and don't reenter the editor mid-run). */
-        if (c == 0x03 && basic_is_running())
-            basic_break();
-        else
-            basicwin_handle_key(c);      /* BASIC window owns the keys otherwise */
+        /* While a program RUNs, the interpreter blocks the wm main loop and
+         * pumps the (polled) USB keyboard itself from bw_pause/bw_break_poll.
+         * Keys delivered there must NOT reenter the line editor mid-run, so the
+         * only key we act on while running is Ctrl-C (request a break); all
+         * other keys are dropped until the program returns. */
+        if (basic_is_running()) {
+            if (c == 0x03) basic_break();
+        } else {
+            basicwin_handle_key(c);      /* BASIC window owns the keys when idle */
+        }
     } else if (shellwin_is_shell(fw))
         shellwin_handle_key(c);
 #endif
@@ -1362,6 +1365,15 @@ static void serial_io_tick(void)
     int ch, budget = 256;
 
     genet_rx_tick();                 /* keep the (no-op on Pi 5) net drain */
+
+    /* Run any BASIC command queued over HTTP (/basic/run).  Done here — outside
+     * genet_rx_tick — so a RUN it starts blocks the wm tick (not an HTTP
+     * handler), leaving the 100 Hz timer IRQ free to serve HTTP and deliver a
+     * /basic/key Ctrl-C that breaks it. */
+    { extern void basicwin_poll_pending(void); basicwin_poll_pending(); }
+    /* Run a queued /wifi-adhoc mesh-join here (off the request path): WiFi
+     * bring-up blocks this loop ~1 min, but the HTTP reply already flushed. */
+    { extern void wifi_adhoc_poll_pending(void); wifi_adhoc_poll_pending(); }
 
     while (budget-- > 0 && (ch = uart_poll_char()) >= 0) {
         if (!in_cmd) {

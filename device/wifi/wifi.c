@@ -2599,6 +2599,12 @@ static void wifi_cache_flush(unsigned long addr, unsigned long len, int icache)
  * 10.0.0.<n>/24.  All nodes use a FIXED cell BSSID so they share one cell
  * immediately (deterministic for MANET).  After this the existing data
  * path (responder/ping/udp) works peer-to-peer with no AP/DHCP. */
+/* When set, wifi_adhoc() joins the IBSS mesh but does NOT move the HTTP/JIT
+ * gateway onto the WiFi interface — it stays on Ethernet (genet), so the LAN
+ * control plane + /fb screen-mirror survive while WiFi is on the mesh.  The
+ * WiFi side is still serviced for ARP/ICMP/AODV via wifi_net_poll(). */
+int wifi_adhoc_keep_eth = 0;
+
 int wifi_adhoc(const char *ssid, int channel, int n)
 {
     static u8 jp[64];
@@ -2623,7 +2629,7 @@ int wifi_adhoc(const char *ssid, int channel, int n)
     jp[36]=0x02; jp[37]=0x4d; jp[38]=0x41; jp[39]=0x4e; jp[40]=0x45; jp[41]=0x54; /* 02:4d:41:4e:45:54 "MANET" */
     jp[44]=0; jp[45]=0; jp[46]=0; jp[47]=0;  /* chanspec_num = 0 (channel set via SET_CHANNEL) */
     if (wifi_wlcmd(1, WLC_SET_SSID, jp, 48, 0, 0) != 0) { wifi_log("[wifi] adhoc: SET_SSID failed\r\n"); return -1; }
-    wifi_delay_us(400000);
+    wifi_delay_us(100000);   /* brief settle; the GET_BSSID poll below covers the rest */
     /* static IP (no DHCP in ad-hoc); enables responder + ping/udp */
     wifi_get_iovar("cur_etheraddr", wifi_mac, 6);
     wifi_ip[0]=10; wifi_ip[1]=0; wifi_ip[2]=0; wifi_ip[3]=(u8)n;
@@ -2632,18 +2638,24 @@ int wifi_adhoc(const char *ssid, int channel, int n)
     for (i=0;i<4;i++){ wifi_dns[i]=0; }
     for (i = 0; i < sl && i < 39; i++) wifi_cur_ssid[i] = ssid[i]; wifi_cur_ssid[i] = 0;
     wifi_have_ip = 1;
-    wifi_bind_tcp_server();          /* expose GET / , POST /compile over WiFi */
+    if (!wifi_adhoc_keep_eth)        /* keep_eth: stay on Ethernet (mesh+mirror coexist) */
+        wifi_bind_tcp_server();      /* else expose GET / , POST /compile over WiFi */
     /* IBSS cell formation: the fw scans for the cell then creates it — poll
-     * GET_BSSID until it reports the cell BSSID (~up to 12s). */
+     * GET_BSSID until it reports the cell BSSID.  A cell on a clear channel
+     * normally forms in 1–3 s; poll at a fine 150 ms granule (was 500 ms) so
+     * cell-up is detected ~3x sooner, and cap at 40*150 ms = 6 s (was 12 s) so
+     * the board's main loop (and HTTP server) stops being wedged that much
+     * sooner.  If the cell isn't confirmed by the cap the fw keeps forming it
+     * in the background anyway, so returning early is safe. */
     { int t, up = 0;
-      for (t = 0; t < 24; t++) {
+      for (t = 0; t < 40; t++) {
           if (wifi_wlcmd(0, WLC_GET_BSSID, 0, 0, bss, 6) == 0) {
               int nz = 0, k; for (k = 0; k < 6; k++) if (bss[k] && bss[k] != 0xFF) nz = 1;
               if (nz) { up = 1;
                   wifi_log("[wifi] adhoc: *** IBSS cell up, BSSID %02x:%02x:%02x:%02x:%02x:%02x ***\r\n",
                            bss[0],bss[1],bss[2],bss[3],bss[4],bss[5]); break; }
           }
-          wifi_delay_us(500000);
+          wifi_delay_us(150000);
       }
       if (!up) wifi_log("[wifi] adhoc: IBSS not associated yet (no peer / still forming)\r\n");
     }

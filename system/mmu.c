@@ -81,10 +81,18 @@ void mmu_init(void)
     __asm__ volatile ("dsb sy");
     __asm__ volatile ("isb");
 
-    /* Enable the MMU (SCTLR.M) only — caches stay off on this first enable. */
+    /* Enable the MMU (SCTLR.M) + the INSTRUCTION cache (SCTLR.I).  The DATA
+     * cache (SCTLR.C) stays OFF so the lock-free worker-pool stays coherent
+     * (every data access goes straight to RAM) and DMA buffers (net/SD/WiFi/fb)
+     * need no maintenance.  Enabling the I-cache is safe — instructions are not
+     * DMA'd — and is the bulk of the speedup for the instruction-fetch-bound
+     * compute loops (uncached I-fetch from DRAM was the main cost).  Self-
+     * modifying paths (the cc JIT, chainload/kexec) invalidate the I-cache
+     * themselves.  Invalidate I-cache before turning it on. */
+    __asm__ volatile ("ic iallu\n dsb sy\n isb\n");
     unsigned long sctlr;
     __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
-    sctlr |= 1UL;                          /* M = 1 */
+    sctlr |= 1UL | (1UL << 12);            /* M = 1, I = 1 (D-cache C stays 0) */
     __asm__ volatile ("msr sctlr_el1, %0" :: "r"(sctlr));
     __asm__ volatile ("isb");
 }
@@ -115,9 +123,10 @@ void mmu_enable_secondary(void)
     __asm__ volatile ("msr ttbr0_el1, %0" :: "r"((unsigned long)l0));
     __asm__ volatile ("dsb sy\n tlbi vmalle1\n dsb sy\n isb\n");
 
+    __asm__ volatile ("ic iallu\n dsb sy\n isb\n");
     unsigned long sctlr;
     __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
-    sctlr |= 1UL;                          /* M = 1 (caches stay off) */
+    sctlr |= 1UL | (1UL << 12);            /* M = 1, I = 1 (D-cache C stays 0) */
     __asm__ volatile ("msr sctlr_el1, %0" :: "r"(sctlr));
     __asm__ volatile ("isb");
 }

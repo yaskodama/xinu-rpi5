@@ -219,6 +219,10 @@ void screen_puts(const char *s)
 unsigned int video_screen_width(void)  { return fb_width;  }
 unsigned int video_screen_height(void) { return fb_height; }
 
+/* Raw visible-framebuffer access (for the /fb remote screen-mirror route). */
+const volatile unsigned char *video_fb_base(void)  { return fb_base;  }
+unsigned int                  video_fb_pitch(void) { return fb_pitch; }
+
 /* ---- double buffering (anti-flicker) ----
  * The window manager redraws the whole screen every frame, including a
  * full background wipe.  Drawing that straight to the visible HDMI
@@ -427,6 +431,23 @@ void draw_rect(int x, int y, int w, int h, unsigned int color)
     fill_rect(x,         y + h - 1, w, 1, color);   /* bottom */
     fill_rect(x,         y,         1, h, color);   /* left   */
     fill_rect(x + w - 1, y,         1, h, color);   /* right  */
+}
+
+/* Blit an ARGB buffer to virtual-desktop (x,y), viewport-relative + clipped. */
+void video_blit(int x, int y, int w, int h, const unsigned int *src, int srcstride)
+{
+    if (!fb_ready || !src) return;
+    int sx = x - view_x, sy = y - view_y, ox = 0, oy = 0;
+    if (sx < 0) { ox = -sx; w += sx; sx = 0; }
+    if (sy < 0) { oy = -sy; h += sy; sy = 0; }
+    if (sx + w > (int)fb_width)  w = (int)fb_width  - sx;
+    if (sy + h > (int)fb_height) h = (int)fb_height - sy;
+    if (w <= 0 || h <= 0) return;
+    for (int dy = 0; dy < h; dy++) {
+        unsigned int *row = (unsigned int *)(fb_draw + (sy + dy) * fb_pitch + sx * 4);
+        const unsigned int *s = src + (oy + dy) * srcstride + ox;
+        for (int dx = 0; dx < w; dx++) row[dx] = s[dx];
+    }
 }
 
 /* Bresenham line in virtual-desktop coords (viewport-relative, clipped to fb). */

@@ -854,11 +854,22 @@ static int           g_kbd_held_sh;
 static unsigned long g_kbd_rep_at;   /* next repeat time (timer ticks) */
 static int           g_kbd_rep_n;    /* repeats emitted (cap, in case of a stuck key) */
 
+/* Apply the Ctrl modifier: Ctrl + A..Z (either case) -> control code 1..26
+ * (so Ctrl-C == 0x03, which the BASIC window uses to break a running program).
+ * Non-letters are passed through unchanged. */
+static char kbd_apply_ctrl(char c)
+{
+    char up = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+    if (up >= 'A' && up <= 'Z') return (char)(up - 'A' + 1);
+    return c;
+}
+
 static void kbd_decode(unsigned char *r)
 {
     extern void xhci_keyboard_event(char);
     extern unsigned long timer_ticks(void);
     int shift = (r[0] & 0x22) != 0;                /* L/R Shift in modifier byte */
+    int ctrl  = (r[0] & 0x11) != 0;                /* L/R Ctrl  in modifier byte */
     for (int i=2;i<8;i++) {
         unsigned u=r[i];
         if (u==0 || u>=0x40) continue;
@@ -866,7 +877,7 @@ static void kbd_decode(unsigned char *r)
         for (int j=2;j<8;j++) if (g_kbd_prev[j]==u){ held=1; break; }
         if (held) continue;
         char c = kbd_ascii(u, shift);
-        if (c) xhci_keyboard_event(c);
+        if (c) { if (ctrl) c = kbd_apply_ctrl(c); xhci_keyboard_event(c); }
     }
     /* Track the last typable key still down, for auto-repeat. */
     int cur = 0;

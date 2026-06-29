@@ -485,6 +485,26 @@ static long bench_dining(long lo, long hi, int core)
     return meals;
 }
 
+/* ---- N-Queens partial (distributed): count solutions for first-queen columns
+ * [g_nqp_c0+lo, g_nqp_c0+hi) at board size g_nqp_n.  Used by /nqpart so a Mac
+ * orchestrator can hand each board a disjoint column range and sum the partial
+ * counts.  Native (no JIT deadline) → correct for any n; SMP across cores. */
+static int g_nqp_n = 13;
+static int g_nqp_c0 = 0;
+static long bench_nqueens_part(long lo, long hi, int core)
+{
+    (void)core;
+    int n = g_nqp_n;
+    unsigned all = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    long total = 0;
+    for (long c = lo; c < hi; c++) {
+        unsigned col = (unsigned)(g_nqp_c0 + c);
+        unsigned bit = 1u << col;
+        total += nq_solve(1, bit, bit << 1, bit >> 1, all);
+    }
+    return total;
+}
+
 /* Build the HTTP response for NUL-terminated request `req` into `out`
  * (capacity `max`).  Returns the byte length. */
 /* ---- /wifi-adhoc : join the WiFi ad-hoc (IBSS) mesh, keep Ethernet ----
@@ -1392,6 +1412,32 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "speedup x100 = ");
         bl = s_putdec(body, bl, msN ? (long)((ms1 * 100UL) / msN) : 0);
         bl = s_put(body, bl, "  (e.g. 385 = 3.85x)\n");
+    } else if (path_eq(req, "/nqpart")) {
+        /* Distributed N-Queens partial: count solutions for first-queen columns
+         * [c0,c1) at board size n, using all cores.  A Mac orchestrator hands
+         * each cluster node a disjoint column range and sums the partials.
+         *   curl 'http://192.168.3.101/nqpart?n=13&c0=0&c1=4' */
+        ctype = "text/plain";
+        int online = smp_cores_online();
+        g_nqp_n = q_int(req, "n", 13);
+        if (g_nqp_n < 1)  g_nqp_n = 1;
+        if (g_nqp_n > 16) g_nqp_n = 16;
+        int c0 = q_int(req, "c0", 0);
+        int c1 = q_int(req, "c1", g_nqp_n);
+        if (c0 < 0) c0 = 0;
+        if (c1 > g_nqp_n) c1 = g_nqp_n;
+        if (c1 < c0) c1 = c0;
+        g_nqp_c0 = c0;
+        unsigned long t0 = now_ms();
+        long sol = smp_parallel_sum(bench_nqueens_part, (long)(c1 - c0), online);
+        unsigned long t1 = now_ms();
+        bl = s_put(body, bl, "nqueens-partial n="); bl = s_putdec(body, bl, (long)g_nqp_n);
+        bl = s_put(body, bl, " c0="); bl = s_putdec(body, bl, (long)c0);
+        bl = s_put(body, bl, " c1="); bl = s_putdec(body, bl, (long)c1);
+        bl = s_put(body, bl, " solutions="); bl = s_putdec(body, bl, sol);
+        bl = s_put(body, bl, " ms="); bl = s_putdec(body, bl, (long)(t1 - t0));
+        bl = s_put(body, bl, " cores="); bl = s_putdec(body, bl, (long)online);
+        bl = s_put(body, bl, "\n");
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";
         bl = s_put(body, bl, "xinu-rpi5 (Pi 5) actor HTTP gateway\n"

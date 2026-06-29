@@ -24,4 +24,10 @@ void basicwin_draw(window_t *self, unsigned int frame);  /* wm draw_content     
 void basicwin_handle_key(char c);                        /* keyboard -> REPL    */
 int  basicwin_is_basic(window_t *w);                     /* true for basic_win  */
 
+/* Remote control (HTTP test harness, system/tcp_server.c). */
+void basicwin_post_line(const char *s);   /* queue a direct command (run from tick) */
+void basicwin_poll_pending(void);         /* run a queued command — call from wm tick */
+void basicwin_inject_key(char c);         /* feed a key as if typed (Ctrl-C breaks) */
+int  basicwin_running(void);              /* 1 while a program executes */
+
 #endif /* XINU_RPI5_BASICWIN_H */

@@ -438,6 +438,10 @@ void wm_run(void)
         video_set_viewport(0, 0);
         draw_wifi_icon(sw, sh);
 
+        /* .avm upload progress bar (screen-space, on top) while a POST
+         * /actor/loadvm is streaming in — shows percent + KB transferred. */
+        { extern void avm_draw_loadbar(int sw, int sh); avm_draw_loadbar(sw, sh); }
+
         /* Transient overlay (e.g. the right-click desktop menu) on top of all. */
         if (wm_overlay) wm_overlay();
 

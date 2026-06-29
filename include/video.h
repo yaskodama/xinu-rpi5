@@ -56,6 +56,10 @@ extern const unsigned char font8x8[96][8];
 unsigned int video_screen_width(void);
 unsigned int video_screen_height(void);
 
+/* Raw visible-framebuffer access (for the /fb remote screen-mirror route). */
+const volatile unsigned char *video_fb_base(void);
+unsigned int                  video_fb_pitch(void);
+
 /* Double buffering (anti-flicker).  video_enable_backbuffer() allocates
  * an off-screen render target the size of the framebuffer and points all
  * drawing primitives at it (returns 1 on success, 0 if no memory — in
@@ -86,6 +90,11 @@ int  video_viewport_y(void);
 void fill_rect(int x, int y, int w, int h, unsigned int color);
 void draw_rect(int x, int y, int w, int h, unsigned int color);
 void draw_line(int x0, int y0, int x1, int y1, unsigned int color);
+
+/* Blit an ARGB pixel buffer (srcstride pixels/row) to virtual-desktop point
+ * (x,y), clipped to the framebuffer.  Used by the AVM "Blender" display to push
+ * its off-screen raster into the VM graphics window. */
+void video_blit(int x, int y, int w, int h, const unsigned int *src, int srcstride);
 
 /* 8x8 glyph drawing with explicit foreground / background colour.
  * draw_string_at advances 8 pixels per character; caller wraps. */
