@@ -1038,28 +1038,83 @@ int avm_loadrun(int len)
 }
 
 /* ======================================================================
- *  AVM file-list window ("AIPL actors") — the Pi 4 avm_open_list() port.
+ *  AVM file-list window ("AVM files") — the Pi 4 avm_open_list() port.
  *
- *  Scans the microSD root for *.avm files (fat32_walk_dir) and lists them in
- *  a wm window; clicking a row reads the file off the card (fat32_read_file)
- *  into the staging buffer and runs it through avm_loadrun() in the VM gfx
- *  window — the same path a POST /actor/loadvm upload takes.  Opened from the
- *  right-click desktop menu ("AVM files").  Read-only: the Pi 4's RAM-app
- *  store / delete dialog needs the ?save= subsystem the Pi 5 doesn't have, so
- *  this lists card files only.
+ *  Lists runnable AIPL .avm actors and runs the one you click in the VM gfx
+ *  window (the same path a POST /actor/loadvm upload takes).  Two sources:
+ *    R: RAM-resident apps — uploaded with /actor/loadvm?...&save=NAME, kept in
+ *       RAM so they survive without any storage I/O (lost on reboot); these get
+ *       an [x] delete button.
+ *    M: *.avm files on the microSD root (fat32_walk_dir), read on click.
+ *    S: *.avm files on a USB mass-storage stick, if one is mounted (best-effort).
+ *  Opened from the right-click desktop menu ("AVM files").
  * ==================================================================== */
+
+/* ---- RAM-resident app store (Pi 4 parity) ---------------------------------
+ * Apps uploaded via /actor/loadvm?...&save=NAME live here so the list window
+ * runs them with zero storage I/O.  NOT compile-time embedding — any actor
+ * sent at runtime appears.  Trade-off: lost on reboot (just re-send). */
+#define AVM_RAM_SLOTS    4
+#define AVM_RAM_SLOT_SZ  (4 * 1024 * 1024)              /* 4 MB per saved app */
+static unsigned char avm_ram[AVM_RAM_SLOTS][AVM_RAM_SLOT_SZ];
+static struct { char name[16]; int len; int used; } avm_ram_meta[AVM_RAM_SLOTS];
+static int avm_ram_rr;                                   /* round-robin victim */
+
+static int avm_streq(const char *a, const char *b)
+{
+    int i = 0; for (; a[i] && b[i]; i++) if (a[i] != b[i]) return 0;
+    return a[i] == b[i];
+}
+
+/* Save the current staging buffer (the just-uploaded .avm) into a RAM slot under
+ * `name`.  Reuses a same-named slot, else round-robins.  Called from the
+ * tcp_server /actor/loadvm?save=NAME handler.  Returns 0 on success. */
+int avm_save(const char *name, int len)
+{
+    if (len <= 0 || len > AVM_RAM_SLOT_SZ) return -1;
+    int slot = -1;
+    for (int s = 0; s < AVM_RAM_SLOTS; s++)
+        if (avm_ram_meta[s].used && avm_streq(avm_ram_meta[s].name, name)) { slot = s; break; }
+    if (slot < 0) { slot = avm_ram_rr % AVM_RAM_SLOTS; avm_ram_rr++; }
+    int i = 0; for (; name[i] && i < 15; i++) avm_ram_meta[slot].name[i] = name[i];
+    avm_ram_meta[slot].name[i] = 0;
+    avm_ram_meta[slot].len = len; avm_ram_meta[slot].used = 1;
+    for (int b = 0; b < len; b++) avm_ram[slot][b] = avm_stage[b];
+    return 0;
+}
+
+/* Best-effort persist of the staging buffer to the microSD root as NAME.AVM
+ * (single-cluster fat32_write_file — fine for small actors, e.g. BASIC .avm).
+ * Returns 0 on success, negative on error. */
+int avm_save_sd(const char *name, int len)
+{
+    if (len <= 0) return -1;
+    char path[20]; int p = 0;
+    for (int i = 0; name[i] && p < 11; i++) {       /* NAME -> upper, <=8 chars */
+        char c = name[i]; if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        path[p++] = c;
+    }
+    path[p++]='.'; path[p++]='A'; path[p++]='V'; path[p++]='M'; path[p]=0;
+    fat32_t fs;
+    if (fat32_mount(&fs) != 0) return -2;
+    if (fat32_write_file(&fs, fs.root_cluster, path, avm_stage, (unsigned long)len) != 0) return -3;
+    return 0;
+}
+
 #define AVM_LIST_MAX 40
 #define AVM_ROW_H    12
 #define AVM_ROW_TOP  (WM_TITLEBAR_H + 22)
-static struct { char name[16]; unsigned int first; unsigned int size; } avm_list[AVM_LIST_MAX];
+#define AVM_DEL_W    14
+static struct { char name[16]; char vol; unsigned int ref; unsigned int size; } avm_list[AVM_LIST_MAX];
 static int      avm_list_n;
+static int      avm_confirm_del = -1;          /* row pending delete confirmation, or -1 */
 static window_t avm_listwin;
 static int      avm_listwin_added;
 
 static void avm_list_visit(const char *name, int is_dir, unsigned long size,
                            unsigned int first, int depth, void *ctx)
 {
-    (void)depth; (void)ctx;
+    (void)depth;
     if (is_dir) return;
     int l = 0; while (name[l]) l++;
     if (l < 5) return;
@@ -1071,17 +1126,38 @@ static void avm_list_visit(const char *name, int is_dir, unsigned long size,
     if (avm_list_n >= AVM_LIST_MAX) return;
     int i = 0; for (; name[i] && i < 15; i++) avm_list[avm_list_n].name[i] = name[i];
     avm_list[avm_list_n].name[i] = 0;
-    avm_list[avm_list_n].first   = first;
-    avm_list[avm_list_n].size    = (unsigned int)size;
+    avm_list[avm_list_n].vol  = *(char *)ctx;       /* 'M' microSD / 'S' USB */
+    avm_list[avm_list_n].ref  = first;              /* first cluster */
+    avm_list[avm_list_n].size = (unsigned int)size;
     avm_list_n++;
 }
+
+/* USB mass-storage volume mount (best-effort) — implemented in the E section. */
+extern int avm_msd_mount(fat32_t *fs);
 
 static void avm_scan(void)
 {
     avm_list_n = 0;
-    fat32_t fs;
-    if (fat32_mount(&fs) != 0) return;              /* no card / not FAT32 */
-    fat32_walk_dir(&fs, fs.root_cluster, 0, avm_list_visit, 0);
+    /* RAM-resident apps first — always reliable, even with no card. */
+    for (int s = 0; s < AVM_RAM_SLOTS && avm_list_n < AVM_LIST_MAX; s++) {
+        if (!avm_ram_meta[s].used) continue;
+        int i = 0; for (; avm_ram_meta[s].name[i] && i < 15; i++)
+            avm_list[avm_list_n].name[i] = avm_ram_meta[s].name[i];
+        avm_list[avm_list_n].name[i] = 0;
+        avm_list[avm_list_n].vol  = 'R';
+        avm_list[avm_list_n].ref  = (unsigned int)s;     /* RAM slot index */
+        avm_list[avm_list_n].size = (unsigned int)avm_ram_meta[s].len;
+        avm_list_n++;
+    }
+    /* microSD root */
+    fat32_t fs; char v;
+    if (fat32_mount(&fs) == 0) {
+        v = 'M'; fat32_walk_dir(&fs, fs.root_cluster, 0, avm_list_visit, &v);
+    }
+    /* USB stick (best-effort: only if a mass-storage device is mounted) */
+    if (avm_msd_mount(&fs) == 0) {
+        v = 'S'; fat32_walk_dir(&fs, fs.root_cluster, 0, avm_list_visit, &v);
+    }
 }
 
 static void avm_run_listed(int idx)
@@ -1089,22 +1165,48 @@ static void avm_run_listed(int idx)
     if (idx < 0 || idx >= avm_list_n) return;
     unsigned int sz = avm_list[idx].size;
     if (sz == 0 || sz > AVM_STAGE_MAX) return;
+    if (avm_list[idx].vol == 'R') {                 /* RAM-resident: run from RAM */
+        int s = (int)avm_list[idx].ref;
+        if (s < 0 || s >= AVM_RAM_SLOTS || !avm_ram_meta[s].used) return;
+        int n = avm_ram_meta[s].len;
+        if (n <= 0 || n > AVM_STAGE_MAX) return;
+        for (int b = 0; b < n; b++) avm_stage[b] = avm_ram[s][b];
+        avm_loadrun(n);
+        return;
+    }
     fat32_t fs;
-    if (fat32_mount(&fs) != 0) return;
-    int n = fat32_read_file(&fs, avm_list[idx].first, sz, avm_stage, AVM_STAGE_MAX);
+    int mounted = (avm_list[idx].vol == 'S') ? avm_msd_mount(&fs) : fat32_mount(&fs);
+    if (mounted != 0) return;
+    int n = fat32_read_file(&fs, avm_list[idx].ref, sz, avm_stage, AVM_STAGE_MAX);
     if (n <= 0) return;
     avm_loadrun(n);                                 /* spawn + run in the VM gfx window */
+}
+
+/* B: right-click "MAKINA" — find SOLID.AVM on any volume and run it. */
+void avm_run_makina(void)
+{
+    avm_scan();
+    for (int i = 0; i < avm_list_n; i++) {
+        const char *nm = avm_list[i].name; const char *want = "SOLID.AVM";
+        int j = 0, ok = 1;
+        for (; want[j]; j++) {
+            char a = nm[j]; if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+            if (a != want[j]) { ok = 0; break; }
+        }
+        if (ok && nm[j] == 0) { avm_run_listed(i); return; }
+    }
 }
 
 static void avm_listwin_draw(window_t *self, unsigned int frame)
 {
     (void)frame;
     int x = self->x + 6, y = self->y + WM_TITLEBAR_H + 6;
-    draw_string_at(x, y, "AVM files on microSD - click to run:",
+    draw_string_at(x, y, "AVM actors - click=run, [x]=delete:",
                    0xFFFFE0A0U, self->content_bg);
     y += 16;
     for (int i = 0; i < avm_list_n; i++) {
         char line[40]; int p = 0;
+        line[p++] = avm_list[i].vol; line[p++] = ':'; line[p++] = ' ';
         for (int k = 0; avm_list[i].name[k] && p < 18; k++) line[p++] = avm_list[i].name[k];
         while (p < 19) line[p++] = ' ';                 /* pad name column */
         unsigned int sz = avm_list[i].size; char suf = 'B'; unsigned int val = sz;
@@ -1114,18 +1216,62 @@ static void avm_listwin_draw(window_t *self, unsigned int frame)
         while (val) { tmp[tn++] = (char)('0' + val % 10); val /= 10; }
         while (tn) line[p++] = tmp[--tn];
         line[p++] = suf; line[p] = 0;
-        draw_string_at(x, y + i * AVM_ROW_H, line, 0xFFCFE8FFU, self->content_bg);
+        int ry = y + i * AVM_ROW_H;
+        draw_string_at(x, ry, line, 0xFFCFE8FFU, self->content_bg);
+        if (avm_list[i].vol == 'R') {                   /* delete button (RAM only) */
+            int dbx = self->x + self->width - AVM_DEL_W - 6;
+            fill_rect(dbx, ry - 1, AVM_DEL_W, 11, 0xFF802020U);
+            draw_rect(dbx, ry - 1, AVM_DEL_W, 11, 0xFFFF7070U);
+            draw_string_at(dbx + 4, ry, "x", 0xFFFFE0E0U, 0xFF802020U);
+        }
     }
     if (avm_list_n == 0)
-        draw_string_at(x, y, "(no .avm files - put one on the card root)",
+        draw_string_at(x, y, "(none - upload with /actor/loadvm?save=NAME or put .avm on card)",
                        0xFF888888U, self->content_bg);
+
+    /* confirmation dialog (drawn on top) */
+    if (avm_confirm_del >= 0 && avm_confirm_del < avm_list_n) {
+        int dh = 56, dy = self->y + self->height - dh - 8, dx = self->x + 8, dw = self->width - 16;
+        fill_rect(dx, dy, dw, dh, 0xFF202830U);
+        draw_rect(dx, dy, dw, dh, 0xFFFFC060U);
+        char q[40]; int p = 0; const char *t = "Delete ";
+        for (int i = 0; t[i]; i++) q[p++] = t[i];
+        for (int k = 0; avm_list[avm_confirm_del].name[k] && p < 30; k++) q[p++] = avm_list[avm_confirm_del].name[k];
+        q[p++] = '?'; q[p] = 0;
+        draw_string_at(dx + 8, dy + 8, q, 0xFFFFFFFFU, 0xFF202830U);
+        fill_rect(dx + 8,  dy + 28, 60, 18, 0xFF40A040U);
+        draw_string_at(dx + 22, dy + 33, "Yes", 0xFFFFFFFFU, 0xFF40A040U);
+        fill_rect(dx + 90, dy + 28, 60, 18, 0xFF606060U);
+        draw_string_at(dx + 106, dy + 33, "No", 0xFFFFFFFFU, 0xFF606060U);
+    }
 }
 
 static void avm_listwin_click(window_t *self, int lx, int ly)
 {
-    (void)lx;
+    /* confirmation dialog takes priority while open */
+    if (avm_confirm_del >= 0) {
+        int dh = 56, dyr = self->height - dh - 8, by = dyr + 28;
+        if (ly >= by && ly <= by + 18) {
+            if (lx >= 8 && lx <= 68) {                  /* Yes -> free the RAM slot */
+                if (avm_confirm_del < avm_list_n && avm_list[avm_confirm_del].vol == 'R') {
+                    int s = (int)avm_list[avm_confirm_del].ref;
+                    if (s >= 0 && s < AVM_RAM_SLOTS) avm_ram_meta[s].used = 0;
+                }
+                avm_confirm_del = -1; avm_scan();
+            } else if (lx >= 90 && lx <= 150) {         /* No -> cancel */
+                avm_confirm_del = -1;
+            }
+        } else {
+            avm_confirm_del = -1;                        /* click elsewhere cancels */
+        }
+        return;
+    }
     int row = (ly - AVM_ROW_TOP) / AVM_ROW_H;
     if (row < 0 || row >= avm_list_n) return;
+    /* trash button column (RAM apps only) -> ask to confirm */
+    if (avm_list[row].vol == 'R' && lx >= self->width - AVM_DEL_W - 6) {
+        avm_confirm_del = row; return;
+    }
     avm_run_listed(row);
 }
 
@@ -1134,7 +1280,7 @@ void avm_open_list(void)            /* called from the right-click desktop menu 
     avm_scan();
     if (!avm_listwin_added) {
         avm_listwin.x = 700; avm_listwin.y = 90;
-        avm_listwin.width = 340; avm_listwin.height = 340;
+        avm_listwin.width = 360; avm_listwin.height = 340;
         const char *t = "AVM files"; int k;
         for (k = 0; k < WM_TITLE_MAX && t[k]; k++) avm_listwin.title[k] = t[k];
         avm_listwin.title[k] = 0;
@@ -1146,4 +1292,25 @@ void avm_open_list(void)            /* called from the right-click desktop menu 
         avm_listwin_added = 1;
     }
     wm_show(&avm_listwin);
+}
+
+/* ---- E: USB mass-storage volume (best-effort, read-only) -------------------
+ * Mounts a FAT32 USB stick via the RP1 xHCI MSD block reader so the list window
+ * can show its *.avm files.  Only if the MSD is already enumerated (capacity
+ * known) — we do NOT auto-run rp1usb_msd_fullsetup() here, since that heavy USB
+ * bring-up could stall the wm; bring the stick up first via /msd-setup. */
+static int avm_msd_rd(unsigned long lba, void *buf)
+{
+    extern int rp1usb_msd_read_block(unsigned int);
+    extern unsigned int rp1usb_msd_data_byte(int);
+    if (rp1usb_msd_read_block((unsigned int)lba) != 0) return -1;
+    unsigned char *o = (unsigned char *)buf;
+    for (int i = 0; i < 512; i++) o[i] = (unsigned char)rp1usb_msd_data_byte(i);
+    return 0;
+}
+int avm_msd_mount(fat32_t *fs)
+{
+    extern unsigned int rp1usb_msd_blocks(void);
+    if (rp1usb_msd_blocks() == 0) return -1;        /* not set up -> skip USB volume */
+    return fat32_mount_dev(fs, avm_msd_rd, 0);      /* read-only (wr = NULL) */
 }

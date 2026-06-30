@@ -401,7 +401,7 @@ static int g_menu_x, g_menu_y;
 #define MENU_W       128
 #define MENU_ITEM_H  18
 #define MENU_PAD     3
-static const char *g_menu_items[] = { "Shell", "BASIC", "AVM files" };
+static const char *g_menu_items[] = { "Shell", "BASIC", "AVM files", "MAKINA", "Text size" };
 #define MENU_N ((int)(sizeof(g_menu_items) / sizeof(g_menu_items[0])))
 
 /* Painted by wm_run() after all windows (see wm_set_overlay), so it floats on
@@ -510,6 +510,17 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
                     } else if (it == 2) {                   /* "AVM files" -> SD list */
                         extern void avm_open_list(void);
                         avm_open_list();
+                    } else if (it == 3) {                   /* "MAKINA" -> run SOLID.AVM */
+                        extern void avm_run_makina(void);
+                        avm_run_makina();
+                    } else if (it == 4) {                   /* "Text size" -> toggle focused 1x/2x */
+                        extern struct window *wm_focused(void);
+                        extern void wm_request_full_redraw(void);
+                        window_t *fw = wm_focused();
+                        if (fw) {
+                            fw->font_scale = (fw->font_scale >= 2) ? 1 : 2;
+                            wm_request_full_redraw();
+                        }
                     }
                 }
                 g_menu_vis = 0;

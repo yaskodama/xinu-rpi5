@@ -863,8 +863,19 @@ static int http_build(const char *req, char *out, int max)
             } else {
                 bl = s_put(body, bl, "usage: POST /actor/loadvm?off=<byte> body=<chunk>\n");
             }
-        } else if (q_int(req, "go", 0)) {          /* GET ?go=1&len=N -> run */
+        } else if (q_int(req, "go", 0)) {          /* GET ?go=1&len=N[&save=NAME] -> run */
             int len = q_int(req, "len", 0);
+            char savename[16];
+            if (q_param(req, "save", savename, sizeof savename) && savename[0]) {
+                extern int avm_save(const char *, int);     /* RAM-resident store */
+                extern int avm_save_sd(const char *, int);  /* best-effort microSD */
+                int rc  = avm_save(savename, len);
+                int sdrc = avm_save_sd(savename, len);
+                bl = s_put(body, bl, "saved RAM="); bl = s_putdec(body, bl, rc);
+                bl = s_put(body, bl, " SD="); bl = s_putdec(body, bl, sdrc);
+                bl = s_put(body, bl, " name="); bl = s_put(body, bl, savename);
+                bl = s_put(body, bl, "\n");
+            }
             int id  = avm_loadrun(len);
             bl = s_put(body, bl, "loadvm: len="); bl = s_putdec(body, bl, len);
             bl = s_put(body, bl, " spawned actor id="); bl = s_putdec(body, bl, id);

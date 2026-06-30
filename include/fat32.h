@@ -16,6 +16,12 @@
 #ifndef XINU_RPI5_FAT32_H
 #define XINU_RPI5_FAT32_H
 
+/* Block-device hooks: fat32_mount() binds the on-board microSD; fat32_mount_dev()
+ * lets a caller bind any 512-byte block device (e.g. a USB mass-storage stick),
+ * so the same reader serves both. */
+typedef int (*fat32_rdfn)(unsigned long lba, void *buf);
+typedef int (*fat32_wrfn)(unsigned long lba, const void *buf);
+
 /* Returned by fat32_mount() — opaque to callers but the struct is
  * exposed so they can keep a stack-allocated instance. */
 typedef struct {
@@ -30,12 +36,21 @@ typedef struct {
     unsigned long part_lba;          /* first sector of the partition  */
     unsigned long fat_lba;            /* first FAT entry sector         */
     unsigned long data_lba;           /* cluster 2's first sector       */
+
+    /* Bound block device (set by fat32_mount / fat32_mount_dev). */
+    fat32_rdfn    rd;
+    fat32_wrfn    wr;
 } fat32_t;
 
 /* Read MBR to find the first partition, read its boot sector and
  * populate `fs`.  Returns 0 on success, -1 if anything is unexpected
  * (no MBR signature, partition isn't FAT32, etc.). */
 int fat32_mount(fat32_t *fs);
+
+/* Mount a FAT32 volume on an arbitrary 512-byte block device (e.g. USB MSD).
+ * `rd`/`wr` read/write one block; `wr` may be NULL for read-only media.
+ * Returns 0 on success, -1 if not a FAT32 volume. */
+int fat32_mount_dev(fat32_t *fs, fat32_rdfn rd, fat32_wrfn wr);
 
 /* Visitor callback signature: called once per non-LFN, non-deleted
  * directory entry.  `is_dir` is non-zero if the entry is a sub-

@@ -18,10 +18,11 @@ static unsigned int le32(const unsigned char *p)
  * to keep stack pressure low. */
 static unsigned char scratch[SD_BLOCK_SIZE];
 
-int fat32_mount(fat32_t *fs)
+/* Parse the MBR + BPB through the already-bound fs->rd device. */
+static int fat32_finish_mount(fat32_t *fs)
 {
     unsigned char mbr[SD_BLOCK_SIZE];
-    if (sd_read_block(0, mbr) != 0)             return -1;
+    if (fs->rd(0, mbr) != 0)                    return -1;
     if (mbr[510] != 0x55 || mbr[511] != 0xAA)   return -1;
 
     /* First partition table entry starts at MBR offset 0x1BE.
@@ -33,7 +34,7 @@ int fat32_mount(fat32_t *fs)
     fs->part_lba = le32(&mbr[0x1BE + 0x08]);
 
     /* Read the partition's boot sector to get the BPB. */
-    if (sd_read_block(fs->part_lba, scratch) != 0) return -1;
+    if (fs->rd(fs->part_lba, scratch) != 0) return -1;
     if (scratch[510] != 0x55 || scratch[511] != 0xAA) return -1;
 
     fs->bytes_per_sector   = le16(&scratch[0x0B]);
@@ -54,6 +55,21 @@ int fat32_mount(fat32_t *fs)
     return 0;
 }
 
+int fat32_mount(fat32_t *fs)
+{
+    fs->rd = sd_read_block;                      /* on-board microSD */
+    fs->wr = sd_write_block;
+    return fat32_finish_mount(fs);
+}
+
+int fat32_mount_dev(fat32_t *fs, fat32_rdfn rd, fat32_wrfn wr)
+{
+    if (!rd) return -1;
+    fs->rd = rd;
+    fs->wr = wr;
+    return fat32_finish_mount(fs);
+}
+
 /* Translate a cluster number to the LBA of its first sector. */
 static unsigned long cluster_to_lba(const fat32_t *fs, unsigned int cluster)
 {
@@ -70,7 +86,7 @@ static unsigned int fat32_next_cluster(fat32_t *fs, unsigned int cluster)
     unsigned long sec = fs->fat_lba + (fat_byte / SD_BLOCK_SIZE);
     unsigned int  off = (unsigned int)(fat_byte % SD_BLOCK_SIZE);
 
-    if (sd_read_block(sec, scratch) != 0) return 0x0FFFFFFFu;
+    if (fs->rd(sec, scratch) != 0) return 0x0FFFFFFFu;
     unsigned int v = le32(&scratch[off]) & 0x0FFFFFFFu;
     return v;
 }
@@ -115,7 +131,7 @@ int fat32_read_file(fat32_t *fs, unsigned int first_cluster,
     while (cur >= 2 && cur < 0x0FFFFFF8u && done < want && safety-- > 0) {
         unsigned long base = cluster_to_lba(fs, cur);
         for (unsigned int s = 0; s < fs->sectors_per_cluster && done < want; s++) {
-            if (sd_read_block(base + s, scratch) != 0) return (int)done;
+            if (fs->rd(base + s, scratch) != 0) return (int)done;
             unsigned long n = want - done;
             if (n > SD_BLOCK_SIZE) n = SD_BLOCK_SIZE;
             for (unsigned long i = 0; i < n; i++) out[done + i] = scratch[i];
@@ -143,11 +159,11 @@ static int fat_set_entry(fat32_t *fs, unsigned int cluster, unsigned int value)
     for (unsigned int f = 0; f < fs->num_fats; f++) {
         unsigned long sec = fs->fat_lba + (unsigned long)f * fs->sectors_per_fat
                           + (fat_byte / SD_BLOCK_SIZE);
-        if (sd_read_block(sec, scratch) != 0) return -1;
+        if (fs->rd(sec, scratch) != 0) return -1;
         scratch[off+0] = value & 0xFF;        scratch[off+1] = (value >> 8) & 0xFF;
         scratch[off+2] = (value >> 16) & 0xFF; scratch[off+3] = (value >> 24) & 0x0F
                                               | (scratch[off+3] & 0xF0);  /* top nibble reserved */
-        if (sd_write_block(sec, scratch) != 0) return -1;
+        if (fs->wr(sec, scratch) != 0) return -1;
     }
     return 0;
 }
@@ -195,7 +211,7 @@ int fat32_write_file(fat32_t *fs, unsigned int dir_cluster, const char *name,
             scratch[i] = (done < len) ? src[done] : 0;
             if (done < len) done++;
         }
-        if (sd_write_block(base + s, scratch) != 0) return -1;
+        if (fs->wr(base + s, scratch) != 0) return -1;
         if (done >= len && s+1 < fs->sectors_per_cluster) {
             /* remaining sectors stay as-is on disk; we only needed to cover data */
         }
@@ -208,7 +224,7 @@ int fat32_write_file(fat32_t *fs, unsigned int dir_cluster, const char *name,
         unsigned long dbase = cluster_to_lba(fs, cur);
         for (unsigned int s = 0; s < fs->sectors_per_cluster; s++) {
             unsigned long sec = dbase + s;
-            if (sd_read_block(sec, scratch) != 0) return -1;
+            if (fs->rd(sec, scratch) != 0) return -1;
             for (unsigned int off = 0; off + 32 <= SD_BLOCK_SIZE; off += 32) {
                 unsigned char *e = &scratch[off];
                 int match = 1;
@@ -221,7 +237,7 @@ int fat32_write_file(fat32_t *fs, unsigned int dir_cluster, const char *name,
                     e[26] = newc & 0xFF;         e[27] = (newc >> 8) & 0xFF;   /* lo */
                     e[28] = len & 0xFF;          e[29] = (len >> 8) & 0xFF;
                     e[30] = (len >> 16) & 0xFF;  e[31] = (len >> 24) & 0xFF;
-                    if (sd_write_block(sec, scratch) != 0) return -1;
+                    if (fs->wr(sec, scratch) != 0) return -1;
                     return 0;
                 }
             }
@@ -241,7 +257,7 @@ int fat32_walk_dir(fat32_t *fs, unsigned int cluster, int depth,
     while (cur >= 2 && cur < 0x0FFFFFF8u && safety-- > 0) {
         unsigned long base = cluster_to_lba(fs, cur);
         for (unsigned int s = 0; s < fs->sectors_per_cluster; s++) {
-            if (sd_read_block(base + s, dirsec) != 0) return -1;
+            if (fs->rd(base + s, dirsec) != 0) return -1;
 
             for (unsigned int off = 0; off + 32 <= SD_BLOCK_SIZE; off += 32) {
                 unsigned char *e = &dirsec[off];
