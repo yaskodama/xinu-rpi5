@@ -102,9 +102,10 @@ void shellwin_draw(window_t *self, unsigned int frame)
     if (idx < 0 || idx >= SHELLWIN_MAX) idx = 0;
     shell_inst_t *in = &insts[idx];
 
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
     int cx = self->x + 4;
     int cy = self->y + WM_TITLEBAR_H + 4;
-    const int line_h = FONT_HEIGHT + 1;
+    const int line_h = (FONT_HEIGHT + 1) * fs;
 
     /* Cap visible rows to what physically fits inside the window's
      * content area — the ring may carry more lines than the window
@@ -123,20 +124,20 @@ void shellwin_draw(window_t *self, unsigned int frame)
 
     for (int i = 0; i < rows; i++) {
         int r = (start + i) % SHELLWIN_ROWS;
-        draw_string_at(cx, cy + i * line_h,
-                       in->ring[r], 0xFFCCE0FFU, self->content_bg);
+        draw_string_scaled(cx, cy + i * line_h,
+                           in->ring[r], 0xFFCCE0FFU, self->content_bg, fs);
     }
 
     /* Input caret at the current write position (end of the prompt line, which
      * is always the newest displayed row).  Only the active shell blinks a
      * bright caret; inactive shells show a dim one. */
     {
-        int caret_x = cx + in->cur_col * FONT_WIDTH;
+        int caret_x = cx + in->cur_col * FONT_WIDTH * fs;
         int caret_y = cy + (rows - 1) * line_h;
         unsigned int col;
         if (idx == active) col = ((frame >> 4) & 1) ? 0xFF00FF00U : 0xFF006600U;
         else               col = 0xFF004400U;
-        fill_rect(caret_x, caret_y, FONT_WIDTH, FONT_HEIGHT, col);
+        fill_rect(caret_x, caret_y, FONT_WIDTH * fs, FONT_HEIGHT * fs, col);
     }
 }
 

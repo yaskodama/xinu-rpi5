@@ -12,6 +12,7 @@
 #include "video.h"
 #include "wm.h"
 #include "smp.h"
+#include "fat32.h"
 /* rpi5 port of the Pi4 "Blender display system" (device/video/avm.c).
  * Same AVM bytecode + 16-colour palette + tri()/line()/cls() + AVM2 binary mesh
  * as the Pi4, so the SAME compiled .avm renders identically.  The Pi4's
@@ -1034,4 +1035,115 @@ int avm_loadrun(int len)
     vm_enqueue(-1, id, "tick", 0, 0);
     avm_active = 1;                                /* vmgfx_draw will tick it */
     return id;
+}
+
+/* ======================================================================
+ *  AVM file-list window ("AIPL actors") — the Pi 4 avm_open_list() port.
+ *
+ *  Scans the microSD root for *.avm files (fat32_walk_dir) and lists them in
+ *  a wm window; clicking a row reads the file off the card (fat32_read_file)
+ *  into the staging buffer and runs it through avm_loadrun() in the VM gfx
+ *  window — the same path a POST /actor/loadvm upload takes.  Opened from the
+ *  right-click desktop menu ("AVM files").  Read-only: the Pi 4's RAM-app
+ *  store / delete dialog needs the ?save= subsystem the Pi 5 doesn't have, so
+ *  this lists card files only.
+ * ==================================================================== */
+#define AVM_LIST_MAX 40
+#define AVM_ROW_H    12
+#define AVM_ROW_TOP  (WM_TITLEBAR_H + 22)
+static struct { char name[16]; unsigned int first; unsigned int size; } avm_list[AVM_LIST_MAX];
+static int      avm_list_n;
+static window_t avm_listwin;
+static int      avm_listwin_added;
+
+static void avm_list_visit(const char *name, int is_dir, unsigned long size,
+                           unsigned int first, int depth, void *ctx)
+{
+    (void)depth; (void)ctx;
+    if (is_dir) return;
+    int l = 0; while (name[l]) l++;
+    if (l < 5) return;
+    const char *e = name + l - 4;                   /* match ".AVM" (any case) */
+    int is_avm = (e[0]=='.' && (e[1]=='A'||e[1]=='a') &&
+                               (e[2]=='V'||e[2]=='v') &&
+                               (e[3]=='M'||e[3]=='m'));
+    if (!is_avm) return;
+    if (avm_list_n >= AVM_LIST_MAX) return;
+    int i = 0; for (; name[i] && i < 15; i++) avm_list[avm_list_n].name[i] = name[i];
+    avm_list[avm_list_n].name[i] = 0;
+    avm_list[avm_list_n].first   = first;
+    avm_list[avm_list_n].size    = (unsigned int)size;
+    avm_list_n++;
+}
+
+static void avm_scan(void)
+{
+    avm_list_n = 0;
+    fat32_t fs;
+    if (fat32_mount(&fs) != 0) return;              /* no card / not FAT32 */
+    fat32_walk_dir(&fs, fs.root_cluster, 0, avm_list_visit, 0);
+}
+
+static void avm_run_listed(int idx)
+{
+    if (idx < 0 || idx >= avm_list_n) return;
+    unsigned int sz = avm_list[idx].size;
+    if (sz == 0 || sz > AVM_STAGE_MAX) return;
+    fat32_t fs;
+    if (fat32_mount(&fs) != 0) return;
+    int n = fat32_read_file(&fs, avm_list[idx].first, sz, avm_stage, AVM_STAGE_MAX);
+    if (n <= 0) return;
+    avm_loadrun(n);                                 /* spawn + run in the VM gfx window */
+}
+
+static void avm_listwin_draw(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    int x = self->x + 6, y = self->y + WM_TITLEBAR_H + 6;
+    draw_string_at(x, y, "AVM files on microSD - click to run:",
+                   0xFFFFE0A0U, self->content_bg);
+    y += 16;
+    for (int i = 0; i < avm_list_n; i++) {
+        char line[40]; int p = 0;
+        for (int k = 0; avm_list[i].name[k] && p < 18; k++) line[p++] = avm_list[i].name[k];
+        while (p < 19) line[p++] = ' ';                 /* pad name column */
+        unsigned int sz = avm_list[i].size; char suf = 'B'; unsigned int val = sz;
+        if (sz >= 1024) { val = (sz + 512) / 1024; suf = 'K'; }
+        char tmp[12]; int tn = 0;
+        if (!val) tmp[tn++] = '0';
+        while (val) { tmp[tn++] = (char)('0' + val % 10); val /= 10; }
+        while (tn) line[p++] = tmp[--tn];
+        line[p++] = suf; line[p] = 0;
+        draw_string_at(x, y + i * AVM_ROW_H, line, 0xFFCFE8FFU, self->content_bg);
+    }
+    if (avm_list_n == 0)
+        draw_string_at(x, y, "(no .avm files - put one on the card root)",
+                       0xFF888888U, self->content_bg);
+}
+
+static void avm_listwin_click(window_t *self, int lx, int ly)
+{
+    (void)lx;
+    int row = (ly - AVM_ROW_TOP) / AVM_ROW_H;
+    if (row < 0 || row >= avm_list_n) return;
+    avm_run_listed(row);
+}
+
+void avm_open_list(void)            /* called from the right-click desktop menu */
+{
+    avm_scan();
+    if (!avm_listwin_added) {
+        avm_listwin.x = 700; avm_listwin.y = 90;
+        avm_listwin.width = 340; avm_listwin.height = 340;
+        const char *t = "AVM files"; int k;
+        for (k = 0; k < WM_TITLE_MAX && t[k]; k++) avm_listwin.title[k] = t[k];
+        avm_listwin.title[k] = 0;
+        avm_listwin.font_scale  = 1;
+        avm_listwin.chrome_color = 0xFFFFB060U; avm_listwin.title_bg = 0xFF704020U;
+        avm_listwin.title_fg = 0xFFFFFFFFU;     avm_listwin.content_bg = 0xFF14100AU;
+        avm_listwin.draw_content = avm_listwin_draw;
+        avm_listwin.on_click     = avm_listwin_click;
+        avm_listwin_added = 1;
+    }
+    wm_show(&avm_listwin);
 }

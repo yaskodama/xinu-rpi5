@@ -41,6 +41,8 @@ typedef struct window {
     void        (*on_click)(struct window *self, int lx, int ly);
 
     int           focused;        /* 1 = currently selected window (bright chrome) */
+    int           font_scale;     /* content text magnification (0/1 = 1x, 2 = 2x …);
+                                   * windows that honour it draw via draw_string_scaled */
     int           tag;            /* free for the owner — shellwin uses it as the
                                    * shell-instance index (0 = the first shell). */
     struct window *next;          /* internal — set by wm_add() */
@@ -84,6 +86,11 @@ void wm_scroll(int dx, int dy);
  * everything previously added, so later windows are "on top" in
  * draw order, though we don't currently overlap them). */
 void wm_add(window_t *w);
+
+/* Add `w` to the desktop if not already shown, then focus + raise it.  The
+ * Pi 4 wm_show() equivalent — used by the right-click menu to pop up an
+ * on-demand window (shell / BASIC / AVM list). */
+void wm_show(window_t *w);
 
 /* Reposition / resize a window by its add order (0-based).  Used by the
  * serial layout-command parser so the Mac screen-designer can rearrange the

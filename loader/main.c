@@ -371,7 +371,7 @@ void xhci_keyboard_event(char c)
     extern struct window *wm_focused(void);
     extern int shellwin_is_shell(window_t *);
     extern int basicwin_is_basic(window_t *);
-    extern void basicwin_handle_key(char);
+    extern int  basicwin_route_key(window_t *, char);
     extern int  basic_is_running(void);
     extern void basic_break(void);
     struct window *fw = wm_focused();
@@ -384,7 +384,7 @@ void xhci_keyboard_event(char c)
         if (basic_is_running()) {
             if (c == 0x03) basic_break();
         } else {
-            basicwin_handle_key(c);      /* BASIC window owns the keys when idle */
+            basicwin_route_key(fw, c);   /* key -> the focused BASIC window's instance */
         }
     } else if (shellwin_is_shell(fw))
         shellwin_handle_key(c);
@@ -401,7 +401,7 @@ static int g_menu_x, g_menu_y;
 #define MENU_W       128
 #define MENU_ITEM_H  18
 #define MENU_PAD     3
-static const char *g_menu_items[] = { "Shell" };
+static const char *g_menu_items[] = { "Shell", "BASIC", "AVM files" };
 #define MENU_N ((int)(sizeof(g_menu_items) / sizeof(g_menu_items[0])))
 
 /* Painted by wm_run() after all windows (see wm_set_overlay), so it floats on
@@ -504,6 +504,13 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
                     g_cursor_y >= g_menu_y && g_cursor_y < g_menu_y + mh) {
                     int it = (g_cursor_y - g_menu_y - MENU_PAD) / MENU_ITEM_H;
                     if (it == 0) shellwin_spawn();          /* "Shell" -> new window */
+                    else if (it == 1) {                     /* "BASIC" -> new window */
+                        extern void basicwin_new(void);
+                        basicwin_new();
+                    } else if (it == 2) {                   /* "AVM files" -> SD list */
+                        extern void avm_open_list(void);
+                        avm_open_list();
+                    }
                 }
                 g_menu_vis = 0;
                 wm_request_full_redraw();                   /* erase the popup */

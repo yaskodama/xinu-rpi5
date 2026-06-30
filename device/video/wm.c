@@ -158,6 +158,29 @@ void wm_add(window_t *w)
     t->next = w;
 }
 
+/* Add `w` to the desktop if it isn't there yet, then focus + raise it (draw it
+ * on top).  Used by the right-click menu to pop up a window on demand — the
+ * Pi 4 wm_show() equivalent, by pointer (no screen-coord round-trip, so it works
+ * even when the target is panned off-screen). */
+void wm_show(window_t *w)
+{
+    if (!w) return;
+    if (!wm_is_shown(w)) wm_add(w);
+
+    for (window_t *p = wm_head; p; p = p->next) p->focused = 0;
+    w->focused = 1;
+
+    /* raise: unlink and re-append so it draws last (on top) */
+    if (!(wm_head == w && w->next == 0)) {
+        if (wm_head == w) wm_head = w->next;
+        else { window_t *p = wm_head; while (p->next && p->next != w) p = p->next;
+               if (p->next == w) p->next = w->next; }
+        w->next = 0;
+        window_t *t = wm_head; while (t && t->next) t = t->next;
+        if (t) t->next = w; else wm_head = w;
+    }
+}
+
 /* Address a window by its add order (0-based), like the Pi 4 Layout actor's
  * win_move/win_resize builtins.  The Mac screen-designer ships geometry over
  * the debug UART and these reposition the live windows (the wm_run loop
