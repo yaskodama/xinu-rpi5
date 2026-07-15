@@ -1541,6 +1541,78 @@ static int cmd_wifi(int argc, char **argv)
 /* wifi-invest: maintenance / diagnostics for when the connection won't come up.
  * Re-runs the full M0..M1 bring-up, dumps the pinmux + the detailed trace log,
  * then scans, so the failing stage is visible. */
+/* manet — M14 MANET app-layer (多賀2021 4章/6章、案B 密度実験).
+ * 実験の駆動はホスト側スクリプト(expB/bench_b.py)が HTTP /run?cmd= 経由で行う。
+ * 結果は wifi trace に "@B ..." 行として出るので /wifi-trace で回収する。 */
+static int str2i(const char *p) { int v = 0; while (*p>='0'&&*p<='9') v = v*10 + (*p++-'0'); return v; }
+
+static int cmd_manet(int argc, char **argv)
+{
+    extern void wifi_manet_node(int);
+    extern void wifi_manet_nbr(const unsigned char *, int);
+    extern void wifi_manet_cfg(int, int, int, int);
+    extern int  wifi_manet_fire(int, int);
+    extern int  wifi_manet_pull(int);
+    extern void wifi_manet_reset(void);
+    extern void wifi_manet_status(void);
+    extern void shell_flush_screen(void);
+
+    if (argc < 2) {
+        uart_puts("usage: manet status | known | has <fid> | node <n> | nbr [ids...] | fire <fid> [ms]\n"
+                  "       manet pull [ms] | load <pps> <ms> | cfg <proxy> <rrpasses> <rrverts> <ackonly> | reset\n");
+        return 1;
+    }
+    if (str_eq(argv[1], "status")) { wifi_manet_status(); shell_flush_screen(); return 0; }
+    if (str_eq(argv[1], "known"))  { extern void wifi_manet_dump(void); wifi_manet_dump(); shell_flush_screen(); return 0; }
+    if (str_eq(argv[1], "has")) {          /* manet has <fid> — 厳密到達判定 */
+        extern int wifi_manet_has(int);
+        if (argc < 3) { uart_puts("usage: manet has <fid>\n"); return 1; }
+        wifi_manet_has(str2i(argv[2])); shell_flush_screen(); return 0;
+    }
+    if (str_eq(argv[1], "reset"))  { wifi_manet_reset(); uart_puts("manet: reset\n"); return 0; }
+    if (str_eq(argv[1], "node")) {
+        if (argc < 3) { uart_puts("usage: manet node <n>\n"); return 1; }
+        wifi_manet_node(str2i(argv[2])); return 0;
+    }
+    if (str_eq(argv[1], "nbr")) {          /* manet nbr 2 3 5  |  manet nbr  (= 全受け入れ) */
+        unsigned char ids[64]; int i, n = 0;
+        for (i = 2; i < argc && n < 64; i++) ids[n++] = (unsigned char)str2i(argv[i]);
+        wifi_manet_nbr(ids, n);
+        uart_puts("manet: nbr set ("); puts_dec(n); uart_puts(")\n");
+        return 0;
+    }
+    if (str_eq(argv[1], "cfg")) {          /* manet cfg <proxy> <rrpasses> <rrverts> <ackonly> */
+        if (argc < 6) { uart_puts("usage: manet cfg <proxy> <rrpasses> <rrverts> <ackonly>\n"); return 1; }
+        wifi_manet_cfg(str2i(argv[2]), str2i(argv[3]), str2i(argv[4]), str2i(argv[5]));
+        wifi_manet_status(); shell_flush_screen();
+        return 0;
+    }
+    if (str_eq(argv[1], "fire")) {         /* manet fire <fid> [timeout_ms] */
+        int ms = 500;
+        if (argc < 3) { uart_puts("usage: manet fire <fid> [ms]\n"); return 1; }
+        if (argc >= 4) ms = str2i(argv[3]);
+        wifi_manet_fire(str2i(argv[2]), ms);
+        shell_flush_screen();
+        return 0;
+    }
+    if (str_eq(argv[1], "load")) {         /* manet load <pps> <ms> — 背景負荷 */
+        extern int wifi_manet_load(int, int);
+        if (argc < 4) { uart_puts("usage: manet load <pps> <ms>\n"); return 1; }
+        wifi_manet_load(str2i(argv[2]), str2i(argv[3]));
+        shell_flush_screen();
+        return 0;
+    }
+    if (str_eq(argv[1], "pull")) {
+        int ms = 300;
+        if (argc >= 3) ms = str2i(argv[2]);
+        wifi_manet_pull(ms);
+        shell_flush_screen();
+        return 0;
+    }
+    uart_puts("manet: unknown subcommand\n");
+    return 1;
+}
+
 static int cmd_wifi_invest(int argc, char **argv)
 {
     int rc, n;
@@ -1613,6 +1685,7 @@ static const struct centry commandtab[] = {
     { "reboot",   "reboot the board (BCM2712 PM watchdog)",  cmd_reboot   },
     { "wifi",       "wifi on <ssid> <pass> | off | status | scan | adhoc <ssid> [ch] [node] | aodv <ip>", cmd_wifi },
     { "wifi-invest","wifi diagnostics + maintenance (re-run bring-up, dump trace)", cmd_wifi_invest },
+    { "manet",      "MANET app (UDP/5000): status|node|nbr|fire|pull|cfg|reset", cmd_manet },
     { "sdtest",     "SD card controller diagnostics (read LBA 0)", cmd_sdtest },
     { "?",      "alias for help",                          cmd_help   },
     { 0, 0, 0 }

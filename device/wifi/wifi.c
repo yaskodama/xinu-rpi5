@@ -1892,6 +1892,7 @@ static int wifi_ip_eq(const u8 *p)
 /* AODV (M13): process an inbound IPv4 frame — consume AODV control (UDP/654)
  * or relay a transit packet per the route table.  Returns 1 if consumed. */
 static int aodv_ip_in(u8 *e, int elen);
+static int manet_ip_in(u8 *e, int elen);
 
 /* Answer one received 802.3 frame: ARP-who-has-us -> ARP reply, ICMP echo
  * request -> echo reply.  All over the WLAN data channel. */
@@ -1924,6 +1925,7 @@ static void wifi_handle_frame(u8 *fr, int len, int doff)
         u8 *ip = e + 14;
         int ihl = (ip[0] & 0x0F) * 4;
         if (aodv_ip_in(e, elen)) return;             /* AODV control / relay */
+        if (manet_ip_in(e, elen)) return;            /* M14 MANET app (UDP/5000) */
         if (ip[9] == 1 && wifi_ip_eq(ip + 16)) {     /* ICMP to us */
             u8 *ic = ip + ihl;
             int iptot = (ip[2] << 8) | ip[3];
@@ -2503,6 +2505,362 @@ int wifi_aodv(const u8 *dst)
     wifi_log("[wifi] aodv: no route to %d.%d.%d.%d (RREP timeout)\r\n", dst[0],dst[1],dst[2],dst[3]);
     return -1;
 }
+/* ================================================================== *
+ *  M14 — MANET app-layer over UDP (多賀2021 4章/6章、案B 実験用)     *
+ * ================================================================== *
+ * 第4章の4エージェント(情報/ノード管理/拡散(push)/収集(pull))のノード間
+ * ホップを、同期RPC ではなく UDP で実装したもの。phone_node_fire.abcl の
+ * `now remote(nbr,"diffusion").receive(id)` は戻り値を捨てており(=返信不要)、
+ * ブロードキャストに置き換えても意味論は同じ。同期RPC は tcp_server が
+ * 受動オープン専用(SYN_SENT 無し)かつ cc_pump が単一スレッドのため載らない。
+ *
+ *   push = PUSH をブロードキャスト (hop=1、返信不要)
+ *   pull = PULLREQ ブロードキャスト → PULLRSP ユニキャスト
+ *   仮想トポロジ = 受信側 whitelist (manet nbr) で src を落とす
+ *
+ * 【案B の測定】発火ノードが PUSH を投げ、各受信ノードが即 ACK を返す。
+ * ACK には受信側の *内部差分* (rx→取り込み, 取り込み→再経路) を載せる。
+ * 差分は受信ボード内で完結するので **ノード間の時刻同期が要らない**
+ * (RTC 無し・ad-hoc では NTP も死んでいるため、これが唯一実用的な方法)。
+ * 発火ノードは自分の cntpct_el0 だけで RTT・到達率・内訳を得る。
+ */
+#define MN_PORT     5000
+#define MN_PUSH     1
+#define MN_ACK      2
+#define MN_PULLREQ  3
+#define MN_PULLRSP  4
+#define MN_BG       5                  /* 背景負荷: 受信側は取り込むが ACK しない */
+#define MN_HDR      16
+#define MN_MAXNBR   64
+#define MN_MAXKNOWN 256
+#define MN_RRV      288                /* 再経路 合成負荷の最大頂点数 */
+#define MN_RRE      384
+
+struct mn_ack { u8 node; u32 rtt, dri, dir; };
+
+static u8   g_mn_node   = 0;           /* 自ノード id (= 10.0.0.<n> の n) */
+static u8   g_mn_nbr[MN_MAXNBR];
+static int  g_mn_nbrn   = 0;           /* 0 = whitelist 無効(全受け入れ) */
+static u16  g_mn_known[MN_MAXKNOWN];
+static int  g_mn_knownn = 0;
+static u16  g_mn_seq    = 0;
+static int  g_mn_proxy  = 1;           /* TX 多重度: 仮想ノード分の輻輳を作る */
+static int  g_mn_rrp    = 0;           /* 再経路パス数 (0 = 無効) */
+static int  g_mn_rrv    = 266;         /* 再経路頂点数 (既定 = 荒川266) */
+static u8   g_mn_ackonly= 0;           /* 対照群: 処理を省き RX 直後に ACK */
+static u32  g_mn_filtered = 0, g_mn_rx = 0, g_mn_bg = 0;
+static struct mn_ack g_mn_acks[MN_MAXNBR];
+static int  g_mn_ackn   = 0;
+static u32  g_mn_t0     = 0;
+static u16  g_mn_wait   = 0;
+static int  g_mn_collect= 0;
+
+/* --- gknown 集合: AIPL 側 has() と同じ線形走査(コスト構造を合わせる) --- */
+static int mn_has(u16 id) { int i; for (i=0;i<g_mn_knownn;i++) if (g_mn_known[i]==id) return 1; return 0; }
+static int mn_learn(u16 id)
+{
+    if (mn_has(id)) return 0;
+    if (g_mn_knownn < MN_MAXKNOWN) g_mn_known[g_mn_knownn++] = id;
+    return 1;
+}
+static int mn_nbr_ok(u8 src)
+{
+    int i;
+    if (g_mn_nbrn == 0) return 1;               /* whitelist 未設定 = 全受け入れ */
+    for (i = 0; i < g_mn_nbrn; i++) if (g_mn_nbr[i] == src) return 1;
+    return 0;
+}
+
+/* --- 再経路の合成負荷 ------------------------------------------------ *
+ * manet_fire.abcl の距離場再計算 (Bellman-Ford, passes=90, 266頂点/327辺)
+ * と同じ *計算構造* (passes × edges の二重ループ) を持つコストモデル。
+ * 実在の荒川地図ではない —— 測っているのは経路の正しさではなく計算コスト。 */
+static u16 g_rr_eu[MN_RRE], g_rr_ev[MN_RRE];
+static u8  g_rr_ew[MN_RRE];
+static int g_rr_ne = 0, g_rr_built = 0;
+static u32 g_rr_dist[MN_RRV];
+
+static void mn_rr_build(int V)
+{
+    int i, e = 0;
+    if (V > MN_RRV) V = MN_RRV;
+    for (i = 0; i < V && e < MN_RRE; i++) {          /* 環状: V 辺 */
+        g_rr_eu[e] = (u16)i; g_rr_ev[e] = (u16)((i+1) % V); g_rr_ew[e] = (u8)(1 + (i % 7)); e++;
+    }
+    for (i = 0; i < V && e < MN_RRE; i += 4) {       /* 弦: E/V ≈ 1.23 (=327/266) に合わせる */
+        g_rr_eu[e] = (u16)i; g_rr_ev[e] = (u16)((i*7 + 3) % V); g_rr_ew[e] = (u8)(2 + (i % 5)); e++;
+    }
+    g_rr_ne = e; g_rr_built = V;
+}
+static u32 mn_reroute(void)
+{
+    int p, i, V = g_mn_rrv;
+    u32 t0 = SYSTIMER_CLO;
+    if (g_mn_rrp <= 0) return 0;
+    if (V > MN_RRV) V = MN_RRV;
+    if (g_rr_built != V) mn_rr_build(V);
+    for (i = 0; i < V; i++) g_rr_dist[i] = 0xFFFFFFu;
+    g_rr_dist[0] = 0;
+    for (p = 0; p < g_mn_rrp; p++)
+        for (i = 0; i < g_rr_ne; i++) {
+            u32 a = g_rr_dist[g_rr_eu[i]], b = g_rr_dist[g_rr_ev[i]], w = g_rr_ew[i];
+            if (a + w < b) g_rr_dist[g_rr_ev[i]] = a + w;
+            if (b + w < a) g_rr_dist[g_rr_eu[i]] = b + w;
+        }
+    return SYSTIMER_CLO - t0;
+}
+
+static void mn_mk(u8 *p, int type, u16 seq, u16 arg)
+{
+    int i;
+    for (i = 0; i < MN_HDR; i++) p[i] = 0;
+    p[0] = (u8)type; p[1] = g_mn_node;
+    p[2] = (u8)seq;  p[3] = (u8)(seq >> 8);
+    p[4] = (u8)arg;  p[5] = (u8)(arg >> 8);
+}
+static void mn_bcast(const u8 *p, int n)
+{
+    u8 bc[6] = {0xff,0xff,0xff,0xff,0xff,0xff}, bip[4] = {255,255,255,255};
+    wifi_udp_tx(bc, bip, MN_PORT, MN_PORT, p, n);
+}
+
+/* 受信フック: UDP/5000 を捌く。wifi_handle_frame から aodv_ip_in の後に呼ぶ。
+ * 返信は受信フレームの src MAC/IP へ直接ユニキャスト —— ARP を挟まないので
+ * ARP 解決の遅延が測定値に混入しない。 */
+static int manet_ip_in(u8 *e, int elen)
+{
+    u8 *ip = e + 14, *udp, *p;
+    int ihl = (ip[0] & 0x0F) * 4, dport, plen, type;
+    u8 src;
+    u16 seq;
+    u32 t_rx, d_ri = 0, d_ir = 0;
+    if (ip[9] != 17) return 0;                      /* not UDP */
+    udp = ip + ihl; dport = (udp[2] << 8) | udp[3];
+    if (dport != MN_PORT) return 0;                 /* not ours -> 通常経路へ */
+    t_rx = SYSTIMER_CLO;
+    plen = ((udp[4] << 8) | udp[5]) - 8;
+    if (plen < MN_HDR || 14 + ihl + 8 + plen > elen) return 1;
+    p = udp + 8;
+    type = p[0]; src = p[1]; seq = (u16)(p[2] | (p[3] << 8));
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    if (src == g_mn_node) return 1;                 /* 自分のブロードキャストの折返し */
+    g_mn_rx++;
+
+    if (type == MN_PUSH) {
+        u16 fid = (u16)(p[4] | (p[5] << 8));
+        u8 a[MN_HDR];
+        if (!mn_nbr_ok(src)) { g_mn_filtered++; return 1; }   /* 仮想トポロジ外 */
+        if (!g_mn_ackonly) {                        /* 対照群 ackonly=1 は処理を飛ばす */
+            mn_learn(fid);
+            d_ri = SYSTIMER_CLO - t_rx;             /* rx -> gknown 取り込み */
+            d_ir = mn_reroute();                    /* 取り込み -> 再経路完了 */
+        }
+        mn_mk(a, MN_ACK, seq, 0);
+        a[6]=(u8)d_ri;  a[7]=(u8)(d_ri>>8);  a[8]=(u8)(d_ri>>16);  a[9]=(u8)(d_ri>>24);
+        a[10]=(u8)d_ir; a[11]=(u8)(d_ir>>8); a[12]=(u8)(d_ir>>16); a[13]=(u8)(d_ir>>24);
+        wifi_udp_tx(e + 6, ip + 12, MN_PORT, MN_PORT, a, MN_HDR);
+        return 1;
+    }
+    if (type == MN_ACK) {
+        int i;
+        if (!g_mn_collect || seq != g_mn_wait) return 1;
+        for (i = 0; i < g_mn_ackn; i++) if (g_mn_acks[i].node == src) return 1;  /* dedup */
+        if (g_mn_ackn < MN_MAXNBR) {
+            g_mn_acks[g_mn_ackn].node = src;
+            g_mn_acks[g_mn_ackn].rtt  = SYSTIMER_CLO - g_mn_t0;
+            g_mn_acks[g_mn_ackn].dri  = p[6]|(p[7]<<8)|(p[8]<<16)|((u32)p[9]<<24);
+            g_mn_acks[g_mn_ackn].dir  = p[10]|(p[11]<<8)|(p[12]<<16)|((u32)p[13]<<24);
+            g_mn_ackn++;
+        }
+        return 1;
+    }
+    if (type == MN_BG) {                            /* 背景負荷: RX + 取り込みだけ行い ACK しない
+                                                     * (ACK 増幅で媒体が飽和するのを避ける) */
+        if (!mn_nbr_ok(src)) { g_mn_filtered++; return 1; }
+        if (!g_mn_ackonly) { mn_learn((u16)(p[4] | (p[5] << 8))); mn_reroute(); }
+        g_mn_bg++;
+        return 1;
+    }
+    if (type == MN_PULLREQ) {                       /* ④ 収集: 公開テーブルを返す */
+        static u8 r[MN_HDR + 2*MN_MAXKNOWN];
+        int i, n = g_mn_knownn;
+        if (!mn_nbr_ok(src)) { g_mn_filtered++; return 1; }
+        mn_mk(r, MN_PULLRSP, seq, (u16)n);
+        for (i = 0; i < n; i++) { r[MN_HDR+2*i] = (u8)g_mn_known[i]; r[MN_HDR+2*i+1] = (u8)(g_mn_known[i]>>8); }
+        wifi_udp_tx(e + 6, ip + 12, MN_PORT, MN_PORT, r, MN_HDR + 2*n);
+        return 1;
+    }
+    if (type == MN_PULLRSP) {                       /* 持ち帰った ID を取り込む */
+        int i, n = p[4] | (p[5] << 8);
+        if (!mn_nbr_ok(src)) return 1;
+        if (MN_HDR + 2*n > plen) n = (plen - MN_HDR) / 2;
+        for (i = 0; i < n; i++) mn_learn((u16)(p[MN_HDR+2*i] | (p[MN_HDR+2*i+1] << 8)));
+        return 1;
+    }
+    return 1;
+}
+
+void wifi_manet_node(int n) { g_mn_node = (u8)n; }
+void wifi_manet_nbr(const u8 *ids, int n)
+{
+    int i;
+    if (n > MN_MAXNBR) n = MN_MAXNBR;
+    for (i = 0; i < n; i++) g_mn_nbr[i] = ids[i];
+    g_mn_nbrn = n < 0 ? 0 : n;
+}
+void wifi_manet_cfg(int proxy, int rrp, int rrv, int ackonly)
+{
+    if (proxy >= 1) g_mn_proxy = proxy;
+    if (rrp   >= 0) g_mn_rrp   = rrp;
+    if (rrv   >  0) g_mn_rrv   = rrv > MN_RRV ? MN_RRV : rrv;
+    g_mn_ackonly = (u8)(ackonly ? 1 : 0);
+}
+void wifi_manet_reset(void)
+{
+    g_mn_knownn = 0; g_mn_ackn = 0; g_mn_collect = 0;
+    g_mn_filtered = 0; g_mn_rx = 0; g_mn_bg = 0;
+}
+void wifi_manet_status(void)
+{
+    int i;
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    wifi_log("@B status node=%d nbrn=%d proxy=%d rrp=%d rrv=%d ackonly=%d known=%d rx=%u bg=%u filt=%u\r\n",
+             g_mn_node, g_mn_nbrn, g_mn_proxy, g_mn_rrp, g_mn_rrv, g_mn_ackonly,
+             g_mn_knownn, g_mn_rx, g_mn_bg, g_mn_filtered);
+    wifi_log("@B nbr");
+    for (i = 0; i < g_mn_nbrn; i++) wifi_log(" %d", g_mn_nbr[i]);
+    wifi_log("\r\n");
+}
+
+/* 発火ノード側の1試行: PUSH を投げ、ACK を timeout_ms まで回収して内訳を出す。
+ * 全ての時刻は自ノードの cntpct_el0 —— ノード間同期は不要。 */
+int wifi_manet_fire(int fid, int timeout_ms)
+{
+    static u8 fr[2048];
+    int chan, doff, i, k;
+    u32 t_end, tall = 0;
+    u8 p[MN_HDR];
+    if (!wifi_have_ip) { wifi_log("[manet] no IP (run `wifi adhoc <ssid> <ch> <node>` first)\r\n"); return -1; }
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    g_mn_seq++;
+    g_mn_ackn = 0; g_mn_wait = g_mn_seq; g_mn_collect = 1;
+    mn_learn((u16)fid);                             /* 発火ノード自身が接触して学習 */
+    mn_mk(p, MN_PUSH, g_mn_seq, (u16)fid);
+    g_mn_t0 = SYSTIMER_CLO;
+    mn_bcast(p, MN_HDR);
+    /* proxy: 仮想ノード (k-1) 台分の PUSH を同じ無線から出して媒体を負荷する。
+     * 1つの無線が k ノード分の backoff を直列化するため輻輳は近似 —— 報告時に明記。 */
+    for (k = 1; k < g_mn_proxy; k++) {
+        u8 q[MN_HDR];
+        mn_mk(q, MN_PUSH, g_mn_seq, (u16)(fid + 1000*k));
+        q[1] = (u8)(200 + (k % 50));                /* 仮想 src id (実ノード帯と非衝突) */
+        mn_bcast(q, MN_HDR);
+    }
+    t_end = SYSTIMER_CLO + (u32)timeout_ms * 1000u;
+    while ((int)(t_end - SYSTIMER_CLO) > 0) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n > 0 && chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+        else if (n <= 0) wifi_delay_us(200);
+        if (g_mn_nbrn && g_mn_ackn >= g_mn_nbrn) break;    /* 全隣人から回収済 */
+    }
+    g_mn_collect = 0;
+    for (i = 0; i < g_mn_ackn; i++) {
+        if (g_mn_acks[i].rtt > tall) tall = g_mn_acks[i].rtt;
+        wifi_log("@B ack seq=%d node=%d rtt=%u dri=%u dir=%u\r\n",
+                 g_mn_seq, g_mn_acks[i].node, g_mn_acks[i].rtt, g_mn_acks[i].dri, g_mn_acks[i].dir);
+    }
+    wifi_log("@B done seq=%d fid=%d d=%d acks=%d tall=%u proxy=%d rrp=%d rrv=%d ackonly=%d\r\n",
+             g_mn_seq, fid, g_mn_nbrn, g_mn_ackn, tall, g_mn_proxy, g_mn_rrp, g_mn_rrv, g_mn_ackonly);
+    return g_mn_ackn;
+}
+
+/* ④ 収集エージェント(pull): PULLREQ をブロードキャストし PULLRSP を回収。 */
+int wifi_manet_pull(int timeout_ms)
+{
+    static u8 fr[2048];
+    int chan, doff, before = g_mn_knownn;
+    u32 t_end;
+    u8 p[MN_HDR];
+    if (!wifi_have_ip) { wifi_log("[manet] no IP\r\n"); return -1; }
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    g_mn_seq++;
+    mn_mk(p, MN_PULLREQ, g_mn_seq, 0);
+    mn_bcast(p, MN_HDR);
+    t_end = SYSTIMER_CLO + (u32)timeout_ms * 1000u;
+    while ((int)(t_end - SYSTIMER_CLO) > 0) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n > 0 && chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+        else if (n <= 0) wifi_delay_us(200);
+    }
+    wifi_log("@B pull seq=%d gained=%d known=%d\r\n", g_mn_seq, g_mn_knownn - before, g_mn_knownn);
+    return g_mn_knownn - before;
+}
+
+/* 背景負荷生成: 仮想ノード群の PUSH を pps [packets/s] で ms ミリ秒ぶん出す。
+ * 密度 N の セルでは各ノードが毎tick 1発出すので、offered load ≈ N pps。
+ * 【重要な限界】1つの無線が N ノード分を出しても、CSMA の backoff は無線ごと
+ * なので *独立に競合する送信機の数* は再現できない。パケットレートの近似であって
+ * N 台のセルそのものではない —— 報告時に必ず明記すること。 */
+int wifi_manet_load(int pps, int ms)
+{
+    static u8 fr[2048];
+    u32 t_end, next, iv;
+    u8 p[MN_HDR];
+    int sent = 0, chan, doff;
+    if (!wifi_have_ip) { wifi_log("[manet] no IP\r\n"); return -1; }
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    if (pps <= 0) { wifi_log("@B load pps=0 (off)\r\n"); return 0; }
+    iv = 1000000u / (u32)pps;
+    next = SYSTIMER_CLO;
+    t_end = SYSTIMER_CLO + (u32)ms * 1000u;
+    while ((int)(t_end - SYSTIMER_CLO) > 0) {
+        if ((int)(SYSTIMER_CLO - next) >= 0) {
+            g_mn_seq++;
+            mn_mk(p, MN_BG, g_mn_seq, (u16)(50000 + (sent & 0x3FF)));
+            p[1] = (u8)(200 + (sent % 50));          /* 仮想 src id (実ノード帯と非衝突) */
+            mn_bcast(p, MN_HDR);
+            sent++; next += iv;
+        }
+        { int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+          if (n > 0 && chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff); }
+    }
+    wifi_log("@B load pps=%d ms=%d sent=%d\r\n", pps, ms, sent);
+    return sent;
+}
+
+int wifi_manet_known(u16 *out, int cap)
+{
+    int i, n = g_mn_knownn < cap ? g_mn_knownn : cap;
+    for (i = 0; i < n; i++) out[i] = g_mn_known[i];
+    return n;
+}
+
+/* gknown をトレースへ吐く。到達率の *厳密* な判定に使う ——
+ * ACK 欠落は「PUSH が落ちた」のか「ACK が落ちた」のか区別できない
+ * (IBSS ブロードキャストも ACK ユニキャストも無確認送信のため)。
+ * 試行後に有線制御面からこれを読めば、受信側の事実が直接わかる。 */
+void wifi_manet_dump(void)
+{
+    int i, n = g_mn_knownn;
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    if (n > 32) n = 32;                 /* HTTP /run の body は 640B (tcp_server.c:533) */
+    wifi_log("@B known node=%d n=%d ids=", g_mn_node, g_mn_knownn);
+    for (i = 0; i < n; i++) wifi_log("%s%d", i ? "," : "", g_mn_known[i]);
+    wifi_log("%s\r\n", g_mn_knownn > n ? ",..." : "");
+}
+
+/* 厳密な到達判定: この端末の gknown が fid を含むか。
+ * 試行後に有線制御面から問い合わせる —— ACK 欠落(=無確認送信のブロードキャスト/
+ * ユニキャストがどちらも落ちうる)と PUSH 欠落を切り分ける唯一の手段。 */
+int wifi_manet_has(int fid)
+{
+    int v;
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    v = mn_has((u16)fid);
+    wifi_log("@B has node=%d fid=%d v=%d\r\n", g_mn_node, fid, v);
+    return v;
+}
+
 /* TFTP RRQ (octet) over WiFi: fetch `fname` from srv into dst[maxlen].
  * Returns total bytes on success, -1 on error/timeout. */
 int wifi_tftp_get(const u8 *srv, const char *fname, u8 *dst, int maxlen)
@@ -2671,4 +3029,16 @@ int  wifi_trace_len(void) { return 0; }
 int  wifi_probe(void) { return -1; }
 int  wifi_probe_stage(int k) { (void)k; return -1; }
 void wifi_net_poll(void) { }
+/* M14 MANET — stubs (no radio on this build) */
+void wifi_manet_node(int n) { (void)n; }
+void wifi_manet_nbr(const unsigned char *ids, int n) { (void)ids; (void)n; }
+void wifi_manet_cfg(int p, int rp, int rv, int a) { (void)p; (void)rp; (void)rv; (void)a; }
+int  wifi_manet_fire(int fid, int ms) { (void)fid; (void)ms; return -1; }
+int  wifi_manet_pull(int ms) { (void)ms; return -1; }
+void wifi_manet_reset(void) { }
+void wifi_manet_status(void) { }
+int  wifi_manet_known(unsigned short *o, int cap) { (void)o; (void)cap; return 0; }
+void wifi_manet_dump(void) { }
+int  wifi_manet_load(int p, int m) { (void)p; (void)m; return -1; }
+int  wifi_manet_has(int f) { (void)f; return 0; }
 #endif /* WIFI_SDIO_BASE */
