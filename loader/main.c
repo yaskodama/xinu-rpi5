@@ -1669,6 +1669,20 @@ void kernel_main(void)
       /* One-shot prime-count benchmark to serial: 1-core vs all-cores. */
       smp_run_boot_bench(200000); }
 
+#ifdef DCACHE_EXPERIMENT
+    /* D-cache ON experiment: run the fill/dining/null sweep to the serial
+     * console NOW — after smp_init (workers up, D-cache on) but BEFORE any DMA
+     * agent (net/USB/WM) starts, so the D-cache never coexists with an
+     * incoherent device.  Then halt: with C=1 the GEM/USB/FB DMA would be
+     * incoherent, so we deliberately do not continue into normal boot. */
+    {
+        extern void smpbench_serial_run(void);
+        smpbench_serial_run();
+        uart_puts("DCACHE_EXPERIMENT: halting (no net/USB with D-cache on).\n");
+        for (;;) __asm__ volatile ("wfe");
+    }
+#endif
+
     /* Pass our MAC to the responder so ARP replies carry the
      * right source MAC.  d8:3a:dd:a7:fd:bf — confirmed from
      * pre-reset UMAC read on this Pi 4. */

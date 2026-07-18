@@ -522,6 +522,57 @@ static long bench_null(long lo, long hi, int core)
     return hi - lo;
 }
 
+/* ---- D-cache experiment: run the sweep to the SERIAL console --------------
+ * Used only by the DCACHE_EXPERIMENT build.  With the D-cache ON there is no
+ * network (the GEM DMA rings are coherent only while the cache is off), so the
+ * result cannot be served over HTTP; this prints it over UART instead.  Called
+ * from main() right after smp_init(), BEFORE any DMA agent (net/USB/WM) starts,
+ * so the D-cache never has to coexist with an incoherent device — the only
+ * memory touched is the private bench_fill_buf and pure compute.  Same
+ * workloads and timing (now_us) as the HTTP /bench, so the numbers compare
+ * directly with the Pi 3 D-cache experiment. */
+void smpbench_serial_run(void)
+{
+    static char b[128];
+    static const long fills[] = { 4096, 16384, 65536, 262144 };
+    int online = smp_cores_online();
+    unsigned long sctlr;
+    __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
+
+    uart_puts("\r\n===== smpbench (D-cache experiment) =====\r\n");
+    uart_puts("cores_online = "); uart_putc((char)('0' + online)); uart_puts("\r\n");
+    { int n = s_put(b, 0, "sctlr = 0x"); n = s_puthex(b, n, (unsigned int)sctlr);
+      n = s_put(b, n, "  (C=");
+      n = s_put(b, n, (sctlr & (1UL<<2)) ? "1 ON" : "0 OFF"); n = s_put(b, n, ")\r\n");
+      b[n]=0; uart_puts(b); }
+    uart_puts("compare speedup RATIOS (clock varies); agree=yes = coherent.\r\n");
+
+    /* dining (pure compute) + fill sweep (memory) across 1..online cores. */
+    for (int pass = 0; pass < 2 + (int)(sizeof(fills)/sizeof(fills[0])); pass++) {
+        smp_range_fn fn; long units; const char *label;
+        if (pass == 0)      { g_din_n = 5; units = 200000; fn = bench_dining; label = "dining"; }
+        else if (pass == 1) { units = online;  fn = bench_null; label = "null"; }
+        else { units = fills[pass-2]; fn = bench_fill; label = "fill"; }
+
+        unsigned long t0 = now_us();
+        long r1 = smp_parallel_sum(fn, units, 1);
+        unsigned long us1 = now_us() - t0;
+        t0 = now_us();
+        long rN = smp_parallel_sum(fn, units, online);
+        unsigned long usN = now_us() - t0;
+
+        int n = s_put(b, 0, "  "); n = s_put(b, n, label);
+        if (fn == bench_fill) { n = s_put(b, n, " n="); n = s_putdec(b, n, units); }
+        n = s_put(b, n, "  1c="); n = s_putdec(b, n, (long)us1);
+        n = s_put(b, n, "us Nc="); n = s_putdec(b, n, (long)usN);
+        n = s_put(b, n, "us  x100=");
+        n = s_putdec(b, n, usN ? (long)((us1 * 100UL) / usN) : 0);
+        n = s_put(b, n, "  agree="); n = s_put(b, n, (r1 == rN) ? "yes" : "NO");
+        n = s_put(b, n, "\r\n"); b[n]=0; uart_puts(b);
+    }
+    uart_puts("===== end smpbench =====\r\n");
+}
+
 /* ---- N-Queens partial (distributed): count solutions for first-queen columns
  * [g_nqp_c0+lo, g_nqp_c0+hi) at board size g_nqp_n.  Used by /nqpart so a Mac
  * orchestrator can hand each board a disjoint column range and sum the partial

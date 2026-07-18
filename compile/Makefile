@@ -77,7 +77,7 @@ INCLUDE = -I../include -I../extern/xinu-raz-include
 # -mstrict-align makes the compiler never emit an unaligned access, which
 # removes that whole class of landmine kernel-wide.
 COMMON  = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
-          -mgeneral-regs-only -mstrict-align $(INCLUDE) -MMD -MP
+          -mgeneral-regs-only -mstrict-align $(INCLUDE) -MMD -MP $(EXTRADEFS)
 
 # Pi 5 (BCM2712, Cortex-A76).  Peripheral base 0x107C000000; mailbox at
 # 0x107C00B880 (best-effort).  Serial console = GPIO14/15 = RP1 UART0 at

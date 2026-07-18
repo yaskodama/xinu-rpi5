@@ -34,6 +34,38 @@ static unsigned long l1_hi[ENTRIES]__attribute__((aligned(4096)));  /* 1TB .. 1.
 #define GIGABYTE     0x40000000UL
 #define TB1          0x10000000000UL
 
+#ifdef DCACHE_ON
+/* Invalidate the entire D-cache by set/way to the Point of Coherency, AArch64.
+ * MUST run before enabling SCTLR.C: the cache holds garbage out of reset, and
+ * enabling it without invalidating tells the core that garbage is valid data.
+ * Standard CLIDR/CCSIDR walk (ARM ARM). */
+static void dcache_invalidate_all(void)
+{
+    unsigned long clidr;
+    __asm__ volatile ("mrs %0, clidr_el1" : "=r"(clidr));
+    unsigned long loc = (clidr >> 24) & 7;
+    for (unsigned long level = 0; level < loc; level++) {
+        unsigned long type = (clidr >> (level * 3)) & 7;
+        if (type < 2) continue;                       /* no D-side at this level */
+        __asm__ volatile ("msr csselr_el1, %0\n isb\n" :: "r"(level << 1));
+        unsigned long ccsidr;
+        __asm__ volatile ("mrs %0, ccsidr_el1" : "=r"(ccsidr));
+        unsigned int linesh = (unsigned int)(ccsidr & 7) + 4;      /* log2(line bytes) */
+        unsigned int ways   = (unsigned int)((ccsidr >> 3)  & 0x3FF);
+        unsigned int sets   = (unsigned int)((ccsidr >> 13) & 0x7FFF);
+        unsigned int wayshift = (unsigned int)__builtin_clz(ways); /* ways at top */
+        for (int w = (int)ways; w >= 0; w--)
+            for (int s = (int)sets; s >= 0; s--) {
+                unsigned long val = (level << 1)
+                    | ((unsigned long)s << linesh)
+                    | ((unsigned long)(unsigned int)w << wayshift);
+                __asm__ volatile ("dc isw, %0" :: "r"(val));
+            }
+    }
+    __asm__ volatile ("msr csselr_el1, xzr\n dsb sy\n isb\n" ::: "memory");
+}
+#endif /* DCACHE_ON */
+
 void mmu_init(void)
 {
     /* Enable EL1 FP/SIMD access (CPACR_EL1.FPEN = 0b11).  The AIPL value_t
@@ -92,7 +124,16 @@ void mmu_init(void)
     __asm__ volatile ("ic iallu\n dsb sy\n isb\n");
     unsigned long sctlr;
     __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
-    sctlr |= 1UL | (1UL << 12);            /* M = 1, I = 1 (D-cache C stays 0) */
+    sctlr |= 1UL | (1UL << 12);            /* M = 1, I = 1 */
+#ifdef DCACHE_ON
+    /* ★ Enable the D-cache (C=1) for the experiment.  Invalidate by set/way
+     * FIRST (the cache holds reset garbage).  The A76's DSU keeps the shareable
+     * WB mappings coherent between cores without a software SMPEN bit (unlike
+     * the A53), so the lock-free worker-pool mailbox stays coherent — the
+     * bench's own agree=yes check confirms this at run time. */
+    dcache_invalidate_all();
+    sctlr |= (1UL << 2);                    /* C = 1 (DCACHE_ON) */
+#endif
     __asm__ volatile ("msr sctlr_el1, %0" :: "r"(sctlr));
     __asm__ volatile ("isb");
 }
@@ -126,7 +167,11 @@ void mmu_enable_secondary(void)
     __asm__ volatile ("ic iallu\n dsb sy\n isb\n");
     unsigned long sctlr;
     __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
-    sctlr |= 1UL | (1UL << 12);            /* M = 1, I = 1 (D-cache C stays 0) */
+    sctlr |= 1UL | (1UL << 12);            /* M = 1, I = 1 */
+#ifdef DCACHE_ON
+    dcache_invalidate_all();               /* this core's cache also holds garbage */
+    sctlr |= (1UL << 2);                    /* C = 1 (DCACHE_ON) */
+#endif
     __asm__ volatile ("msr sctlr_el1, %0" :: "r"(sctlr));
     __asm__ volatile ("isb");
 }
