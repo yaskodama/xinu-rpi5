@@ -17,6 +17,56 @@ serial hello-world into a small interactive system: an HDMI window manager,
 USB-A input, wired + WiFi networking with an HTTP gateway, microSD storage, an
 on-device C/AIPL compiler, and a `kexec` selector across four OS variants.
 
+## Multi-core SMP, D-cache & self-forming Wi-Fi mesh (2026 experiments)
+
+This port is one of three siblings — **xinu-rpi3 (A53)**, **xinu-rpi4 (A72)**,
+**xinu-rpi5 (A76, this one)** — joined into a single self-forming cluster and
+benchmarked together. Full write-ups are in the companion `smp_report`
+(per-board SMP + D-cache) and `mesh_report` (mesh + distributed) PDFs.
+
+**4-core worker-pool SMP.** Core 0 runs the OS; cores 1–3 are compute workers
+(`system/smp.c`) that wait in `wfe` for a job posted to a lock-free mailbox, run
+a `[lo,hi)` range function, and signal done. `boot.S` releases the secondaries
+into `_smp_start`, and `mmu_enable_secondary()` brings each worker up on core 0's
+page tables with **MMU + I-cache on, D-cache off**. Measured (`agree=yes`):
+
+| Benchmark            | 1-core | 4-core | Speedup |
+|----------------------|-------:|-------:|:-------:|
+| dining (philosophers)| 152800 µs | 38203 µs | **4.00×** |
+| primes (count)       | 66819 µs | 22105 µs | **3.02×** |
+| n-queens (n=12, block split) | 125753 µs | 79269 µs | 1.58× |
+
+The A76 is the fastest of the three boards (≈1.9× the A72 per core), which makes
+it the node that takes the heaviest work in the distributed benchmark below.
+
+**D-cache experiment.** The default build runs every core with the D-cache
+**off** (free mailbox coherency). A `DCACHE_ON` build turns it on and keeps the
+lock-free mailbox coherent with **explicit maintenance** (`dc cvac` / `dc ivac`).
+On this A76 the cores share a **DSU** (DynamIQ Shared Unit); the experiment
+confirmed multi-core D-cache is workable here — as on the A72 and A53 — provided
+the mailbox is explicitly cleaned/invalidated (verified by the benchmark's
+`agree=` column). Clean serial capture required masking IRQs and spinning on the
+UART TXFF during the timed run (the 32-byte FIFO otherwise overflows).
+
+**Self-forming Wi-Fi ad-hoc mesh.** All three boards join one IBSS cell with no
+access point: SSID `MANET`, channel 6, fixed BSSID `02:4d:41:4e:45:54`, static
+`10.0.0.n/24` (this board is **node 3 = 10.0.0.3**). A periodic **HELLO beacon**
+(UDP/5000, every 2 s, `device/wifi/wifi.c`) announces the node id; each board
+records the senders it hears, so neighbour tables fill automatically — power-on
+and join is all it takes. This board reports convergence in its MANET status as
+`@B peers n=… hello_tx=… ids=…` (the Pi 3/Pi 4 expose the same via `GET /manet`).
+
+**Distributed benchmark routes.**
+- `GET /bench?kind=nqueens|dining|primes[&n=N][&cores=K]` — the SMP benchmark
+  above (1-core vs 4-core, µs, speedup, `agree=`).
+- `GET /nqpart?n=N&c0=A&c1=B` — count N-Queens solutions for first-queen columns
+  `[c0,c1)`, split across this board's 4 cores. A Mac orchestrator hands each
+  board a disjoint range and sums the partials, so the mesh solves one problem as
+  a **12-core (3×4) distributed computer**. This A76 node takes the heavy centre
+  columns; best 3-board result: N=14 (365 596 solutions) in **1 458 ms — 1.87×
+  this board alone** (2 722 ms), sum verified. See `mesh_report` for the
+  capacity/granularity efficiency analysis (2.32× heterogeneous ceiling, ~80%).
+
 ## What works
 
 A single-image AArch64 kernel with the MMU enabled (BCM2712, Cortex-A76):
