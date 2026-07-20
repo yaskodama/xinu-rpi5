@@ -36,6 +36,14 @@ page tables with **MMU + I-cache on, D-cache off**. Measured (`agree=yes`):
 | primes (count)       | 66819 µs | 22105 µs | **3.02×** |
 | n-queens (n=12, block split) | 125753 µs | 79269 µs | 1.58× |
 
+```mermaid
+xychart-beta
+    title "Pi 5 (A76) — 4-core SMP speedup (x over 1 core)"
+    x-axis [dining, primes, "n-queens"]
+    y-axis "speedup" 0 --> 4.2
+    bar [4.00, 3.02, 1.58]
+```
+
 The A76 is the fastest of the three boards (≈1.9× the A72 per core), which makes
 it the node that takes the heaviest work in the distributed benchmark below.
 
@@ -66,6 +74,14 @@ and join is all it takes. This board reports convergence in its MANET status as
   columns; best 3-board result: N=14 (365 596 solutions) in **1 458 ms — 1.87×
   this board alone** (2 722 ms), sum verified. See `mesh_report` for the
   capacity/granularity efficiency analysis (2.32× heterogeneous ceiling, ~80%).
+
+```mermaid
+xychart-beta
+    title "Distributed N-Queens (N=14, 365596 solutions) — wall-clock ms"
+    x-axis ["Pi4 4c", "Pi5 4c", "8-core", "9-core", "12-core"]
+    y-axis "ms (lower is better)" 0 --> 5400
+    bar [5216, 2722, 2088, 1585, 1458]
+```
 
 ## What works
 
