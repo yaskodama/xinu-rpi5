@@ -50,3 +50,41 @@ chainload_stub:
     isb
     br      x3                      // jump into the freshly-loaded kernel
 chainload_stub_end:
+
+// ---------------------------------------------------------------------
+// chainload_park — where a secondary core goes to die.
+//
+// Cores 1-3 idle in smp_worker_loop() (system/smp.c), which lives in .text
+// at 0x80000+ — exactly the region the stub above overwrites.  Left running,
+// they execute instructions that are being rewritten under them, and their
+// page tables (in .bss) are overwritten too.  Before the copy, core 0 hands
+// each secondary this address; the core turns its own MMU and caches off so
+// it needs no translation, acknowledges, and spins in a low-power loop until
+// the new kernel starts it again.
+//
+// Relocated by the C wrapper to a safe high address, clear of both 0x80000
+// and the staging buffer.  No stack use.
+//
+//   x0 = address of this core's ack byte (also outside the copy region)
+// ---------------------------------------------------------------------
+.global chainload_park
+.global chainload_park_end
+chainload_park:
+    mrs     x9, sctlr_el1
+    bic     x9, x9, #(1 << 0)       // M = 0  (MMU off -> PA == VA, no tables)
+    bic     x9, x9, #(1 << 2)       // C = 0
+    bic     x9, x9, #(1 << 12)      // I = 0
+    msr     sctlr_el1, x9
+    isb
+    tlbi    vmalle1
+    ic      iallu
+    dsb     sy
+    isb
+
+    mov     w10, #1
+    strb    w10, [x0]               // "I am parked" — core 0 polls this
+    dsb     sy
+
+1:  wfe
+    b       1b
+chainload_park_end:

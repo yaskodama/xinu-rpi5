@@ -78,6 +78,24 @@ enum {
 #define TCP_FLAG_PSH 0x08
 #define TCP_FLAG_ACK 0x10
 
+/* --- Send path: segmentation + retransmission ---------------------------
+ *
+ * tcp_send() refuses anything over one frame while the HTTP layer handed it
+ * the whole response in one call, so any body over ~1.4 KB was dropped
+ * outright — the FIN still went out, so the client saw a clean close with
+ * zero bytes.  (`/fb` is hand-chunked to dodge this; nothing else was, and
+ * http_resp was capped at 1400 to hide it.)
+ *
+ * Now the connection owns a send buffer that holds the response until the
+ * peer acknowledges it.  tcp_pump() emits MSS-sized segments up to the
+ * in-flight limit, ACKs slide snd_una forward, and the RX tick retransmits
+ * from snd_una when the RTO expires. */
+#define TCP_MSS          1460           /* 1500 MTU - 20 IP - 20 TCP */
+#define TCP_SND_BUF      16384
+#define TCP_MAX_INFLIGHT (4 * TCP_MSS)  /* our own cap, on top of peer's win */
+#define TCP_RTO_MS       500UL
+#define TCP_MAX_RETRIES  6
+
 struct tcp_conn {
     int state;
     unsigned char peer_mac[6];
@@ -91,6 +109,21 @@ struct tcp_conn {
      * whose final ACK never arrives pins the one slot in SYN_RCVD forever
      * and the server is dead until reboot.  tcp_conn_reap() uses this. */
     unsigned long last_ms;
+
+    /* Unacknowledged outbound data.  snd_seq0 is the sequence number of
+     * snd[0]; snd_una is how much the peer has acknowledged and snd_nxt how
+     * much we have put on the wire, both as offsets into snd[]. */
+    char           snd[TCP_SND_BUF];
+    int            snd_len;
+    int            snd_una;
+    int            snd_nxt;
+    unsigned long  snd_seq0;
+    unsigned long  snd_last_tx_ms;
+    int            snd_retries;
+    int            snd_fin_pending;   /* close once the last data is on the wire */
+    int            peer_fin;          /* peer half-closed (CLOSE_WAIT) */
+    int            fin_acked;         /* peer acknowledged OUR fin */
+    unsigned short peer_win;          /* peer's advertised receive window */
 };
 
 static struct tcp_conn g_conn;
@@ -409,6 +442,131 @@ static unsigned long now_ms(void)
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
     if (!hz) return 0;
     return (ct * 1000UL) / hz;
+}
+
+/* ---- Send pump: emit as much of snd[] as the window allows -------------
+ *
+ * Called after queueing a response, when an ACK opens the window, and from
+ * the retransmit path.  Sends whole MSS segments (the tail may be short),
+ * bounded by both the peer's advertised window and our own in-flight cap so
+ * a large response can't outrun the single-frame TX path.
+ *
+ * The FIN goes out in the same flight as the last data segment, as a normal
+ * stack does — it just occupies the next sequence number and the retransmit
+ * timer covers it.  Holding it until every byte was ACKed costs a full round
+ * trip per response; on the Pi 4 that measured ~1.8x slower overall. */
+static int  tcp_send(unsigned char flags, const char *payload, int payload_len);
+static unsigned long now_ms(void);
+static unsigned long g_retrans;         /* segments retransmitted */
+/* Post-mortem of the PREVIOUS connection.  The send state lives in g_conn and
+ * is reset by the next SYN, so a stalled transfer cannot be inspected from a
+ * fresh HTTP request — by the time /tcpstat is served, the evidence is gone.
+ * These are snapshotted just before the reset. */
+static long g_snap_len, g_snap_nxt, g_snap_una, g_snap_win, g_snap_state;
+static unsigned long g_pump_calls, g_segs_tx, g_ack_calls, g_tick_calls;
+
+static void tcp_pump(void)
+{
+    struct tcp_conn *c = &g_conn;
+    g_pump_calls++;
+    if (c->state != TCP_ESTABLISHED && c->state != TCP_FIN_WAIT_1) return;
+
+    int limit = TCP_MAX_INFLIGHT;
+    if (c->peer_win && c->peer_win < limit) limit = c->peer_win;
+    if (limit < TCP_MSS) limit = TCP_MSS;      /* always make progress */
+
+    while (c->snd_nxt < c->snd_len) {
+        int inflight = c->snd_nxt - c->snd_una;
+        if (inflight >= limit) break;
+
+        int n = c->snd_len - c->snd_nxt;
+        if (n > TCP_MSS) n = TCP_MSS;
+
+        c->my_seq = c->snd_seq0 + (unsigned long)c->snd_nxt;
+        if (tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, c->snd + c->snd_nxt, n) < 0) {
+            g_txfail++;
+            break;                              /* TX busy — retry on the tick */
+        }
+        c->snd_nxt += n;
+        g_segs_tx++;
+        c->snd_last_tx_ms = now_ms();
+    }
+
+    /* Leave my_seq pointing at the next NEW byte, so a pure ACK emitted from
+     * some other path doesn't carry a mid-stream sequence number. */
+    if (c->snd_len > 0) c->my_seq = c->snd_seq0 + (unsigned long)c->snd_nxt;
+
+    if (c->snd_fin_pending && c->snd_nxt >= c->snd_len) {
+        c->my_seq = c->snd_seq0 + (unsigned long)c->snd_len;
+        if (tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0) >= 0) {
+            c->my_seq += 1;
+            c->snd_fin_pending = 0;
+            /* If the peer already half-closed we owe only the final ACK. */
+            c->state = c->peer_fin ? TCP_LAST_ACK : TCP_FIN_WAIT_1;
+            c->snd_last_tx_ms = now_ms();
+        }
+    }
+}
+
+/* Queue a response body and start sending it. */
+static void tcp_send_response(const char *body, int len)
+{
+    struct tcp_conn *c = &g_conn;
+    if (len < 0) len = 0;
+    if (len > TCP_SND_BUF) len = TCP_SND_BUF;   /* truncate, but honestly */
+    for (int i = 0; i < len; i++) c->snd[i] = body[i];
+    c->snd_len         = len;
+    c->snd_una         = 0;
+    c->snd_nxt         = 0;
+    c->snd_seq0        = c->my_seq;
+    c->snd_retries     = 0;
+    c->snd_fin_pending = 1;
+    c->snd_last_tx_ms  = now_ms();
+    tcp_pump();
+}
+
+/* Peer acknowledged up to `ack`: slide the window and send more. */
+static void tcp_on_ack(unsigned long ack)
+{
+    struct tcp_conn *c = &g_conn;
+    g_ack_calls++;
+    if (c->snd_len > 0) {
+        unsigned long acked = ack - c->snd_seq0;      /* wraps correctly */
+        if (acked <= (unsigned long)c->snd_len && (int)acked > c->snd_una) {
+            c->snd_una     = (int)acked;
+            c->snd_retries = 0;
+        }
+    }
+    tcp_pump();
+}
+
+/* Retransmit timer.  Driven from the RX path alongside the reaper, so it
+ * needs no timer of its own; the cost is that it only fires while packets
+ * are flowing or the loop is idling, which is exactly when it matters. */
+void tcp_retransmit_tick(void)
+{
+    struct tcp_conn *c = &g_conn;
+    g_tick_calls++;
+    if (c->snd_una >= c->snd_len && !c->snd_fin_pending) return;
+    if (c->state != TCP_ESTABLISHED && c->state != TCP_FIN_WAIT_1) return;
+
+    unsigned long now = now_ms();
+    if (c->snd_last_tx_ms == 0 || now < c->snd_last_tx_ms) {
+        c->snd_last_tx_ms = now;
+        return;
+    }
+    if (now - c->snd_last_tx_ms < TCP_RTO_MS) return;
+
+    if (++c->snd_retries > TCP_MAX_RETRIES) {
+        /* Peer is gone.  Drop the response rather than retransmitting for
+         * ever; the reaper will recycle the slot. */
+        c->snd_len = c->snd_una = c->snd_nxt = 0;
+        c->snd_fin_pending = 0;
+        return;
+    }
+    c->snd_nxt = c->snd_una;          /* go-back-N */
+    g_retrans++;
+    tcp_pump();
 }
 
 /* ---- half-open / idle connection reaper -------------------------------
@@ -882,7 +1040,7 @@ static int http_build(const char *req, char *out, int max)
      * the 1280x720 framebuffer can't go in one reply.  Instead serve a small
      * RGB565 thumbnail in chunks the browser stitches back together:
      *   GET /fb[?w=W]          -> "DW DH SRCW SRCH"  (text dims)
-     *   GET /fb?off=N[&w=W]    -> up to 1024 bytes of the thumbnail's RGB565
+     *   GET /fb?off=N[&w=W]    -> up to 8192 bytes of the thumbnail's RGB565
      *                            pixel stream starting at byte offset N
      * Self-contained: builds the WHOLE response into `out` (with a CORS
      * header) and returns here, so the aice-avm desktop page served from the
@@ -905,7 +1063,7 @@ static int http_build(const char *req, char *out, int max)
         char offbuf[12];
         int has_off = q_param(req, "off", offbuf, sizeof offbuf);
 
-        static char fbody[1100];
+        static char fbody[8192];   /* was 1100: one segment was all we could send */
         int fl = 0;
         const char *fbctype;
         if (!has_off) {                              /* /fb or /fb?w= -> dims */
@@ -920,7 +1078,10 @@ static int http_build(const char *req, char *out, int max)
             int off = q_int(req, "off", 0);
             if (off < 0) off = 0;
             if (off & 1) off++;
-            int chunk = 1024;
+            /* Was 1024, because the send path could only emit one segment.
+             * With segmentation the browser needs 8x fewer round trips for
+             * the same frame — and this is the regression test for it. */
+            int chunk = 8192;
             if (off + chunk > total) chunk = total - off;
             if (chunk < 0) chunk = 0;
             if (fb && pitch) {
@@ -1539,6 +1700,41 @@ static int http_build(const char *req, char *out, int max)
         int th = q_int(req, "threshold_ms", 0);
         int dry = q_int(req, "dry", 0);
         cc_actor_gc((long)th, dry, body, (int)sizeof body); bl = 0; while(body[bl])bl++;
+    } else if (path_eq(req, "/tcpstat")) {
+        /* The counters `tcpstat` prints, over the wire.  This board has no
+         * /shell route, so the serial-only command was unreadable remotely —
+         * which meant tcp_conn_reap() could not be observed at all. */
+        ctype = "text/plain";
+        const char *st;
+        switch (g_conn.state) {
+            case TCP_LISTEN:      st = "LISTEN";      break;
+            case TCP_SYN_RCVD:    st = "SYN_RCVD";    break;
+            case TCP_ESTABLISHED: st = "ESTABLISHED"; break;
+            case TCP_FIN_WAIT_1:  st = "FIN_WAIT_1";  break;
+            case TCP_LAST_ACK:    st = "LAST_ACK";    break;
+            default:              st = "CLOSED";      break;
+        }
+        bl = s_put(body, bl, "tcp state=");   bl = s_put(body, bl, st);
+        bl = s_put(body, bl, " any=");        bl = s_putdec(body, bl, (long)g_tcp_any);
+        bl = s_put(body, bl, " seg_rx=");     bl = s_putdec(body, bl, (long)g_seg_rx);
+        bl = s_put(body, bl, " syn=");        bl = s_putdec(body, bl, (long)g_syn_seen);
+        bl = s_put(body, bl, " synack=");     bl = s_putdec(body, bl, (long)g_synack_sent);
+        bl = s_put(body, bl, " estab=");      bl = s_putdec(body, bl, (long)g_estab);
+        bl = s_put(body, bl, " txfail=");     bl = s_putdec(body, bl, (long)g_txfail);
+        bl = s_put(body, bl, " reaped=");     bl = s_putdec(body, bl, (long)g_reaped);
+        bl = s_put(body, bl, " retrans=");    bl = s_putdec(body, bl, (long)g_retrans);
+        bl = s_put(body, bl, " sndlen=");     bl = s_putdec(body, bl, (long)g_conn.snd_len);
+        bl = s_put(body, bl, " una=");        bl = s_putdec(body, bl, (long)g_conn.snd_una);
+        bl = s_put(body, bl, "\n  prev: len=");  bl = s_putdec(body, bl, g_snap_len);
+        bl = s_put(body, bl, " nxt=");        bl = s_putdec(body, bl, g_snap_nxt);
+        bl = s_put(body, bl, " una=");        bl = s_putdec(body, bl, g_snap_una);
+        bl = s_put(body, bl, " win=");        bl = s_putdec(body, bl, g_snap_win);
+        bl = s_put(body, bl, " state=");      bl = s_putdec(body, bl, g_snap_state);
+        bl = s_put(body, bl, "\n  calls: pump=");  bl = s_putdec(body, bl, (long)g_pump_calls);
+        bl = s_put(body, bl, " segs=");       bl = s_putdec(body, bl, (long)g_segs_tx);
+        bl = s_put(body, bl, " ack=");        bl = s_putdec(body, bl, (long)g_ack_calls);
+        bl = s_put(body, bl, " tick=");       bl = s_putdec(body, bl, (long)g_tick_calls);
+        bl = s_put(body, bl, "\n");
     } else if (str_starts(rpath, "/chainload")) {
         /* Network kexec — POST the kernel in chunks to staging RAM, then GO.
          *   POST /chainload?off=<byte>  body = a chunk (<=8 KB)
@@ -1867,6 +2063,14 @@ int tcp_handle_packet(const unsigned char *frame, int len)
 
     g_conn.last_ms = now_ms();          /* keep-alive for tcp_conn_reap() */
 
+    /* Peer's advertised receive window — tcp_pump() will not put more than
+     * this in flight.  Previously ignored entirely. */
+    g_conn.peer_win = (unsigned short)(((unsigned short)tcp[14] << 8) | tcp[15]);
+
+    /* Slide the send window on any ACK for outstanding data, whatever state
+     * we are in; tcp_pump() then emits the next segments. */
+    if ((flags & TCP_FLAG_ACK) && g_conn.snd_len > 0) tcp_on_ack(ack);
+
     /* LISTEN: only SYN starts a connection.  Anything else gets RST. */
     if (g_conn.state == TCP_CLOSED || g_conn.state == TCP_LISTEN) {
         if (!(flags & TCP_FLAG_SYN)) return 1;       /* ignore */
@@ -1879,6 +2083,19 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         g_conn.my_seq    = g_isn_seed;
         g_isn_seed      += 0x100;
         g_conn.greeted   = 0;
+        /* Keep the previous connection's send state for /tcpstat. */
+        g_snap_len   = g_conn.snd_len;
+        g_snap_nxt   = g_conn.snd_nxt;
+        g_snap_una   = g_conn.snd_una;
+        g_snap_win   = g_conn.peer_win;
+        g_snap_state = g_conn.state;
+        /* Fresh connection: nothing outstanding from the previous one. */
+        g_conn.snd_len = g_conn.snd_una = g_conn.snd_nxt = 0;
+        g_conn.snd_fin_pending = 0;
+        g_conn.snd_retries     = 0;
+        g_conn.peer_fin        = 0;
+        g_conn.fin_acked       = 0;
+        g_reqlen               = 0;
 
         uart_puts("tcp: SYN from "); puts_ip(g_conn.peer_ip);
         uart_puts(":"); puts_u32_dec(sport); uart_puts(" -> SYN+ACK\n");
@@ -1924,7 +2141,10 @@ int tcp_handle_packet(const unsigned char *frame, int len)
              * once http_complete() says headers + Content-Length bytes are in;
              * until then we just ACK and wait for the next segment. */
             static char g_req[65536];   /* 64 KB: bigger /actor/loadvm chunks (~60 KB) */
-            static char http_resp[1400];
+            /* Was 1400 — one segment's worth, because that is all the send
+             * path could carry.  It now segments, so the cap is the send
+             * buffer instead of the MTU. */
+            static char http_resp[TCP_SND_BUF];
 
             /* Only accept in-order data (seq == what we expect); ignore the
              * rest so a retransmit can't corrupt the buffer. */
@@ -1936,22 +2156,31 @@ int tcp_handle_packet(const unsigned char *frame, int len)
             }
             tcp_send(TCP_FLAG_ACK, 0, 0);          /* acknowledge the segment */
 
-            if (!http_complete(g_req, g_reqlen)) return 1;   /* need more */
-
-            int rlen = http_build(g_req, http_resp, (int)sizeof http_resp);
-            g_reqlen = 0;
-            tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, http_resp, rlen);
-            g_conn.my_seq += rlen;
-
-            /* Close immediately (HTTP/1.0 Connection: close). */
-            tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
-            g_conn.my_seq += 1;
-            g_conn.state = TCP_FIN_WAIT_1;
-            uart_puts("http: served request, FIN sent\n");
-            return 1;
+            if (http_complete(g_req, g_reqlen)) {
+                int rlen = http_build(g_req, http_resp, (int)sizeof http_resp);
+                g_reqlen = 0;
+                /* Queue it: tcp_pump() segments, tracks what the peer has
+                 * ACKed, and sends the FIN with the final segment. */
+                tcp_send_response(http_resp, rlen);
+                uart_puts("http: served request\n");
+            }
+            /* fall through: this segment may also carry FIN */
         }
         if (flags & TCP_FLAG_FIN) {
             g_conn.peer_seq = seq + 1;
+            g_conn.peer_fin = 1;
+            /* Half-close.  The peer's FIN means it will send no more — NOT
+             * that it stopped reading.  Closing here threw away whatever the
+             * response still had queued: a client that shuts down its write
+             * side after the request (nc, and any HTTP/1.0 client that does
+             * the same) got the transfer cut at the in-flight limit, with the
+             * FIN consuming a sequence number that then made snd_una overtake
+             * snd_nxt and wedged both the pump and the retransmit timer. */
+            if (g_conn.snd_nxt < g_conn.snd_len || g_conn.snd_fin_pending) {
+                tcp_send(TCP_FLAG_ACK, 0, 0);   /* ack the FIN, keep sending */
+                tcp_pump();
+                return 1;
+            }
             tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
             g_conn.my_seq += 1;
             g_conn.state = TCP_LAST_ACK;
@@ -1962,14 +2191,24 @@ int tcp_handle_packet(const unsigned char *frame, int len)
     }
 
     if (g_conn.state == TCP_FIN_WAIT_1) {
-        if ((flags & TCP_FLAG_ACK) && ack == g_conn.my_seq) {
-            if (flags & TCP_FLAG_FIN) {
-                g_conn.peer_seq = seq + 1;
-                tcp_send(TCP_FLAG_ACK, 0, 0);
-                g_conn.state = TCP_LISTEN;
-                uart_puts("tcp: closed (back to LISTEN)\n");
-            }
-            return 1;
+        /* A normal client sends the ACK of our FIN and its own FIN as two
+         * SEPARATE segments.  This used to close only when one segment
+         * carried both, so the single connection slot stayed in FIN_WAIT_1
+         * until the 60 s reaper and the NEXT request was refused — one
+         * request per minute.  Track the two events independently. */
+        if ((flags & TCP_FLAG_ACK) && ack == g_conn.my_seq) g_conn.fin_acked = 1;
+        if (flags & TCP_FLAG_FIN) {
+            g_conn.peer_seq = seq + 1;
+            g_conn.peer_fin = 1;
+            tcp_send(TCP_FLAG_ACK, 0, 0);
+        }
+        /* With one slot, holding it for a TIME_WAIT we cannot afford costs
+         * more than it buys: once our FIN is acknowledged the response is
+         * delivered, so free the slot.  A late FIN retransmit then lands in
+         * LISTEN, where non-SYN segments are ignored. */
+        if (g_conn.fin_acked) {
+            g_conn.state = TCP_LISTEN;
+            uart_puts("tcp: closed (back to LISTEN)\n");
         }
         return 1;
     }
@@ -2012,6 +2251,7 @@ void tcp_dump_state(void)
     uart_puts(" synack=");       puts_u32_dec(g_synack_sent);
     uart_puts(" estab=");        puts_u32_dec(g_estab);
     uart_puts(" txfail=");       puts_u32_dec(g_txfail);
+    uart_puts(" reaped=");       puts_u32_dec(g_reaped);
     uart_puts("\n     last_peer=");
     if (g_last_port) { puts_ip(g_last_ip); uart_puts(":"); puts_u32_dec(g_last_port); }
     else             { uart_puts("(none)"); }
@@ -2026,6 +2266,7 @@ unsigned long tcp_syn_count(void)     { return g_syn_seen;    }
 unsigned long tcp_synack_count(void)  { return g_synack_sent; }
 unsigned long tcp_estab_count(void)   { return g_estab;       }
 unsigned long tcp_txfail_count(void)  { return g_txfail;      }
+unsigned long tcp_reaped_count(void)  { return g_reaped;      }
 
 const char *tcp_state_str(void)
 {

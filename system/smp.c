@@ -79,6 +79,93 @@ static long psci_cpu_on(unsigned long target_cpu, unsigned long entry,
 }
 #endif /* RP1_ETH_BASE */
 
+#ifdef RP1_ETH_BASE
+#define PSCI_CPU_OFF         0x84000002UL   /* no args; does not return on success */
+
+static long psci_cpu_off(void)
+{
+    register long x0 __asm__("x0") = (long)PSCI_CPU_OFF;
+    __asm__ volatile("smc #0"
+                     : "+r"(x0)
+                     :
+                     : "x1","x2","x3","x4","x5","x6","x7","x8","x9","x10",
+                       "x11","x12","x13","x14","x15","x16","x17","memory","cc");
+    return x0;   /* only reached on failure */
+}
+#endif /* RP1_ETH_BASE */
+
+/* Job body that takes a secondary core out of the picture for good.  Posted
+ * by smp_park_secondaries() below; runs on the target core.
+ *
+ * `lo` carries the address of a relocated trampoline that has been copied
+ * clear of the region about to be overwritten, and `hi` this core's ack byte.
+ * Try PSCI first — BL31 powers the core down properly and the next kernel can
+ * CPU_ON it again.  If BL31 refuses, fall through to the trampoline, which
+ * drops the MMU and spins somewhere safe. */
+static long smp_park_self(long lo, long hi, int core)
+{
+    (void)core;
+#ifdef RP1_ETH_BASE
+    psci_cpu_off();                       /* no return on success */
+#endif
+    ((void (*)(unsigned long))(unsigned long)lo)((unsigned long)hi);
+    for (;;) __asm__ volatile("wfe");     /* unreachable */
+}
+
+/* Stop every secondary core before something overwrites the kernel image.
+ *
+ * `park_trampoline` and `ack` must both point outside the region that is
+ * about to be rewritten.  Returns the number of cores confirmed stopped —
+ * either powered off via PSCI (which never sets the ack byte, since the core
+ * is gone) or parked in the trampoline (which does).  Bounded: a core that
+ * is mid-job and never picks up the request is reported as not stopped
+ * rather than hanging the caller. */
+int smp_park_secondaries(unsigned long park_trampoline, volatile unsigned char *ack)
+{
+    int stopped = 0;
+
+    for (int c = 1; c < SMP_NCORES; c++) {
+        if (!smp_online[c]) { stopped++; continue; }
+        ack[c] = 0;
+        smp_job_fn[c] = smp_park_self;
+        smp_job_lo[c] = (long)park_trampoline;
+        smp_job_hi[c] = (long)(unsigned long)&ack[c];
+        MB_CLEAN(&smp_job_fn[c]); MB_CLEAN(&smp_job_lo[c]); MB_CLEAN(&smp_job_hi[c]);
+        dsb();
+        smp_job_seq[c]++;
+        MB_CLEAN(&smp_job_seq[c]);
+        dsb_sev();
+    }
+
+    /* Confirm.  A PSCI-off core reports OFF through AFFINITY_INFO; a
+     * trampoline-parked core sets its ack byte.  Either counts. */
+    for (int c = 1; c < SMP_NCORES; c++) {
+        if (!smp_online[c]) continue;
+        unsigned long spins = 0;
+        for (;;) {
+            if (ack[c]) { stopped++; break; }
+#ifdef RP1_ETH_BASE
+            {
+                register long x0 __asm__("x0") = (long)0xC4000004UL; /* AFFINITY_INFO */
+                register long x1 __asm__("x1") = (long)((unsigned long)c << 8);
+                register long x2 __asm__("x2") = 0;
+                __asm__ volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2)
+                                 : "x3","x4","x5","x6","x7","x8","x9","x10","x11",
+                                   "x12","x13","x14","x15","x16","x17","memory","cc");
+                if (x0 == 1) { stopped++; break; }   /* 1 = OFF */
+            }
+#endif
+            if (++spins >= SMP_BRINGUP_WAIT) break;  /* give up on this core */
+            __asm__ volatile("nop");
+        }
+        smp_online[c] = 0;
+        MB_CLEAN(&smp_online[c]);
+    }
+
+    dsb();
+    return stopped;
+}
+
 int smp_core_id(void)
 {
     unsigned long m;
