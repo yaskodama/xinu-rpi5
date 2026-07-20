@@ -223,6 +223,11 @@ int net_responder_handle(const unsigned char *frame, int len)
             int total_len = ((unsigned short)ip[2] << 8) | ip[3];
             int icmp_len = total_len - ihl;
             if (icmp_len < 8 || total_len + 14 > 1518) return 0;
+            /* total_len is attacker-controlled: a short frame declaring a
+             * large IP length would make the copy below echo whatever sits
+             * after the frame in the RX ring (i.e. previous packets) back
+             * to the sender.  Trust the wire length, not the header. */
+            if (total_len > len - 14) return 0;
 
             /* Throttle (see ARP path): print the first few echoes so
              * the operator can confirm ping reached us, then stay

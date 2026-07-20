@@ -1,6 +1,7 @@
 // kernel/memory.c — first-fit allocator (Xinu getmem/freemem style).
 
 #include "memory.h"
+#include "critical.h"
 
 /* Dummy list head.  `mnext` points at the first real free block;
  * `mlength` shadows the sum of all free bytes so mem_free_bytes()
@@ -34,17 +35,29 @@ void *getmem(unsigned long nbytes)
     if (nbytes == 0) return 0;
     nbytes = ROUNDMB(nbytes);
 
+    /* The free list is shared with anything that allocates from an IRQ
+     * handler or gets preempted mid-walk, so the whole walk is a critical
+     * section.  proc_create() calls us with interrupts on. */
+    unsigned long daif = irq_save();
+
     struct memblk *prev = &memlist_head;
     struct memblk *curr = memlist_head.mnext;
+    void *result = 0;
 
     while (curr != 0) {
-        if (curr->mlength == nbytes) {
-            /* Exact fit: unlink whole block. */
-            prev->mnext = curr->mnext;
-            memlist_head.mlength -= nbytes;
-            return (void *)curr;
-        }
-        if (curr->mlength > nbytes) {
+        /* A leftover smaller than a header cannot be described as a free
+         * block: writing `struct memblk` at curr+nbytes would run past the
+         * end of curr and clobber the successor.  Take the whole block
+         * instead of splitting. */
+        if (curr->mlength < nbytes + sizeof(struct memblk)) {
+            if (curr->mlength >= nbytes) {
+                /* Exact fit (or an unsplittable splinter): unlink whole. */
+                prev->mnext = curr->mnext;
+                memlist_head.mlength -= curr->mlength;
+                result = (void *)curr;
+                break;
+            }
+        } else {
             /* Split: keep the tail as a new free block. */
             struct memblk *leftover =
                 (struct memblk *)((unsigned char *)curr + nbytes);
@@ -52,12 +65,15 @@ void *getmem(unsigned long nbytes)
             leftover->mlength = curr->mlength - nbytes;
             prev->mnext = leftover;
             memlist_head.mlength -= nbytes;
-            return (void *)curr;
+            result = (void *)curr;
+            break;
         }
         prev = curr;
         curr = curr->mnext;
     }
-    return 0;  /* no fit */
+
+    irq_restore(daif);
+    return result;  /* 0 = no fit */
 }
 
 int freemem(void *blk, unsigned long nbytes)
@@ -68,6 +84,8 @@ int freemem(void *blk, unsigned long nbytes)
     unsigned long start = (unsigned long)blk;
     unsigned long end   = start + nbytes;
     if (start < heap_lo || end > heap_hi) return -1;
+
+    unsigned long daif = irq_save();
 
     /* Walk to the insertion point so prev < blk <= curr. */
     struct memblk *prev = &memlist_head;
@@ -80,8 +98,8 @@ int freemem(void *blk, unsigned long nbytes)
     /* Overlap check (catches double-free / wrong-size). */
     unsigned long prev_end =
         (prev == &memlist_head) ? 0 : ((unsigned long)prev + prev->mlength);
-    if (prev_end > start) return -1;
-    if (curr != 0 && end > (unsigned long)curr) return -1;
+    if (prev_end > start)                        { irq_restore(daif); return -1; }
+    if (curr != 0 && end > (unsigned long)curr)  { irq_restore(daif); return -1; }
 
     struct memblk *newblk = (struct memblk *)start;
 
@@ -103,6 +121,7 @@ int freemem(void *blk, unsigned long nbytes)
     }
 
     memlist_head.mlength += nbytes;
+    irq_restore(daif);
     return 0;
 }
 
@@ -111,20 +130,24 @@ unsigned long mem_total_bytes(void) { return heap_total; }
 
 unsigned long mem_largest_block(void)
 {
+    unsigned long daif = irq_save();
     unsigned long max = 0;
     struct memblk *curr = memlist_head.mnext;
     while (curr != 0) {
         if (curr->mlength > max) max = curr->mlength;
         curr = curr->mnext;
     }
+    irq_restore(daif);
     return max;
 }
 
 int mem_free_block_count(void)
 {
+    unsigned long daif = irq_save();
     int n = 0;
     struct memblk *curr = memlist_head.mnext;
     while (curr != 0) { n++; curr = curr->mnext; }
+    irq_restore(daif);
     return n;
 }
 

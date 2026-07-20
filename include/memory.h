@@ -21,11 +21,21 @@ struct memblock {
     unsigned int     length;
 };
 
-/* Round up / truncate to the memory-block granularity (8 bytes — the
- * alignment of struct memblk's pointer/length fields on AArch64).
+/* Round up / truncate to the memory-block granularity.
+ *
+ * MUST be >= sizeof(struct memblk) (16 on AArch64).  A free region smaller
+ * than one header cannot be represented: freemem() would write mnext+mlength
+ * (16 bytes) into an 8-byte hole and clobber the neighbouring block, and
+ * getmem()'s split would write the leftover header past the end of the block
+ * it is handing out.  With 16 every block size is a multiple of 16, so every
+ * split remainder is 0 or >= 16 and both cases vanish.
+ *
+ * 16 is also what AArch64 needs: SP must be 16-byte aligned, and process
+ * stacks come straight out of getmem() (system/proc.c).
  * Classic Xinu names; memory.c uses them in mem_init/getmem/freemem. */
-#define ROUNDMB(x) ((unsigned long)(((unsigned long)(x) + 7UL) & ~7UL))
-#define TRUNCMB(x) ((unsigned long)( (unsigned long)(x)        & ~7UL))
+#define MEM_ALIGN  16UL
+#define ROUNDMB(x) ((unsigned long)(((unsigned long)(x) + (MEM_ALIGN-1UL)) & ~(MEM_ALIGN-1UL)))
+#define TRUNCMB(x) ((unsigned long)( (unsigned long)(x)                    & ~(MEM_ALIGN-1UL)))
 
 void mem_init(unsigned long heap_start, unsigned long heap_end);
 void *getmem(unsigned long nbytes);

@@ -204,6 +204,8 @@ static void genet_rx_tick(void)
         genet_rx_release();
     }
 
+    { extern void tcp_conn_reap(void);  /* recycle half-open / idle TCP slots  */
+      tcp_conn_reap(); }                /* (self-throttled by its timestamps)  */
     dhcp_drive();          /* run the DHCP state machine (rate-limited inside) */
     gc_drive();            /* periodic global actor GC (rate-limited inside)   */
     { extern void wifi_net_poll(void);   /* drain WiFi RX + run its ARP/ICMP    */

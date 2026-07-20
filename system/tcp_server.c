@@ -86,11 +86,18 @@ struct tcp_conn {
     unsigned long my_seq;       /* next byte we will send */
     unsigned long peer_seq;     /* next byte we expect to receive */
     int greeted;
+    /* Wall-clock stamp of the last segment seen on this conn.  Without it
+     * the connection only ever advances on receive, so a single bare SYN
+     * whose final ACK never arrives pins the one slot in SYN_RCVD forever
+     * and the server is dead until reboot.  tcp_conn_reap() uses this. */
+    unsigned long last_ms;
 };
 
 static struct tcp_conn g_conn;
 static int g_reqlen;                  /* bytes of HTTP request accumulated so far */
 static int g_chain_len;               /* bytes of a kernel image staged for /chainload */
+#define CHAIN_STAGE_CAP  (4UL * 1024 * 1024)
+static unsigned char *g_chain_stage;  /* heap staging buffer, above _end */
 static unsigned char g_my_mac[6];
 static unsigned char g_my_ip[4]  = { 192, 168, 3, 100 };
 static unsigned short g_listen_port = 23;
@@ -402,6 +409,37 @@ static unsigned long now_ms(void)
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
     if (!hz) return 0;
     return (ct * 1000UL) / hz;
+}
+
+/* ---- half-open / idle connection reaper -------------------------------
+ * There is one connection slot and no retransmit timer, so a peer that
+ * sends a bare SYN and never completes the handshake owns the server
+ * until reboot.  Recycle the slot on a timeout instead.  Called from the
+ * RX path (loader/main.c, device/wifi/wifi.c) so it runs without needing
+ * its own timer. */
+#define TCP_HALFOPEN_TIMEOUT_MS  5000UL
+#define TCP_ESTAB_TIMEOUT_MS    60000UL
+
+static unsigned long g_reaped;          /* slots recycled by the reaper */
+
+void tcp_conn_reap(void)
+{
+    struct tcp_conn *c = &g_conn;
+    if (c->state == TCP_CLOSED || c->state == TCP_LISTEN) return;
+
+    unsigned long now = now_ms();
+    unsigned long limit = (c->state == TCP_ESTABLISHED)
+                        ? TCP_ESTAB_TIMEOUT_MS
+                        : TCP_HALFOPEN_TIMEOUT_MS;
+    /* now_ms() is monotonic here (free-running 64-bit counter), so a plain
+     * subtraction is safe; guard against a zero stamp anyway. */
+    if (c->last_ms == 0 || now < c->last_ms) { c->last_ms = now; return; }
+    if (now - c->last_ms < limit) return;
+
+    c->state   = TCP_LISTEN;
+    c->greeted = 0;
+    g_reqlen   = 0;
+    g_reaped++;
 }
 
 /* Microsecond timer off the same generic counter — the ms version rounds too
@@ -1507,24 +1545,46 @@ static int http_build(const char *req, char *out, int max)
          *   GET  /chainload?go=1&len=<N> -> relocate trampoline + boot it
          * RAM-only: a bad image just needs a real power-cycle (no SD write). */
         ctype = "text/plain";
-        volatile unsigned char *STAGE = (volatile unsigned char *)0x4000000UL;
+        /* Staging comes from the heap, which is always above _end.  The fixed
+         * 0x4000000 this used to use sits inside our own .bss (which has grown
+         * to ~69 MB), so the upload overwrote the running kernel and the board
+         * died mid-transfer — the same bug the Pi 4 had. */
+        extern void *kmalloc(unsigned long);
+        extern unsigned char _end[];
         if (req[0]=='P') {
             int off = q_int(req, "off", -1);
             const char *b = http_body(req);
             int cl = content_length(req);
-            if (off == 0) g_chain_len = 0;
-            if (off >= 0 && b && cl > 0) {
-                for (int i = 0; i < cl; i++) STAGE[off + i] = (unsigned char)b[i];
+            if (off == 0) {                                  /* new upload */
+                g_chain_len = 0;
+                if (!g_chain_stage) g_chain_stage = (unsigned char *)kmalloc(CHAIN_STAGE_CAP);
+            }
+            if (!g_chain_stage) {
+                bl = s_put(body, bl, "chainload: no staging memory\n");
+            } else if (off < 0 || !b || cl <= 0) {
+                bl = s_put(body, bl, "usage: POST /chainload?off=<byte> body=<chunk>\n");
+            } else if ((unsigned long)off + (unsigned long)cl > CHAIN_STAGE_CAP) {
+                bl = s_put(body, bl, "chainload: chunk past staging capacity\n");
+            } else {
+                unsigned char *stage = g_chain_stage;
+                for (int i = 0; i < cl; i++) stage[off + i] = (unsigned char)b[i];
                 if (off + cl > g_chain_len) g_chain_len = off + cl;
                 bl = s_put(body, bl, "ok off="); bl = s_putdec(body, bl, off);
                 bl = s_put(body, bl, " n=");     bl = s_putdec(body, bl, cl);
                 bl = s_put(body, bl, " total="); bl = s_putdec(body, bl, g_chain_len);
                 bl = s_put(body, bl, "\n");
-            } else bl = s_put(body, bl, "usage: POST /chainload?off=<byte> body=<chunk>\n");
+            }
         } else if (q_int(req, "go", 0)) {
             int len = q_int(req, "len", g_chain_len);
             extern void kernel_chainload(unsigned long, unsigned long);
-            kernel_chainload(0x4000000UL, (unsigned long)len);   /* never returns */
+            if (!g_chain_stage || len <= 0) {
+                bl = s_put(body, bl, "chainload: nothing staged\n");
+            } else if ((unsigned long)g_chain_stage < (unsigned long)_end) {
+                bl = s_put(body, bl, "chainload: staging overlaps the running kernel; refused\n");
+            } else {
+                kernel_chainload((unsigned long)g_chain_stage,
+                                 (unsigned long)len);        /* never returns */
+            }
         } else {
             bl = s_put(body, bl, "staged="); bl = s_putdec(body, bl, g_chain_len);
             bl = s_put(body, bl, " bytes. GET /chainload?go=1&len=<N> to boot it\n");
@@ -1793,8 +1853,19 @@ int tcp_handle_packet(const unsigned char *frame, int len)
     unsigned char data_off = (tcp[12] >> 4) * 4;
     unsigned char flags    = tcp[13] & 0x3F;
     int total_len = ((unsigned short)ip[2] << 8) | ip[3];
+
+    /* Both total_len and data_off come off the wire.  Validate them
+     * against the frame we actually received before deriving data/data_len:
+     * otherwise `data` can point past the frame (into stale RX-ring bytes,
+     * i.e. previous packets) and the bogus data_len desyncs peer_seq. */
+    if (data_off < 20) return 1;                     /* malformed header */
+    if (total_len < ihl + data_off) return 1;
+    if (total_len > len - 14) return 1;              /* header lies about length */
+
     int data_len  = total_len - ihl - data_off;
     const volatile unsigned char *data = tcp + data_off;
+
+    g_conn.last_ms = now_ms();          /* keep-alive for tcp_conn_reap() */
 
     /* LISTEN: only SYN starts a connection.  Anything else gets RST. */
     if (g_conn.state == TCP_CLOSED || g_conn.state == TCP_LISTEN) {
