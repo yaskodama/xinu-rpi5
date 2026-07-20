@@ -1661,6 +1661,40 @@ void kernel_main(void)
      * SMP; see system/smp.c + include/smp.h).  Core 0 keeps running the whole
      * single-core OS unchanged.  Safe if the cores never respond — they just
      * stay offline and parallel jobs fall back to core 0.  Try /smp-bench. */
+#ifdef DCACHE_EXPERIMENT
+    /* D-cache experiment (serial output, then halt).  Measure the OFF baseline
+     * (C=0, single-core — smp_init not yet run) FIRST, then enable C=1 and bring
+     * up the workers (with explicit mailbox cache maintenance in smp.c), then
+     * measure ON (multi-core) — all at one boot clock so OFF/ON compare cleanly.
+     * dining's OFF~=ON absolute time confirms the clock did not move between. */
+    {
+        extern void smpbench_serial_run(void);
+        extern void smp_init(void); extern int smp_cores_online(void);
+        /* Mask IRQs for the whole experiment: the 100 Hz timer ISR drains the
+         * NIC RX ring and prints rp1eth/pcie lines that otherwise interleave
+         * with (and corrupt) the bench output on the serial console.  We halt at
+         * the end anyway, so nothing needs interrupts here. */
+        __asm__ volatile ("msr daifset, #2" ::: "memory");   /* mask IRQ (DAIF.I=1) */
+        /* Block on the UART TX FIFO so long bench lines are not truncated at the
+         * 32-byte FIFO (safe now: IRQs masked, so no ISR waits on us). */
+        { extern void uart_set_blocking(int); uart_set_blocking(1); }
+        uart_puts("\n[dcache-exp] IRQs masked, UART blocking. D-cache OFF baseline (C=0) ...\n");
+        smpbench_serial_run();
+#ifdef DCACHE_ON
+        { extern void mmu_enable_dcache(void);
+          uart_puts("[dcache-exp] enabling D-cache C=1, then re-measuring ...\n");
+          mmu_enable_dcache(); }
+#endif
+        uart_puts("[dcache-exp] starting SMP workers (multi-core, D-cache ON) ...\n");
+        smp_init();
+        uart_puts("[dcache-exp] SMP up, cores=");
+        uart_putc((char)('0' + smp_cores_online()));
+        uart_puts(". running bench ...\n");
+        smpbench_serial_run();
+        uart_puts("DCACHE_EXPERIMENT: halting.\n");
+        for (;;) __asm__ volatile ("wfe");
+    }
+#else
     { extern void smp_init(void); extern int smp_cores_online(void);
       extern void smp_run_boot_bench(long n);
       smp_init();
@@ -1668,19 +1702,6 @@ void kernel_main(void)
       uart_putc((char)('0' + smp_cores_online())); uart_puts("\n");
       /* One-shot prime-count benchmark to serial: 1-core vs all-cores. */
       smp_run_boot_bench(200000); }
-
-#ifdef DCACHE_EXPERIMENT
-    /* D-cache ON experiment: run the fill/dining/null sweep to the serial
-     * console NOW — after smp_init (workers up, D-cache on) but BEFORE any DMA
-     * agent (net/USB/WM) starts, so the D-cache never coexists with an
-     * incoherent device.  Then halt: with C=1 the GEM/USB/FB DMA would be
-     * incoherent, so we deliberately do not continue into normal boot. */
-    {
-        extern void smpbench_serial_run(void);
-        smpbench_serial_run();
-        uart_puts("DCACHE_EXPERIMENT: halting (no net/USB with D-cache on).\n");
-        for (;;) __asm__ volatile ("wfe");
-    }
 #endif
 
     /* Pass our MAC to the responder so ARP replies carry the

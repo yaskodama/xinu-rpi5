@@ -64,6 +64,36 @@ static void dcache_invalidate_all(void)
     }
     __asm__ volatile ("msr csselr_el1, xzr\n dsb sy\n isb\n" ::: "memory");
 }
+
+/* Clean / invalidate a VA range by 64-byte cache line (A76 line = 64 B).  Used
+ * by the SMP mailbox coherency in smp.c: even though the A76 DSU keeps inner-
+ * shareable WB memory coherent, we clean writes to RAM and invalidate before
+ * cross-core reads at each sync point so the lock-free worker pool is coherent
+ * under C=1 independent of the DSU's snoop assumptions.  EL1-legal, no trap. */
+void dcache_clean_range(void *va, unsigned long size)
+{
+    unsigned long a = (unsigned long)va & ~63UL, end = (unsigned long)va + size;
+    for (; a < end; a += 64) __asm__ volatile ("dc cvac, %0" :: "r"(a));
+    __asm__ volatile ("dsb sy" ::: "memory");
+}
+void dcache_inval_range(void *va, unsigned long size)
+{
+    unsigned long a = (unsigned long)va & ~63UL, end = (unsigned long)va + size;
+    for (; a < end; a += 64) __asm__ volatile ("dc ivac, %0" :: "r"(a));
+    __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* Enable the D-cache (SCTLR.C=1) on core 0, deferred until AFTER the OFF
+ * baseline bench so the experiment can measure C=0 and C=1 at the same boot
+ * clock.  Invalidate by set/way first (the cache holds reset garbage). */
+void mmu_enable_dcache(void)
+{
+    unsigned long sctlr;
+    dcache_invalidate_all();
+    __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
+    sctlr |= (1UL << 2);                    /* C = 1 */
+    __asm__ volatile ("msr sctlr_el1, %0\n isb\n" :: "r"(sctlr) : "memory");
+}
 #endif /* DCACHE_ON */
 
 void mmu_init(void)
@@ -126,13 +156,11 @@ void mmu_init(void)
     __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
     sctlr |= 1UL | (1UL << 12);            /* M = 1, I = 1 */
 #ifdef DCACHE_ON
-    /* ★ Enable the D-cache (C=1) for the experiment.  Invalidate by set/way
-     * FIRST (the cache holds reset garbage).  The A76's DSU keeps the shareable
-     * WB mappings coherent between cores without a software SMPEN bit (unlike
-     * the A53), so the lock-free worker-pool mailbox stays coherent — the
-     * bench's own agree=yes check confirms this at run time. */
-    dcache_invalidate_all();
-    sctlr |= (1UL << 2);                    /* C = 1 (DCACHE_ON) */
+    /* ★ D-cache (C=1) is enabled LATER by mmu_enable_dcache(), called from main()
+     * AFTER the OFF-baseline bench, so the experiment measures C=0 and C=1 at the
+     * same boot clock.  The A76's DSU keeps shareable WB memory coherent between
+     * cores; we additionally do explicit mailbox maintenance in smp.c so the
+     * lock-free worker pool is coherent regardless (see the D-2 cross-check). */
 #endif
     __asm__ volatile ("msr sctlr_el1, %0" :: "r"(sctlr));
     __asm__ volatile ("isb");

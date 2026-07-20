@@ -548,11 +548,12 @@ void smpbench_serial_run(void)
     uart_puts("compare speedup RATIOS (clock varies); agree=yes = coherent.\r\n");
 
     /* dining (pure compute) + fill sweep (memory) across 1..online cores. */
-    for (int pass = 0; pass < 2 + (int)(sizeof(fills)/sizeof(fills[0])); pass++) {
+    for (int pass = 0; pass < 3 + (int)(sizeof(fills)/sizeof(fills[0])); pass++) {
         smp_range_fn fn; long units; const char *label;
-        if (pass == 0)      { g_din_n = 5; units = 200000; fn = bench_dining; label = "dining"; }
-        else if (pass == 1) { units = online;  fn = bench_null; label = "null"; }
-        else { units = fills[pass-2]; fn = bench_fill; label = "fill"; }
+        if (pass == 0)      { g_din_n = 5;  units = 200000;  fn = bench_dining;  label = "dining"; }
+        else if (pass == 1) { g_nq_n = 12;  units = g_nq_n;  fn = bench_nqueens; label = "nqueens"; }
+        else if (pass == 2) { units = online; fn = bench_null; label = "null"; }
+        else { units = fills[pass-3]; fn = bench_fill; label = "fill"; }
 
         unsigned long t0 = now_us();
         long r1 = smp_parallel_sum(fn, units, 1);
@@ -562,7 +563,7 @@ void smpbench_serial_run(void)
         unsigned long usN = now_us() - t0;
 
         int n = s_put(b, 0, "  "); n = s_put(b, n, label);
-        if (fn == bench_fill) { n = s_put(b, n, " n="); n = s_putdec(b, n, units); }
+        if (fn == bench_fill || fn == bench_nqueens) { n = s_put(b, n, " n="); n = s_putdec(b, n, units); }
         n = s_put(b, n, "  1c="); n = s_putdec(b, n, (long)us1);
         n = s_put(b, n, "us Nc="); n = s_putdec(b, n, (long)usN);
         n = s_put(b, n, "us  x100=");

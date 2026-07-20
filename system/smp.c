@@ -39,6 +39,22 @@ static volatile int          smp_job_done[SMP_NCORES];   /* == seq when finished
 static inline void dsb_sev(void) { __asm__ volatile("dsb sy\n\tsev" ::: "memory"); }
 static inline void dsb(void)     { __asm__ volatile("dsb sy" ::: "memory"); }
 
+/* ---- D-cache experiment (DCACHE_ON): keep the lock-free mailbox + secondary
+ * bring-up data coherent under C=1 by explicit cache maintenance (clean writes
+ * to RAM, invalidate before cross-core reads).  The A76 DSU should keep inner-
+ * shareable WB coherent on its own, but the multi-core run earlier only agreed
+ * intermittently; this forces coherency independent of the DSU.  dc cvac/ivac
+ * are EL1-legal (no trap).  No-ops in the normal D-cache-OFF build. */
+#ifdef DCACHE_ON
+extern void dcache_clean_range(void *, unsigned long);
+extern void dcache_inval_range(void *, unsigned long);
+#define MB_CLEAN(p)  dcache_clean_range((void *)(p), sizeof *(p))
+#define MB_INVAL(p)  dcache_inval_range((void *)(p), sizeof *(p))
+#else
+#define MB_CLEAN(p)  ((void)0)
+#define MB_INVAL(p)  ((void)0)
+#endif
+
 /* PSCI (Power State Coordination Interface).  The Pi 5 boots ARM Trusted
  * Firmware (BL31) at EL3 — confirmed by the "NOTICE: BL31:" line on the serial
  * console — which holds cores 1-3 and starts them only on a PSCI CPU_ON SMC.
@@ -76,15 +92,20 @@ int smp_core_id(void)
 /* The worker idle loop: wait (low-power) for a new job, run it, signal done. */
 static void smp_worker_loop(int core)
 {
+    MB_INVAL(&smp_job_seq[core]);
     int last = smp_job_seq[core];
     for (;;) {
-        while (smp_job_seq[core] == last) __asm__ volatile("wfe");
+        MB_INVAL(&smp_job_seq[core]);
+        while (smp_job_seq[core] == last) { __asm__ volatile("wfe"); MB_INVAL(&smp_job_seq[core]); }
         last = smp_job_seq[core];
+        MB_INVAL(&smp_job_fn[core]); MB_INVAL(&smp_job_lo[core]); MB_INVAL(&smp_job_hi[core]);
         smp_range_fn fn = smp_job_fn[core];
         long r = fn ? fn(smp_job_lo[core], smp_job_hi[core], core) : 0;
         smp_job_res[core] = r;
+        MB_CLEAN(&smp_job_res[core]);
         dsb();
         smp_job_done[core] = last;       /* publish completion after the result */
+        MB_CLEAN(&smp_job_done[core]);
         dsb_sev();                       /* wake core 0 out of its wait spin     */
     }
 }
@@ -100,6 +121,7 @@ void smp_secondary_entry(int core)
     exception_init();
     mmu_enable_secondary();
     smp_online[core] = 1;
+    MB_CLEAN(&smp_online[core]);             /* flush so core 0 sees us under C=1 */
     dsb_sev();                              /* tell core 0 we are up */
     smp_worker_loop(core);                  /* never returns */
 }
@@ -111,6 +133,9 @@ void smp_init(void)
         smp_job_seq[c]  = 0;
         smp_job_done[c] = 0;
         smp_stacktop[c] = (unsigned long)(smp_stack[c] + SMP_STACK_BYTES);
+        /* Under C=1 these sit in core 0's cache; the PSCI-started core reads its
+         * stack top in boot.S with the cache OFF and would get stale RAM. */
+        MB_CLEAN(&smp_job_seq[c]); MB_CLEAN(&smp_job_done[c]); MB_CLEAN(&smp_stacktop[c]);
     }
     dsb();
 
@@ -121,6 +146,7 @@ void smp_init(void)
      * path (only taken if some firmware instead drops cores into _start). */
     for (int c = 1; c < SMP_NCORES; c++) {
         smp_release[c] = (unsigned long)&_smp_start;
+        MB_CLEAN(&smp_release[c]);           /* boot.S reads it with the cache OFF */
         dsb();
 #ifdef RP1_ETH_BASE
         /* Pi 5: target MPIDR carries the core id in Aff1 (cpu@c reg = 0x100*c). */
@@ -133,7 +159,8 @@ void smp_init(void)
      * respond in this window is treated as offline and boot proceeds. */
     for (int c = 1; c < SMP_NCORES; c++) {
         unsigned long spins = 0;
-        while (!smp_online[c] && ++spins < SMP_BRINGUP_WAIT) __asm__ volatile("nop");
+        MB_INVAL(&smp_online[c]);
+        while (!smp_online[c] && ++spins < SMP_BRINGUP_WAIT) { __asm__ volatile("nop"); MB_INVAL(&smp_online[c]); }
     }
 }
 
@@ -162,8 +189,10 @@ long smp_parallel_sum(smp_range_fn fn, long n, int ncores)
         smp_job_fn[c] = fn;
         smp_job_lo[c] = lo;
         smp_job_hi[c] = hi;
+        MB_CLEAN(&smp_job_fn[c]); MB_CLEAN(&smp_job_lo[c]); MB_CLEAN(&smp_job_hi[c]);
         dsb();
         smp_job_seq[c]++;        /* arm the job, then wake the worker */
+        MB_CLEAN(&smp_job_seq[c]);
         dsb_sev();
     }
 
@@ -174,6 +203,7 @@ long smp_parallel_sum(smp_range_fn fn, long n, int ncores)
     for (int c = 1; c < ncores; c++) {
         if (!smp_online[c]) continue;          /* already done inline above */
         unsigned long spins = 0;
+        MB_INVAL(&smp_job_done[c]);
         while (smp_job_done[c] != smp_job_seq[c]) {
             if (++spins >= SMP_WAIT_LIMIT) {   /* worker stuck — do it here */
                 long lo = (long)c * chunk;
@@ -182,7 +212,9 @@ long smp_parallel_sum(smp_range_fn fn, long n, int ncores)
                 break;
             }
             __asm__ volatile("nop");
+            MB_INVAL(&smp_job_done[c]);
         }
+        MB_INVAL(&smp_job_res[c]);
         total += smp_job_res[c];
     }
     return total;

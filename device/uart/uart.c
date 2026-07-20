@@ -121,6 +121,11 @@ static int   g_uart_cap_cap, g_uart_cap_len;
 void uart_capture(char *buf, int cap) { g_uart_cap = buf; g_uart_cap_cap = cap; g_uart_cap_len = 0; if (buf && cap) buf[0] = 0; }
 void uart_capture_stop(void) { g_uart_cap = 0; }
 
+/* When set (D-cache experiment, IRQs masked), uart_putc spins on TXFF instead
+ * of dropping — see the comment in uart_putc.  Default 0 = normal non-blocking. */
+volatile int g_uart_block = 0;
+void uart_set_blocking(int on) { g_uart_block = on; }
+
 void uart_putc(char c)
 {
     if (g_uart_cap && g_uart_cap_len < g_uart_cap_cap - 1) {
@@ -131,11 +136,18 @@ void uart_putc(char c)
     shellwin_record_char(c);   /* wm shell window ring — safe before init (drops) */
     screen_putc(c);            /* text console — no-op before video_init()        */
 
-    /* UART TX is NON-blocking: this runs in the input/echo path (often the timer
-     * ISR), and the serial line is unused on this board, so never spin on the
-     * 115200-baud FIFO — just drop the byte if it's full.  Keeps typing snappy. */
-    if (!(UART_FR & FR_TXFF))
+    /* UART TX is NON-blocking by default: this runs in the input/echo path
+     * (often the timer ISR), and the serial line is normally unused, so never
+     * spin on the 115200-baud FIFO — just drop the byte if it's full.  Keeps
+     * typing snappy.  EXCEPTION: g_uart_block (set for the D-cache experiment,
+     * where IRQs are masked and we must not drop bench output) spins on TXFF so
+     * every byte of a long line survives to the serial capture. */
+    if (g_uart_block) {
+        while (UART_FR & FR_TXFF) { }
         UART_DR = (unsigned int)(unsigned char)c;
+    } else if (!(UART_FR & FR_TXFF)) {
+        UART_DR = (unsigned int)(unsigned char)c;
+    }
 }
 
 void uart_puts(const char *s)
