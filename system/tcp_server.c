@@ -617,6 +617,112 @@ void wifi_adhoc_poll_pending(void)
     wifi_adhoc(g_adhoc_ssid, g_adhoc_ch, g_adhoc_n);
 }
 
+/* ===== RT diagnostic harness (rpi5): periodic-task release jitter =========
+ * Ported from xinu-rpi4's /rtos-jitter, adapted to rpi5's proc API:
+ *   - proc_create_static (NOT proc_create): heap-free, safe from the
+ *     genet_rx_tick/net_proc context this runs in (getmem is non-reentrant here);
+ *   - proc_create_static already ready_push()es, so we do NOT call proc_ready();
+ *   - newly-created procs start IRQs-on (proc_entry_trampoline), so a compute
+ *     hog is genuinely preemptible.
+ * Since RT-port Stage 2, http_build runs in the net_proc process, so proc_yield/
+ * proc_sleep_us here are safe.  rpi5 has priority ready_pop + tickless
+ * proc_sleep_us + timer preemption, so a high-prio periodic task should hold its
+ * period even under a full-core hog. */
+extern int  proc_create_static(void (*)(void), void *, unsigned long, const char *);
+extern void proc_yield(void);
+extern void proc_exit(void);
+extern void proc_setprio(int, int);
+extern void proc_sleep_us(unsigned long);
+extern void proc_set_preempt(int);
+
+static unsigned char g_rt_stk_a[8192];   /* hog / preempt-A (reused per request) */
+static unsigned char g_rt_stk_b[8192];   /* measure / preempt-B                  */
+
+struct jit_stat {
+    volatile int  done;
+    unsigned long target_us, n, min_us, max_us, sum_us, max_abs_jit_us, misses;
+};
+static struct jit_stat        g_jit;
+static volatile int           g_jit_hog_run;
+static volatile unsigned long g_jit_chunk_us;
+
+static void jit_hog(void)
+{
+    /* IRQs on at entry (trampoline) so the timer preempts this tight loop. */
+    volatile unsigned x = 2463534242u;
+    while (g_jit_hog_run) {
+        unsigned long s = now_us();
+        while (now_us() - s < g_jit_chunk_us) {
+            int i; for (i = 0; i < 64; i++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; }
+        }
+        proc_yield();                    /* cooperative fallback if preempt off */
+    }
+    proc_exit();
+}
+
+static void jit_measure(void)
+{
+    /* Relative schedule: each release measured `target` after the ACTUAL prev
+     * wake, so a late wake never triggers a catch-up burst.  Publish once. */
+    unsigned long target = g_jit.target_us, N = g_jit.n;
+    unsigned long mn = 0xffffffffUL, mx = 0, sum = 0, mj = 0, miss = 0;
+    unsigned long prev = now_us(), i;
+    for (i = 0; i < N; i++) {
+        proc_sleep_us(target);                       /* tickless RT sleep */
+        unsigned long t = now_us(), d = t - prev;    /* actual period */
+        prev = t;
+        if (d < mn) mn = d;
+        if (d > mx) mx = d;
+        sum += d;
+        unsigned long jit = (d > target) ? (d - target) : (target - d);
+        if (jit > mj) mj = jit;
+        if (jit > target / 2UL) miss++;              /* deadline miss = >50% off */
+    }
+    g_jit.min_us = mn; g_jit.max_us = mx; g_jit.sum_us = sum;
+    g_jit.max_abs_jit_us = mj; g_jit.misses = miss; g_jit.n = N;
+    g_jit_hog_run = 0;
+    g_jit.done = 1;
+    proc_exit();
+}
+
+static void jit_run(unsigned long period_ms, unsigned long samples,
+                    int with_hog, unsigned long chunk_us)
+{
+    g_jit.done = 0; g_jit.target_us = period_ms * 1000UL; g_jit.n = samples;
+    if (with_hog) {
+        g_jit_hog_run = 1; g_jit_chunk_us = chunk_us;
+        int hp = proc_create_static(jit_hog, g_rt_stk_a, sizeof g_rt_stk_a, "jit_hog");
+        if (hp > 0) proc_setprio(hp, 5);             /* low priority; already ready */
+    }
+    int mp = proc_create_static(jit_measure, g_rt_stk_b, sizeof g_rt_stk_b, "jit_meas");
+    if (mp <= 0) { g_jit.done = 1; g_jit_hog_run = 0; return; }
+    proc_setprio(mp, 50);                            /* high (RT) priority */
+    /* Time-based guard: run lasts ~samples*(period+chunk); yield until done. */
+    unsigned long deadline = now_us()
+        + (unsigned long)samples * (period_ms * 1000UL + chunk_us) + 3000000UL;
+    while (!g_jit.done && now_us() < deadline) proc_yield();
+    g_jit_hog_run = 0;
+    { int k; for (k = 0; k < 256; k++) proc_yield(); }   /* let the hog exit */
+}
+
+/* ---- /preempt demo: two equal-priority CPU tasks, no yield ----
+ * Under preemptive scheduling the 100 Hz tick time-slices them -> interleaved
+ * "ABAB..."; cooperative (preempt off) -> blocky "AAAA..BBBB". */
+static volatile char g_pd_log[40];
+static volatile int  g_pd_pos;
+static void pd_mark(char c)
+{
+    int reps;
+    for (reps = 0; reps < 6; reps++) {
+        unsigned long s = now_us();
+        while (now_us() - s < 4000UL) { }            /* ~4 ms busy, NO yield */
+        int q = g_pd_pos;
+        if (q < (int)sizeof(g_pd_log) - 1) { g_pd_log[q] = c; g_pd_pos = q + 1; }
+    }
+}
+static void pd_a(void) { pd_mark('A'); proc_exit(); }
+static void pd_b(void) { pd_mark('B'); proc_exit(); }
+
 static int http_build(const char *req, char *out, int max)
 {
     char body[640];
@@ -667,6 +773,69 @@ static int http_build(const char *req, char *out, int max)
         p = s_put(out, p, " nbatch=");       p = s_putdec(out, p, avm_get_par_nbatch());
         p = s_put(out, p, " lastbn=");       p = s_putdec(out, p, avm_get_par_lastbn());
         p = s_put(out, p, "\n");
+        return p;
+    }
+
+    if (path_eq(req, "/rtos-jitter")) {
+        /* Periodic-task release jitter, idle vs under a full-core compute hog.
+         * rpi5 RT (preempt + tickless): a high-prio 1 kHz task should hold its
+         * period with 0 deadline misses even under load.  Compare preempt on/off:
+         *   curl '.../rtos-jitter?period_ms=1&samples=200&chunk_us=5000&preempt=1'
+         *   curl '.../rtos-jitter?period_ms=1&samples=200&chunk_us=5000&preempt=0' */
+        int P  = q_int(req, "period_ms", 1);   if (P < 1) P = 1;   if (P > 1000) P = 1000;
+        int NS = q_int(req, "samples", 200);   if (NS < 1) NS = 1; if (NS > 2000) NS = 2000;
+        int C  = q_int(req, "chunk_us", 5000); if (C < 0) C = 0;   if (C > 100000) C = 100000;
+        int pe = q_int(req, "preempt", 1);
+        proc_set_preempt(pe ? 1 : 0);
+        jit_run(P, NS, 0, 0);                struct jit_stat a = g_jit;   /* idle   */
+        jit_run(P, NS, 1, (unsigned long)C); struct jit_stat b = g_jit;   /* + hog  */
+        proc_set_preempt(1);                 /* restore net_proc steady state */
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "rtos-jitter (rpi5 RT-port Stage2: preempt+tickless) period_ms=");
+        p = s_putdec(out, p, P);
+        p = s_put(out, p, " samples=");      p = s_putdec(out, p, NS);
+        p = s_put(out, p, " hog_chunk_us="); p = s_putdec(out, p, C);
+        p = s_put(out, p, " preempt=");      p = s_putdec(out, p, pe);
+        p = s_put(out, p, " target_us=");    p = s_putdec(out, p, (long)a.target_us);
+        p = s_put(out, p, "\n[idle]   mean_us="); p = s_putdec(out, p, (long)(a.n ? a.sum_us / a.n : 0));
+        p = s_put(out, p, " max_us=");     p = s_putdec(out, p, (long)a.max_us);
+        p = s_put(out, p, " max_jit_us="); p = s_putdec(out, p, (long)a.max_abs_jit_us);
+        p = s_put(out, p, " misses=");     p = s_putdec(out, p, (long)a.misses);
+        p = s_put(out, p, "\n[loaded] mean_us="); p = s_putdec(out, p, (long)(b.n ? b.sum_us / b.n : 0));
+        p = s_put(out, p, " max_us=");     p = s_putdec(out, p, (long)b.max_us);
+        p = s_put(out, p, " max_jit_us="); p = s_putdec(out, p, (long)b.max_abs_jit_us);
+        p = s_put(out, p, " misses=");     p = s_putdec(out, p, (long)b.misses);
+        p = s_put(out, p, "\n");
+        return p;
+    }
+
+    if (path_eq(req, "/preempt")) {
+        /* Two equal-priority CPU tasks (no yield).  preempt=1 -> interleaved
+         * ABAB (100 Hz time-slice); preempt=0 -> blocky AAAA..BBBB. */
+        int pe = q_int(req, "preempt", 1);
+        int z;
+        g_pd_pos = 0;
+        for (z = 0; z < (int)sizeof(g_pd_log); z++) g_pd_log[z] = 0;
+        proc_set_preempt(pe ? 1 : 0);
+        int ai = proc_create_static(pd_a, g_rt_stk_a, sizeof g_rt_stk_a, "pd_a");
+        int bi = proc_create_static(pd_b, g_rt_stk_b, sizeof g_rt_stk_b, "pd_b");
+        if (ai > 0) proc_setprio(ai, 10);
+        if (bi > 0) proc_setprio(bi, 10);            /* equal priority */
+        unsigned long dl = now_us() + 3000000UL;
+        while (g_pd_pos < 12 && now_us() < dl) proc_yield();
+        proc_set_preempt(1);                         /* restore steady state */
+        char tmp[41];
+        for (z = 0; z < (int)sizeof(g_pd_log) && g_pd_log[z]; z++) tmp[z] = g_pd_log[z];
+        tmp[z] = 0;
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "preempt="); p = s_putdec(out, p, pe);
+        p = s_put(out, p, " (equal-prio A/B, ~4ms/mark, no yield): ");
+        p = s_put(out, p, tmp);
+        p = s_put(out, p, "\n  interleaved ABAB = preemptive; blocky AAAA..BBBB = cooperative\n");
         return p;
     }
 
