@@ -16,15 +16,40 @@
 #include "timer.h"
 #include "irq.h"
 #include "gic.h"
+#include "proc.h"
 
 #define TIMER_IRQ_PPI 30
 
 static unsigned long          timer_interval;
+static unsigned long          timer_freq;     /* CNTFRQ_EL0 (ticks/sec) */
 static volatile unsigned long tick_count;
 
 static inline void cntp_set_tval(unsigned long v)
 {
     __asm__ volatile ("msr cntp_tval_el0, %0" : : "r"(v));
+}
+
+static inline long cntp_get_tval(void)
+{
+    long v;
+    __asm__ volatile ("mrs %0, cntp_tval_el0" : "=r"(v));
+    return v;
+}
+
+static inline unsigned long us_to_ticks(unsigned long us)
+{
+    return (timer_freq * us) / 1000000UL;
+}
+
+/* Tickless one-shot helper: arm the timer to fire `us` from now if sooner than
+ * what is pending.  Called (IRQs masked) from proc_sleep_us for precise RT
+ * wakeup.  (Stage 1 keeps the periodic reload; this just lets a nearer RT
+ * deadline pull the next fire in.) */
+void timer_arm_before_us(unsigned long us)
+{
+    if (!timer_freq) return;
+    long want = (long)us_to_ticks(us);
+    if (want < cntp_get_tval()) cntp_set_tval((unsigned long)(want > 1 ? want : 1));
 }
 
 static inline void cntp_set_ctl(unsigned long v)
@@ -52,12 +77,15 @@ static void timer_irq_handler(void *arg)
      * of the handler takes a few μs. */
     cntp_set_tval(timer_interval);
     tick_count++;
-    timer_tick_hook();
+    proc_timer_tick();         /* wake due RT sleepers (no-op if none) */
+    timer_tick_hook();         /* drain the net stack (unchanged in Stage 1) */
+    proc_resched_request();    /* request a preemptive switch (acted on after EOI) */
 }
 
 void timer_init(void)
 {
     unsigned long freq = cntfrq();
+    timer_freq     = freq;
     timer_interval = freq / TIMER_HZ;
 
     /* Mask + disable while we configure so a partial state can't

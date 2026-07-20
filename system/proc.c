@@ -12,12 +12,33 @@
 
 #include "proc.h"
 #include "memory.h"
+#include "critical.h"
 
 struct procent proctab[NPROC];
 int            currpid;
+extern void proc_entry_trampoline(void);   /* ctxsw.S: msr daifclr #2; br x19 */
+
+/* Preemption (timer-driven).  OFF by default: the cooperative AIPL/actor
+ * runtime shares non-reentrant state, so we only preempt when explicitly
+ * enabled, and never while the actor pump runs. */
+static volatile int g_preempt_on;
+static volatile int g_resched_pending;
+static volatile int g_actor_pump;
+void proc_set_preempt(int on)      { g_preempt_on = on ? 1 : 0; }
+void proc_resched_request(void)    { g_resched_pending = 1; }
+void proc_actor_pump_enter(void)   { g_actor_pump++; }
+void proc_actor_pump_leave(void)   { if (g_actor_pump > 0) g_actor_pump--; }
 
 static struct procent *ready_head;
 static struct procent *ready_tail;
+
+static unsigned long proc_now_us(void)
+{
+    unsigned long ct, hz;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
+    return hz ? (ct * 1000000UL) / hz : 0;
+}
 
 static void copy_name(char *dst, const char *src)
 {
@@ -39,12 +60,20 @@ static void ready_push(struct procent *p)
 
 static struct procent *ready_pop(void)
 {
-    struct procent *p = ready_head;
-    if (p == 0) return 0;
-    ready_head = p->next;
-    if (ready_head == 0) ready_tail = 0;
-    p->next = 0;
-    return p;
+    if (ready_head == 0) return 0;
+    /* Priority-ordered dispatch (rpi3/rpi4-style): return the highest-prio ready
+     * proc; ties keep FIFO order (first of the highest prio). */
+    struct procent *best = ready_head, *bestprev = 0;
+    struct procent *prev = ready_head, *curr = ready_head->next;
+    while (curr) {
+        if (curr->prio > best->prio) { best = curr; bestprev = prev; }
+        prev = curr; curr = curr->next;
+    }
+    if (bestprev) bestprev->next = best->next;
+    else          ready_head = best->next;
+    if (ready_tail == best) ready_tail = bestprev;
+    best->next = 0;
+    return best;
 }
 
 void proc_init(void)
@@ -112,12 +141,12 @@ int proc_create(proc_entry_t entry, unsigned long stksize, const char *name)
     unsigned long *sp_top = (unsigned long *)((unsigned char *)stk + stksize);
     unsigned long *sp     = sp_top - 12;
     sp[0]  = 0;                          /* x29 (FP)            */
-    sp[1]  = (unsigned long)entry;       /* x30 (LR -> entry)   */
+    sp[1]  = (unsigned long)proc_entry_trampoline;  /* x30 -> trampoline */
     sp[2]  = 0; sp[3]  = 0;              /* x27, x28            */
     sp[4]  = 0; sp[5]  = 0;              /* x25, x26            */
     sp[6]  = 0; sp[7]  = 0;              /* x23, x24            */
     sp[8]  = 0; sp[9]  = 0;              /* x21, x22            */
-    sp[10] = 0; sp[11] = 0;              /* x19, x20            */
+    sp[10] = (unsigned long)entry; sp[11] = 0;  /* x19 -> entry (trampoline br) */              /* x19, x20            */
     p->sp = (void *)sp;
 
     ready_push(p);
@@ -150,12 +179,12 @@ int proc_create_static(proc_entry_t entry, void *stk, unsigned long stksize,
     sp_top = (unsigned long *)((unsigned long)sp_top & ~15UL);   /* 16-byte align */
     unsigned long *sp     = sp_top - 12;
     sp[0]  = 0;                          /* x29 (FP)            */
-    sp[1]  = (unsigned long)entry;       /* x30 (LR -> entry)   */
+    sp[1]  = (unsigned long)proc_entry_trampoline;  /* x30 -> trampoline */
     sp[2]  = 0; sp[3]  = 0;
     sp[4]  = 0; sp[5]  = 0;
     sp[6]  = 0; sp[7]  = 0;
     sp[8]  = 0; sp[9]  = 0;
-    sp[10] = 0; sp[11] = 0;
+    sp[10] = (unsigned long)entry; sp[11] = 0;  /* x19 -> entry (trampoline br) */
     p->sp = (void *)sp;
 
     ready_push(p);
@@ -176,8 +205,9 @@ void proc_ready(int pid)
  * unconditionally). */
 void proc_resched(void)
 {
+    unsigned long d = irq_save();
     struct procent *newp = ready_pop();
-    if (newp == 0) return;
+    if (newp == 0) { irq_restore(d); return; }
 
     int new_pid       = (int)(newp - proctab);
     struct procent *oldp = &proctab[currpid];
@@ -195,6 +225,86 @@ void proc_resched(void)
 
     ctxsw(&oldp->sp, newp->sp);
     /* Returns here when somebody ctxsw()'s back to us. */
+    irq_restore(d);
+}
+
+/* Block the caller (PR_WAIT) until proc_ready() puts it back. */
+void proc_block(void)
+{
+    unsigned long d = irq_save();
+    struct procent *oldp = &proctab[currpid];
+    oldp->state = PR_WAIT;
+    struct procent *newp = ready_pop();
+    if (newp == 0) newp = &proctab[NULLPROC];
+    newp->state = PR_CURR;
+    currpid = (int)(newp - proctab);
+    ctxsw(&oldp->sp, newp->sp);
+    irq_restore(d);
+}
+
+/* ---- Real-time additions (P1, ported from rpi4) ---- */
+void proc_setprio(int pid, int prio)
+{
+    if (pid < 0 || pid >= NPROC) return;
+    proctab[pid].prio = prio;
+}
+
+void proc_sleep_us(unsigned long us)
+{
+    extern void timer_arm_before_us(unsigned long);   /* tickless one-shot */
+    unsigned long d = irq_save();
+    struct procent *oldp = &proctab[currpid];
+    oldp->wake_at_us = proc_now_us() + us;
+    oldp->state = PR_SLEEP;
+    timer_arm_before_us(us);
+    struct procent *newp = ready_pop();
+    if (newp == 0) newp = &proctab[NULLPROC];
+    newp->state = PR_CURR;
+    currpid = (int)(newp - proctab);
+    ctxsw(&oldp->sp, newp->sp);
+    irq_restore(d);
+}
+
+/* Called from the timer IRQ (IRQs already masked): ready any sleeper whose
+ * deadline has passed and request a preemptive switch. */
+void proc_timer_tick(void)
+{
+    unsigned long now = proc_now_us();
+    int woke = 0, i;
+    for (i = 0; i < NPROC; i++) {
+        if (proctab[i].state == PR_SLEEP && now >= proctab[i].wake_at_us) {
+            proctab[i].state = PR_READY;
+            ready_push(&proctab[i]);
+            woke = 1;
+        }
+    }
+    if (woke) g_resched_pending = 1;
+}
+
+#define PROC_TICK_FLOOR_US 1000UL
+#define PROC_TICK_MIN_US    200UL
+unsigned long proc_next_delay_us(void)
+{
+    unsigned long now = proc_now_us();
+    unsigned long best = PROC_TICK_FLOOR_US;
+    int i;
+    for (i = 0; i < NPROC; i++) {
+        if (proctab[i].state == PR_SLEEP) {
+            unsigned long w = proctab[i].wake_at_us;
+            unsigned long dd = (w > now) ? (w - now) : 0;
+            if (dd < best) best = dd;
+        }
+    }
+    return best < PROC_TICK_MIN_US ? PROC_TICK_MIN_US : best;
+}
+
+/* Timer-driven preemption point: called after the IRQ is EOI'd. */
+void proc_preempt(void)
+{
+    if (!g_preempt_on || !g_resched_pending) return;
+    if (g_actor_pump) return;   /* actors run cooperatively */
+    g_resched_pending = 0;
+    if (currpid != NULLPROC) proc_resched();
 }
 
 void proc_yield(void)

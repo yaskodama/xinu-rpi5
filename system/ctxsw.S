@@ -40,3 +40,17 @@ ctxsw:
 
     ret                                // jump to restored LR
     .size ctxsw, .-ctxsw
+
+// proc_entry_trampoline — first-run entry for a freshly-created process.
+// A process is first dispatched by a ctxsw inside proc_resched's irq_save()
+// critical section (IRQs masked), and ctxsw does not touch DAIF, so without
+// this the new process would start with interrupts DISABLED and a tight compute
+// loop could never be preempted.  proc_create() puts this address in x30 and
+// the real entry in x19, so `ret` lands here: enable IRQs, then jump to entry.
+    .global  proc_entry_trampoline
+    .type    proc_entry_trampoline, %function
+    .balign  16
+proc_entry_trampoline:
+    msr     daifclr, #2                // clear I: enable IRQs
+    br      x19                        // jump to the real entry (never returns)
+    .size proc_entry_trampoline, .-proc_entry_trampoline

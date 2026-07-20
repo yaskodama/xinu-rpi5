@@ -8,6 +8,7 @@
 
 #include "irq.h"
 #include "gic.h"
+#include "proc.h"
 
 #define IRQ_TABLE_MAX 256
 
@@ -37,4 +38,8 @@ void irq_dispatch_c(void)
     /* Even an unconnected SPI/PPI must be EOI'd so the GIC moves
      * past it; otherwise the same ID re-fires forever. */
     gic_eoi(iar);
+
+    /* After EOI (so the next process can still take timer IRQs), do any
+     * pending preemptive context switch.  No-op unless preemption is enabled. */
+    proc_preempt();
 }
