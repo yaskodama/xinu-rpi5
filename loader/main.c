@@ -247,16 +247,36 @@ static void genet_rx_tick(void)
  * default in device/timer/timer.c).  On the Pi 5 this drains the RP1 GEM
  * RX ring at a guaranteed 100 Hz so it no longer overruns/BNA-freezes when
  * the wm render loop is busy.  Empty on Pi 4/QEMU (RX stays on the wm loop). */
+/* ---- RT-port Stage 2: the net stack runs in a dedicated process, not the ISR.
+ * net_proc_main drains the RX ring + protocol stack + HTTP, then blocks; the
+ * 100 Hz timer IRQ readies it (net_wake) and, via preemption (proc_preempt
+ * after EOI), switches to it — so genet_rx_tick -> tcp_handle_packet now runs in
+ * a real process context where proc_yield()/proc_sleep_us() are safe, instead
+ * of in interrupt context.  It is the only non-NULL process (prio 1), so nothing
+ * preempts it mid-actor: the non-reentrant AIPL runtime stays safe. */
+static int g_net_pid = -1;
+
+static void net_proc_main(void)
+{
+    for (;;) {
+        genet_rx_tick();     /* drain RX + run protocol/HTTP (process context) */
+        proc_block();        /* sleep until the next timer wake */
+    }
+}
+
+/* Wake the net process (called from the timer IRQ, IRQs already masked). */
+static void net_wake(void)
+{
+    if (g_net_pid > 0 && proctab[g_net_pid].state == PR_WAIT)
+        proc_ready(g_net_pid);
+}
+
 void timer_tick_hook(void)
 {
 #if defined(RP1_ETH_BASE) && !defined(MINIMAL_OS)
-    /* The shell main loop blocks on UART input, so the timer IRQ is the only
-     * thing that reliably drains WiFi RX.  genet_rx_tick() -> wifi_net_poll()
-     * therefore answers ARP/ICMP and now also services the TCP/HTTP server in
-     * interrupt context — the same way the existing RP1-eth path already runs
-     * tcp_handle_packet() here.  A POST /compile runs cc inline (bounded by the
-     * cc runaway guard), causing a brief stall but no wedge. */
-    genet_rx_tick();
+    /* Was: genet_rx_tick() inline in the ISR.  Now: just wake the net process,
+     * which drains in a real process context (see net_proc_main). */
+    net_wake();
 #endif
 }
 
@@ -1656,6 +1676,15 @@ void kernel_main(void)
      * ISR's genet_rx_tick can drain it without racing the ring setup. */
     uart_puts("net: NIC up — unmasking DAIF.I (100 Hz RX drain live)\n");
     irq_enable_all();
+
+    /* RT-port Stage 2: move the net stack out of the timer ISR into a dedicated
+     * process.  Create it and enable timer-driven preemption so the 100 Hz tick
+     * wakes + switches to it (see net_proc_main / net_wake / timer_tick_hook).
+     * Big stack: HTTP handlers can run the cc JIT.  net_proc is the only non-NULL
+     * process (prio 1), so nothing preempts it mid-actor. */
+    g_net_pid = proc_create(net_proc_main, 65536, "net");
+    proc_set_preempt(1);
+    uart_puts("net: draining in net_proc (preemptive), ISR no longer runs the stack\n");
 
     /* Bring up the other 3 Cortex-A76 cores as compute workers (worker-pool
      * SMP; see system/smp.c + include/smp.h).  Core 0 keeps running the whole
