@@ -1972,6 +1972,8 @@ int wifi_serve(int secs)
  * Single-threaded: a shell client op (ping/http/dns/ntp) runs on the same
  * tick's call stack and blocks the frame loop, so this never races it.
  * Only active once associated + DHCP'd (wifi_have_ip); a no-op otherwise. */
+static void mn_hello_tick(void);   /* 周期 MANET HELLO（定義は MANET 節） */
+
 void wifi_net_poll(void)
 {
     static u8 fr[2048]; int chan, doff, n, budget;
@@ -1984,6 +1986,7 @@ void wifi_net_poll(void)
     now = SYSTIMER_CLO;
     if ((u32)(now - last_us) < 20000u) return;
     last_us = now;
+    mn_hello_tick();                 /* 周期 HELLO（内部で2秒律速）で近隣を自動発見 */
     /* Drain all queued RX frames this tick (bounded so we never monopolize the
      * wm frame loop) — at the wm frame rate a single frame/tick dropped pings;
      * draining the FIFO each tick keeps the responder reliable. */
@@ -2530,6 +2533,7 @@ int wifi_aodv(const u8 *dst)
 #define MN_PULLREQ  3
 #define MN_PULLRSP  4
 #define MN_BG       5                  /* 背景負荷: 受信側は取り込むが ACK しない */
+#define MN_HELLO    6                  /* 周期ビーコン: 近隣自動発見（無応答・記録のみ）*/
 #define MN_HDR      16
 #define MN_MAXNBR   64
 #define MN_MAXKNOWN 256
@@ -2554,6 +2558,11 @@ static int  g_mn_ackn   = 0;
 static u32  g_mn_t0     = 0;
 static u16  g_mn_wait   = 0;
 static int  g_mn_collect= 0;
+/* --- 近隣ノードの自動発見（周期 HELLO で埋まる） --- */
+static u8   g_mn_peers[MN_MAXNBR];      /* これまで受信したことのある src ノード id */
+static int  g_mn_peersn = 0;
+static u32  g_mn_hello_tx = 0;          /* 送信した HELLO 数 */
+static u32  g_mn_hello_last = 0;        /* 前回 HELLO 送信時刻 (SYSTIMER_CLO) */
 
 /* --- gknown 集合: AIPL 側 has() と同じ線形走査(コスト構造を合わせる) --- */
 static int mn_has(u16 id) { int i; for (i=0;i<g_mn_knownn;i++) if (g_mn_known[i]==id) return 1; return 0; }
@@ -2624,6 +2633,34 @@ static void mn_bcast(const u8 *p, int n)
     wifi_udp_tx(bc, bip, MN_PORT, MN_PORT, p, n);
 }
 
+/* 受信した src ノードを「発見済み近隣」に記録（重複は無視）。どの MANET パケット
+ * を受けても呼ぶので、HELLO でなくても発見できる。 */
+static void mn_peer_seen(u8 src)
+{
+    int i;
+    if (!src) return;
+    for (i = 0; i < g_mn_peersn; i++) if (g_mn_peers[i] == src) return;
+    if (g_mn_peersn < MN_MAXNBR) g_mn_peers[g_mn_peersn++] = src;
+}
+
+/* 周期 HELLO ビーコン: adhoc/IBSS で IP を持つ間、約2秒ごとに自ノードを
+ * ブロードキャストする。全ノードがこれを送れば、トラフィックを流さなくても
+ * 近隣表(g_mn_peers)が自動で埋まり、メッシュが「自律的に見える化」される。
+ * wifi_net_poll() から毎tick呼ばれるが、内部で2秒に律速するので軽い。 */
+static void mn_hello_tick(void)
+{
+    u8 p[MN_HDR]; u32 now;
+    extern int wifi_have_ip;
+    if (!wifi_have_ip) return;                 /* まだ IP 無し（未参加）*/
+    now = SYSTIMER_CLO;
+    if (g_mn_hello_last && (u32)(now - g_mn_hello_last) < 2000000u) return;  /* 2s 律速 */
+    g_mn_hello_last = now;
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    mn_mk(p, MN_HELLO, g_mn_seq++, 0);
+    mn_bcast(p, MN_HDR);
+    g_mn_hello_tx++;
+}
+
 /* 受信フック: UDP/5000 を捌く。wifi_handle_frame から aodv_ip_in の後に呼ぶ。
  * 返信は受信フレームの src MAC/IP へ直接ユニキャスト —— ARP を挟まないので
  * ARP 解決の遅延が測定値に混入しない。 */
@@ -2645,6 +2682,8 @@ static int manet_ip_in(u8 *e, int elen)
     if (!g_mn_node) g_mn_node = wifi_ip[3];
     if (src == g_mn_node) return 1;                 /* 自分のブロードキャストの折返し */
     g_mn_rx++;
+    mn_peer_seen(src);                              /* どのパケットでも近隣として記録 */
+    if (type == MN_HELLO) return 1;                 /* 周期ビーコン: 記録のみ・無応答 */
 
     if (type == MN_PUSH) {
         u16 fid = (u16)(p[4] | (p[5] << 8));
@@ -2729,6 +2768,10 @@ void wifi_manet_status(void)
              g_mn_knownn, g_mn_rx, g_mn_bg, g_mn_filtered);
     wifi_log("@B nbr");
     for (i = 0; i < g_mn_nbrn; i++) wifi_log(" %d", g_mn_nbr[i]);
+    wifi_log("\r\n");
+    /* 自動発見した近隣（周期 HELLO で埋まる）。mesh 収束の可視化。 */
+    wifi_log("@B peers n=%d hello_tx=%u ids=", g_mn_peersn, g_mn_hello_tx);
+    for (i = 0; i < g_mn_peersn; i++) wifi_log(" %d", g_mn_peers[i]);
     wifi_log("\r\n");
 }
 
