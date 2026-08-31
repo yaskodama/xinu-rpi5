@@ -109,7 +109,7 @@ static int parse_structure(const char *src)
         lex_next(); if(T.kind!=T_ID) return a2c_fail("class: expected name"); cpid(c->name); lex_next();
         if(!is_p("{")) return a2c_fail("class: expected '{'");
         lex_next();
-        while(!is_p("}") && T.kind!=T_EOF) {
+        while(!is_p("}") && T.kind!=T_EOF && !a2c_err[0]) {
             if (is_kw("var")) {
                 lex_next(); if(T.kind!=T_ID) return a2c_fail("field: expected name");
                 if(c->nfield>=MAXFIELD) return a2c_fail("too many fields");
@@ -150,16 +150,41 @@ static void  add_local(const char *n){ if(NLOCAL<64){int k=0;for(;n[k]&&k<47;k++
 static int parse_expr(void);
 static int parse_primary(void)
 {
+    /* 正典 AIPL にあって、この機内前段が持たない構文。識別子として素通しすると
+       壊れた C（v_timeout / v_replyto など）が出て cc 側で分かりにくく落ちる。
+       ここで名前を挙げて断る。読み進まないまま上位が回ることも防げる。 */
+    if (T.kind==T_ID) {
+        static const char *ni[] = { "future","await","select","reply","replyto",
+                                    "timeout","spawn","remote", 0 };
+        for (int i=0; ni[i]; i++) if (a2c_streq(T.s, ni[i])) {
+            char m[80]; int k=0; const char *pre="not supported on this device: ";
+            while(pre[k] && k<(int)sizeof m-1){ m[k]=pre[k]; k++; }
+            for(int j=0; ni[i][j] && k<(int)sizeof m-1; j++) m[k++]=ni[i][j];
+            m[k]=0; a2c_fail(m); return 0;
+        }
+    }
+
     if (T.kind==T_NUM) { int n=mknode(N_INT); ND[n].num=T.num; lex_next(); return n; }
     if (T.kind==T_STR) { int n=mknode(N_STR); cpid_to(ND[n].s); lex_next(); return n; }
     if (is_kw("new")) { lex_next(); if(T.kind!=T_ID){a2c_fail("new: expected class");return 0;}
         int ci=class_idx(T.s); int n=mknode(N_NEW); ND[n].ci=ci; lex_next();
-        if(is_p("(")){lex_next(); if(is_p(")"))lex_next();} return n; }
+        /* 引数を読み飛ばさずに構文木へ入れる。以前は '(' の次が ')' でないと
+           何も進めずに戻っていたので、new A("x") で呼び出し側が無限ループした
+           （実機ではカーネルごと固まる）。init があればそれに渡す。 */
+        if(is_p("(")){
+            lex_next();
+            while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){
+                if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr();
+                if(is_p(",")) lex_next();
+            }
+            if(is_p(")")) lex_next(); else return (a2c_fail("new: expected ')'"), 0);
+        }
+        return n; }
     if (is_kw("now")) { lex_next(); int obj=parse_primary();
         if(!is_p(".")){a2c_fail("now: expected .method");return 0;} lex_next();
         if(T.kind!=T_ID){a2c_fail("now: expected method");return 0;}
         int n=mknode(N_NOW); ND[n].mid=meth_id(T.s); ND[n].a=obj; lex_next();
-        if(is_p("(")){lex_next(); while(!is_p(")")&&T.kind!=T_EOF){ if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); } if(is_p(")"))lex_next();}
+        if(is_p("(")){lex_next(); while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){ if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); } if(is_p(")"))lex_next();}
         return n; }
     if (is_kw("self")) { int n=mknode(N_ID); ND[n].s[0]='s';ND[n].s[1]='e';ND[n].s[2]='l';ND[n].s[3]='f';ND[n].s[4]=0; lex_next(); return n; }
     if (is_p("(")) { lex_next(); int e=parse_expr(); if(is_p(")"))lex_next(); return e; }
@@ -179,7 +204,7 @@ static int parse_primary(void)
                 m[k]=0; a2c_fail(m); return 0;
             }
             int n=mknode(isai ? N_AICALL : N_PRINT); lex_next();
-            while(!is_p(")")&&T.kind!=T_EOF){ if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); }
+            while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){ if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); }
             if(is_p(")"))lex_next();
             return n;
         }
@@ -225,7 +250,16 @@ static void emit_node(int i)
     case N_INT: op_s("v_int("); op_n(e->num); op_c(')'); break;
     case N_STR: op_s("v_str(\""); op_s(e->s); op_s("\")"); break;
     case N_ID:  emit_ident(e->s); break;
-    case N_NEW: op_s("v_int(g_spawn("); op_n(e->ci); op_s("))"); break;
+    case N_NEW:
+        if (e->nargs) {
+            int im = -1;
+            for (int k=0; k<CLS[e->ci].nmethod; k++)
+                if (a2c_streq(CLS[e->ci].method[k].name,"init")) { im = meth_id("init"); break; }
+            if (im < 0) { a2c_fail("new: class has no init to take arguments"); break; }
+            op_s("v_int(__new_init(g_spawn("); op_n(e->ci); op_s("), "); op_n(im);
+            emit_args_filled(e->args, e->nargs); op_s("))");
+        } else { op_s("v_int(g_spawn("); op_n(e->ci); op_s("))"); }
+        break;
     case N_PRINT: op_s("v_print("); if(e->nargs) emit_node(e->args[0]); else op_s("v_int(0)"); op_c(')'); break;
     case N_AICALL: op_s("v_ai_call("); if(e->nargs) emit_node(e->args[0]); else op_s("v_str(\"\")"); op_c(')'); break;
     case N_NOW: op_s("dispatch(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid); emit_args_filled(e->args,e->nargs); op_c(')'); break;
@@ -250,7 +284,7 @@ static void emit_node(int i)
 /* ---- statement emit (walks tokens) -------------------------------- */
 static void emit_stmt(void);
 static void emit_block(void)             /* T must be '{' */
-{ op_s("{\n"); lex_next(); while(!is_p("}")&&T.kind!=T_EOF) emit_stmt(); if(is_p("}")) lex_next(); op_s("}\n"); }
+{ op_s("{\n"); lex_next(); while(!is_p("}")&&T.kind!=T_EOF&&!a2c_err[0]) emit_stmt(); if(is_p("}")) lex_next(); op_s("}\n"); }
 
 static void emit_send(void)
 {
@@ -260,7 +294,7 @@ static void emit_send(void)
     if(T.kind!=T_ID){ a2c_fail("send: expected method"); return; }
     int mid=meth_id(T.s); lex_next();
     int args[4],na=0;
-    if(is_p("(")){ lex_next(); while(!is_p(")")&&T.kind!=T_EOF){ if(na<4) args[na++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); } if(is_p(")"))lex_next(); }
+    if(is_p("(")){ lex_next(); while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){ if(na<4) args[na++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); } if(is_p(")"))lex_next(); }
     if(is_p(";")) lex_next();
     op_s("  enqueue(v_int_of("); emit_node(obj); op_s("), "); op_n(mid); emit_args_filled(args,na); op_s(");\n");
 }
@@ -308,6 +342,9 @@ static void emit_program(void)
     op_s("struct Obj { int cls; int f["); op_n(MAXF); op_s("]; };\n");
     op_s("struct Obj g_obj[2048];\nint g_nobj;\n\n");
 
+    op_s("int dispatch(int self, int meth, int a0, int a1, int a2, int a3);\n");
+    op_s("int __new_init(int id, int meth, int a0, int a1, int a2, int a3) {\n"
+         "  if (id >= 0) { dispatch(id, meth, a0, a1, a2, a3); }\n  return id;\n}\n");
     op_s("int g_spawn(int cls) {\n  int id; id = cc_actor_new();\n  if (id < 0) { return -1; }\n");
     op_s("  g_nobj = g_nobj + 1;\n  g_obj[id].cls = cls;\n");
     for (int ci=0; ci<NCLS; ci++) {
@@ -351,7 +388,7 @@ static void emit_program(void)
     op_s("int main() {\n");
     CC=-1; NLOCAL=0;
     L=TOPLEVEL; lex_next();
-    while (T.kind!=T_EOF) emit_stmt();
+    while (T.kind!=T_EOF && !a2c_err[0]) emit_stmt();
     op_s("  return 0;\n}\n");
     if (OPOS<OCAP) OUT[OPOS]=0;
 }
