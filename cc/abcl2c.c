@@ -134,12 +134,12 @@ static int parse_structure(const char *src)
 }
 
 /* ---- expression AST ----------------------------------------------- */
-enum { N_INT, N_STR, N_ID, N_NEW, N_NOW, N_PRINT, N_AICALL, N_BIN, N_UN };
+enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_PRINT, N_AICALL, N_BIN, N_UN };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
 typedef struct { int k; long num; char s[64]; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
 #define MAXNODE 1024
 static enode_t ND[MAXNODE]; static int NND;
-static int mknode(int k){ if(NND>=MAXNODE) return 0; int i=NND++; ND[i].k=k; ND[i].nargs=0; return i; }
+static int mknode(int k){ if(NND>=MAXNODE) { a2c_fail("expression too large"); return 0; } int i=NND++; ND[i].k=k; ND[i].nargs=0; return i; }
 
 /* current emit context */
 static int   CC;                         /* current class idx, -1 = top level  */
@@ -245,8 +245,13 @@ static void emit_args_filled(int *args,int nargs)
 { for(int k=0;k<4;k++){ op_s(", "); if(k<nargs) emit_node(args[k]); else op_s("v_int(0)"); } }
 static void emit_node(int i)
 {
-    enode_t *e=&ND[i];
+    enode_t *e;
+    /* 無効ノード（解析失敗）と、既に失敗が立っている状態では何も出さない。
+       これが無いと 0 番ノードを辿って無限再帰する。 */
+    if (i <= 0 || i >= MAXNODE || a2c_err[0]) { op_s("v_int(0)"); return; }
+    e=&ND[i];
     switch(e->k){
+    case N_NIL: op_s("v_int(0)"); break;
     case N_INT: op_s("v_int("); op_n(e->num); op_c(')'); break;
     case N_STR: op_s("v_str(\""); op_s(e->s); op_s("\")"); break;
     case N_ID:  emit_ident(e->s); break;
@@ -342,7 +347,8 @@ static void emit_program(void)
     op_s("struct Obj { int cls; int f["); op_n(MAXF); op_s("]; };\n");
     op_s("struct Obj g_obj[2048];\nint g_nobj;\n\n");
 
-    op_s("int dispatch(int self, int meth, int a0, int a1, int a2, int a3);\n");
+    /* 機内 cc はプロトタイプ宣言を持たない（前方参照の呼び出しは通る）。
+       ここで dispatch を宣言してはいけない。 */
     op_s("int __new_init(int id, int meth, int a0, int a1, int a2, int a3) {\n"
          "  if (id >= 0) { dispatch(id, meth, a0, a1, a2, a3); }\n  return id;\n}\n");
     op_s("int g_spawn(int cls) {\n  int id; id = cc_actor_new();\n  if (id < 0) { return -1; }\n");
@@ -397,7 +403,9 @@ static void emit_program(void)
 int abcl2c(const char *src, int srclen, char *out, int outcap)
 {
     (void)srclen;
-    NND=0; a2c_err[0]=0;
+    /* ND[0] は「解析に失敗した」を表す無効ノード。parse_* は失敗時に 0 を
+       返すので、0 を実在のノードにしてはいけない。 */
+    NND=1; ND[0].k=N_NIL; ND[0].nargs=0; a2c_err[0]=0;
     if (parse_structure(src) < 0) return -1;
     OUT=out; OCAP=outcap; OPOS=0;
     emit_program();
