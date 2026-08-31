@@ -1286,11 +1286,31 @@ static int http_build(const char *req, char *out, int max)
                                  "functions, recursion; builtins print/putchar/puts/actor_send.\n");
         } else {
             int srclen = 0; while (bodyp[srclen]) srclen++;
-            static char ccout[512];
-            long rv = 0;
-            int rc = cc_run_source(bodyp, srclen, ccout, (int)sizeof ccout, &rv);
-            bl = s_put(body, bl, ccout);
-            if (rc == 0) { bl = s_put(body, bl, "=> "); bl = s_putdec(body, bl, rv); bl = s_put(body, bl, "\n"); }
+            /* 本文が AIPL（"class " で始まる）なら、機内の abcl2c で C に
+               直してから JIT に渡す。シェルの cc/make が .abcl を透過的に
+               扱うのと同じ経路を HTTP からも使えるようにする。 */
+            const char *runsrc = bodyp;
+            int xlat_ok = 1;
+            if (bodyp[0]=='c'&&bodyp[1]=='l'&&bodyp[2]=='a'&&bodyp[3]=='s'&&
+                bodyp[4]=='s'&&(bodyp[5]==' '||bodyp[5]=='\t')) {
+                extern int         abcl2c(const char *, int, char *, int);
+                extern const char *abcl2c_error(void);
+                static char xlat[32768];
+                int xr = abcl2c(bodyp, srclen, xlat, (int)sizeof xlat);
+                if (xr < 0) {
+                    bl = s_put(body, bl, "abcl2c: ");
+                    bl = s_put(body, bl, abcl2c_error());
+                    bl = s_put(body, bl, "\n");
+                    xlat_ok = 0;
+                } else { runsrc = xlat; srclen = xr; }
+            }
+            if (xlat_ok) {
+                static char ccout[512];
+                long rv = 0;
+                int rc = cc_run_source(runsrc, srclen, ccout, (int)sizeof ccout, &rv);
+                bl = s_put(body, bl, ccout);
+                if (rc == 0) { bl = s_put(body, bl, "=> "); bl = s_putdec(body, bl, rv); bl = s_put(body, bl, "\n"); }
+            }
         }
     } else if (str_starts(rpath, "/actor/loadvm")) {
         /* Upload an AIPL .avm actor module and run it in the kernel AVM VM (the
@@ -1976,7 +1996,7 @@ static int http_build(const char *req, char *out, int max)
                              "GET /smp-bench?n=<N>  (4-core prime-count benchmark)\n"
                              "GET /api/actors\n"
                              "GET /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n"
-                             "POST /cc  (C source in body) -> JIT compile & run\n"
+                             "POST /cc  (C or AIPL source in body) -> JIT compile & run\n"
                              "GET /fs | /fs/ls/<dir> | /fs/cat/<file>\n"
                              "POST /fs/mkdir/<dir> | /fs/write/<file> (body)\n"
                              "POST /actor/load (AIPL --xinu-jit C) ; GET /actor/send?to&m&arg\n"

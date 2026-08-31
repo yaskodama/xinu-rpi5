@@ -8,7 +8,7 @@
 //
 // Runtime seam (provided by cc.c via cc_resolve_extern):
 //   v_int v_str v_add v_sub v_mul v_div v_lt v_le v_eq v_ne v_and v_or v_not
-//   v_truthy v_int_of v_print enqueue cc_actor_new   (dispatch is generated)
+//   v_truthy v_int_of v_print v_ai_call enqueue cc_actor_new  (dispatch is generated)
 // There is no v_gt/v_ge/%: `>`/`>=` swap operands onto v_lt/v_le; `%` errors.
 //
 // Portable C.  Build with -DABCL2C_HOST_TEST for a standalone translator
@@ -64,6 +64,7 @@ static void    lex_load(lsave_t s) { L=s.L; Ts=s.Ts; T=s.T; }
 
 static int is_p(const char *p) { return T.kind==T_PUNCT && T.s[0]==p[0] && (p[1]==0 ? T.s[1]==0 : T.s[1]==p[1]); }
 static int is_kw(const char *k) { if (T.kind!=T_ID) return 0; int i=0; for(;k[i];i++) if(T.s[i]!=k[i]) return 0; return T.s[i]==0; }
+static int a2c_streq(const char *a, const char *b) { int i=0; for(;a[i]&&b[i];i++) if(a[i]!=b[i]) return 0; return a[i]==b[i]; }
 static void cpid(char *d) { int i=0; for(;T.s[i]&&i<47;i++) d[i]=T.s[i]; d[i]=0; }
 static void cpid_to(char *d){ int i=0; for(;T.s[i]&&i<63;i++) d[i]=T.s[i]; d[i]=0; }
 
@@ -133,7 +134,7 @@ static int parse_structure(const char *src)
 }
 
 /* ---- expression AST ----------------------------------------------- */
-enum { N_INT, N_STR, N_ID, N_NEW, N_NOW, N_PRINT, N_BIN, N_UN };
+enum { N_INT, N_STR, N_ID, N_NEW, N_NOW, N_PRINT, N_AICALL, N_BIN, N_UN };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
 typedef struct { int k; long num; char s[64]; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
 #define MAXNODE 1024
@@ -164,11 +165,22 @@ static int parse_primary(void)
     if (is_p("(")) { lex_next(); int e=parse_expr(); if(is_p(")"))lex_next(); return e; }
     if (T.kind==T_ID) {
         char nm[48]; cpid(nm); lex_next();
-        if (is_p("(")) {                 /* call: print/puts only */
-            int n=mknode(N_PRINT); lex_next();
+        if (is_p("(")) {
+            /* 組込み呼び出し。以前はどんな名前でも v_print に落としていたので、
+               ai_call(x) や sqrt(x) が黙って print(x) になっていた。
+               受けるものだけを受け、それ以外はその場で失敗させる。 */
+            int isprint = (a2c_streq(nm,"print") || a2c_streq(nm,"puts"));
+            int isai    = a2c_streq(nm,"ai_call");
+            if (!isprint && !isai) {
+                char m[96]; int k=0;
+                const char *pre="unknown function: ";
+                while(pre[k] && k<(int)sizeof m-1){ m[k]=pre[k]; k++; }
+                for(int j=0; nm[j] && k<(int)sizeof m-1; j++) m[k++]=nm[j];
+                m[k]=0; a2c_fail(m); return 0;
+            }
+            int n=mknode(isai ? N_AICALL : N_PRINT); lex_next();
             while(!is_p(")")&&T.kind!=T_EOF){ if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); }
             if(is_p(")"))lex_next();
-            /* only print/puts supported; both -> v_print(arg0) */
             return n;
         }
         int n=mknode(N_ID); { int k=0; for(;nm[k]&&k<47;k++) ND[n].s[k]=nm[k]; ND[n].s[k]=0; } return n;
@@ -215,6 +227,7 @@ static void emit_node(int i)
     case N_ID:  emit_ident(e->s); break;
     case N_NEW: op_s("v_int(g_spawn("); op_n(e->ci); op_s("))"); break;
     case N_PRINT: op_s("v_print("); if(e->nargs) emit_node(e->args[0]); else op_s("v_int(0)"); op_c(')'); break;
+    case N_AICALL: op_s("v_ai_call("); if(e->nargs) emit_node(e->args[0]); else op_s("v_str(\"\")"); op_c(')'); break;
     case N_NOW: op_s("dispatch(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid); emit_args_filled(e->args,e->nargs); op_c(')'); break;
     case N_UN:
         if(e->op==O_NOT){ op_s("v_not("); emit_node(e->a); op_c(')'); }

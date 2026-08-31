@@ -236,6 +236,9 @@ static int cmd_cat(int argc, char **argv)
 
 /* kexec <file> — boot a different Xinu kernel image from /microsd (no reflash).
  * e.g.  kexec /microsd/KERNEL_2712.IMG   — RAM-only chainload, does not return. */
+/* llm/llm.c — 機内の小型モデルで文章を生成する */
+extern int cmd_llm(int argc, char **argv);
+
 static int cmd_kexec(int argc, char **argv)
 {
     extern int microsd_kexec(const char *path);
@@ -1660,6 +1663,7 @@ static const struct centry commandtab[] = {
     { "ls",     "ls [path]  list directory",               cmd_ls     },
     { "cat",    "cat <file>  print file contents",         cmd_cat    },
     { "kexec",  "kexec /microsd/<k.img>  boot another kernel from microSD", cmd_kexec },
+    { "llm",    "llm [prompt]  generate text with the on-board model", cmd_llm },
     { "cc",     "cc <file>  compile + run a C/AIPL program (own process)", cmd_cc },
     { "make",   "make [file]  build Makefile + executable-form file, then run", cmd_make },
     { "run",    "run <file>   execute an executable-form file built by make",   cmd_run  },

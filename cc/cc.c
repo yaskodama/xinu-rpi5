@@ -422,6 +422,25 @@ static void v_print(long w)
     }
     char b[32]; emit_str(v_render(w, b, sizeof b)); emit_ch('\n');
 }
+/* ai_call(prompt) — 機内の小型モデル（llm/llm.c）で続きを生成し、
+   結果を文字列値として返す。外へは一切出ない。生成は 24 トークンまでで、
+   D-cache OFF のぶん時間がかかるが、llm_generate はトークンごとに
+   スケジューラへ譲るのでネットワークは止まらない。 */
+static long v_ai_call(long prompt)
+{
+    extern int llm_run(const char *, int, char *, int, int);
+    char pb[192];
+    const char *p = v_render(prompt, pb, sizeof pb);
+    char out[256];
+    out[0] = 0;
+    llm_run(p, 24, out, (int)sizeof out - 1, 0);
+    int n = 0; while (out[n]) n++;
+    char *r = vheap_alloc(n + 1);
+    if (!r) return v_str("");
+    for (int i = 0; i <= n; i++) r[i] = out[i];
+    return v_str(r);
+}
+
 /* v_truthy is also exported (raw 0/1) for if/while conditions. */
 static long v_truthy_x(long w)    { return v_truthy(w); }
 
@@ -760,6 +779,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "v_or",        (void *)&v_or         },
         { "v_not",       (void *)&v_not        },
         { "v_print",     (void *)&v_print      },
+        { "v_ai_call",   (void *)&v_ai_call    },
         { "v_truthy",    (void *)&v_truthy_x   },
         { "v_int_of",    (void *)&v_int_of     },
         { "v_list_new",   (void *)&v_list_new   },
