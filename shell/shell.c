@@ -275,9 +275,19 @@ static void ccrun_proc_entry(void)
 {
     extern int  cc_compile(const char *, int);
     extern long cc_exec_compiled(char *, int, int *);
+    extern void cc_set_timeout_ms(unsigned long);
+    extern void cc_set_on_proc(int);
+    /* ここは専用プロセス・専用スタック。暴走してもこのスタックを潰して
+       打ち切られるだけで板は固まらないので、インライン経路の 250ms より
+       ずっと長い予算を与えられる。wait() もここでだけ本物の休眠になる。 */
+    cc_set_on_proc(1);
+    cc_set_timeout_ms(10000);
     g_ccrun_rc = cc_compile(g_ccrun_src, g_ccrun_len);
-    if (g_ccrun_rc == 0)
+    if (g_ccrun_rc == 0) {
+        cc_set_timeout_ms(10000);      /* cc_compile が set_deadline で消費するので再設定 */
         g_ccrun_rv = cc_exec_compiled(g_ccrun_out, sizeof g_ccrun_out, &g_ccrun_aborted);
+    }
+    cc_set_on_proc(0);
     proc_exit();
 }
 

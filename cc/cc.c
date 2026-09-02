@@ -120,6 +120,15 @@ static void emit_dec(long v)
  * display.  Keep the runaway deadline short — real demo programs finish in
  * microseconds; a runaway aborts in a quarter second. */
 #define CC_TIMEOUT_MS 250
+/* 打ち切りまでの予算。既定は 250ms で、これは「割り込みを塞いだ RX 処理の中で
+   走る」インライン経路（/cc, /actor/load）に合わせた値。
+   シェルの cc/make は別プロセス・別スタックで走るので、暴走してもそのスタックを
+   潰すだけで板は固まらない。そちらだけ長い予算を与えられるようにする。
+   1回ごとに既定へ戻す — 長い予算がインライン経路へ漏れないように。 */
+static unsigned long g_timeout_ms = CC_TIMEOUT_MS;
+static int           g_on_proc;      /* 別プロセスで走っているか（wait が使える） */
+void cc_set_timeout_ms(unsigned long ms) { g_timeout_ms = ms ? ms : CC_TIMEOUT_MS; }
+void cc_set_on_proc(int on)              { g_on_proc = on; }
 static unsigned long g_deadline;
 static int           g_aborted;
 
@@ -133,8 +142,9 @@ static void cc_set_deadline(void)
 {
     unsigned long frq;
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(frq));
-    g_deadline = cc_now() + (frq / 1000UL) * CC_TIMEOUT_MS;
+    g_deadline = cc_now() + (frq / 1000UL) * g_timeout_ms;
     g_aborted = 0;
+    g_timeout_ms = CC_TIMEOUT_MS;      /* 次の run へ持ち越さない */
 }
 static int cc_tick(void)
 {
@@ -605,6 +615,18 @@ static long cc_gc_sweep(long threshold_ms, long dry)
     int scanned = 0;
     return v_int(gc_sweep_core((long)v_int_of(threshold_ms), (int)v_int_of(dry), &scanned));
 }
+/* wait(ms) — 別プロセスで走っているときだけ本物の休眠。インライン経路
+   （割り込みを塞いだ RX 処理の中）で寝ると板が固まるので、そこでは断る。
+   正典 g7 の Slow.work が使う。 */
+static long cc_wait(long ms)
+{
+    extern void proc_sleep_us(unsigned long us);
+    long v = v_int_of(ms);
+    if (v <= 0) return v_int(0);
+    if (!g_on_proc) { cc_error("wait() needs the separate-process path (shell cc/make)"); return v_int(0); }
+    proc_sleep_us((unsigned long)v * 1000UL);
+    return v_int(0);
+}
 static long cc_now_ms(void) { unsigned long frq=cc_cntfrq(); if(frq<1000)frq=1000; return v_int((long)(cc_now()/(frq/1000UL))); }
 
 /* ---- web_expose: パスとアクターの対応表 --------------------------------
@@ -869,6 +891,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_select",        (void *)&cc_select         },
         { "cc_web_listen",    (void *)&cc_web_listen     },
         { "cc_web_expose",    (void *)&cc_web_expose     },
+        { "cc_wait",          (void *)&cc_wait           },
         { "cc_sel_arg",       (void *)&cc_sel_arg        },
         { "cc_actor_count",   (void *)&cc_actor_count    },
         { "cc_actor_alive",   (void *)&cc_actor_alive    },

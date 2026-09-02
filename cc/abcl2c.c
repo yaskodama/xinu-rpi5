@@ -262,7 +262,7 @@ static void scan_topvars(void)
 }
 
 /* ---- expression AST ----------------------------------------------- */
-enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_PRINT, N_AICALL, N_WEB, N_BIN, N_UN };
+enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
 typedef struct { int k; long num; char s[TOKSTR]; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
 #define MAXNODE 1024
@@ -352,6 +352,9 @@ static int parse_primary(void)
                受けるものだけを受け、それ以外はその場で失敗させる。 */
             int isprint = (a2c_streq(nm,"print") || a2c_streq(nm,"puts"));
             int isai    = a2c_streq(nm,"ai_call");
+            /* wait(ms) — 別プロセス経路（シェルの cc/make）でだけ本物の休眠。
+               インライン経路（/cc, /actor/load）では板が固まるのでランタイムが断る。 */
+            int iswait  = a2c_streq(nm,"wait");
             /* web_listen(port) / web_expose(path, "名前")
                ポート指定はこの装置では無視され、公開ルートは既存の 80 番の
                サーバに載る。web_expose の第2引数はトップレベルの var 名で、
@@ -373,6 +376,15 @@ static int parse_primary(void)
                         m[k]=0; a2c_fail(m); return 0;
                     }
                 } else if (ND[n].nargs != 1) { a2c_fail("web_listen: expected (port)"); return 0; }
+                return n;
+            }
+            if (iswait) {
+                int n=mknode(N_WAIT); lex_next();
+                while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){
+                    if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr();
+                    if(is_p(","))lex_next(); }
+                if(is_p(")"))lex_next();
+                if(ND[n].nargs != 1) { a2c_fail("wait: expected (milliseconds)"); return 0; }
                 return n;
             }
             if (!isprint && !isai) {
@@ -450,6 +462,7 @@ static void emit_node(int i)
     case N_PRINT: op_s("v_print("); if(e->nargs) emit_node(e->args[0]); else op_s("v_int(0)"); op_c(')'); break;
     case N_AICALL: op_s("v_ai_call("); if(e->nargs) emit_node(e->args[0]); else op_s("v_str(\"\")"); op_c(')'); break;
     case N_NOW: op_s("dispatch(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid); emit_args_filled(e->args,e->nargs); op_c(')'); break;
+    case N_WAIT: op_s("cc_wait("); emit_node(e->args[0]); op_c(')'); break;
     case N_WEB:
         if (e->num) {                                  /* web_expose(path, "名前") */
             op_s("cc_web_expose("); emit_node(e->args[0]);
