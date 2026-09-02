@@ -1390,6 +1390,47 @@ static int http_build(const char *req, char *out, int max)
         int arg = q_int(req, "arg", 0);
         char m[ACTOR_NAMELEN]; if (!q_param(req, "m", m, sizeof m)) m[0]=0;
         cc_actor_send_msg(to, m, arg, body, (int)sizeof body); bl = 0; while(body[bl])bl++;
+    } else if (str_starts(rpath, "/api/x/")) {
+        /* AIPL の web_expose("/echo", "echo") で公開したアクターへの入口。
+             GET /api/x/<path>?method=<名前>&args=<文字列>
+           <path> は web_expose の第1引数（先頭の '/' を含む）。
+           この装置ではポート指定（web_listen の引数）は無視され、公開ルートは
+           この 80 番のサーバに載る。 */
+        extern int  cc_web_lookup(const char *path);
+        extern int  cc_actor_send_msg_str(int to, const char *method,
+                                          const char *sarg, char *out, int outcap);
+        extern int  cc_web_count(void);
+        extern const char *cc_web_path_at(int i);
+        extern int  cc_web_actor_at(int i);
+        ctype = "text/plain";
+        const char *sub = rpath + 6;               /* strlen("/api/x") — '/' を残す */
+        if (!sub[0] || (sub[0]=='/' && !sub[1])) {  /* 一覧を出す */
+            bl = s_put(body, bl, "exposed routes (web_expose):\n");
+            int n = cc_web_count();
+            if (!n) bl = s_put(body, bl, "  (none — web_expose したプログラムを載せてください)\n");
+            for (int i = 0; i < n; i++) {
+                bl = s_put(body, bl, "  /api/x"); bl = s_put(body, bl, cc_web_path_at(i));
+                bl = s_put(body, bl, "  -> actor #");
+                { char t[12]; int tn=0,v=cc_web_actor_at(i); if(!v)t[tn++]='0';
+                  while(v){t[tn++]=(char)('0'+v%10);v/=10;} while(tn) body[bl++]=t[--tn]; }
+                bl = s_put(body, bl, "\n");
+            }
+        } else {
+            int to = cc_web_lookup(sub);
+            if (to < 0) {
+                bl = s_put(body, bl, "no such exposed path: "); bl = s_put(body, bl, sub);
+                bl = s_put(body, bl, "\n（GET /api/x/ で一覧）\n");
+            } else {
+                char m[ACTOR_NAMELEN]; if (!q_param(req, "method", m, sizeof m)) m[0]=0;
+                char a[192];           if (!q_param(req, "args",   a, sizeof a)) a[0]=0;
+                if (!m[0]) {
+                    bl = s_put(body, bl, "usage: /api/x/<path>?method=<name>&args=<text>\n");
+                } else {
+                    cc_actor_send_msg_str(to, m, a, body, (int)sizeof body);
+                    bl = 0; while (body[bl]) bl++;
+                }
+            }
+        }
     } else if (str_starts(rpath, "/run")) {
         /* Run a shell command from HTTP — a reliable way to drive the shell
          * (wine/4lines/kodama/clear/...) when the USB keyboard is being flaky. */

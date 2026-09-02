@@ -43,7 +43,12 @@ static int  a2c_fail(const char *m)
 
 /* ---- lexer -------------------------------------------------------- */
 enum { T_EOF, T_ID, T_NUM, T_STR, T_PUNCT };
-typedef struct { int kind; char s[64]; long num; } tok_t;
+/* 文字列リテラルは日本語だと 1 文字 3 バイトになる。64 では足りず、しかも
+   足りないときに閉じ引用符まで読み進めずに戻っていたので、字句解析が文字列の
+   途中から再開して壊れた（"expected expression" になる）。長さを増やし、
+   それでも溢れるときは名前をつけて断る。 */
+#define TOKSTR 160
+typedef struct { int kind; char s[TOKSTR]; long num; } tok_t;
 
 static const char *L;          /* scan cursor (just past current token)   */
 static const char *Ts;         /* start of current token in the source    */
@@ -64,9 +69,21 @@ static void lex_next(void)
     }
     Ts = L; T.kind = T_EOF; T.s[0] = 0; T.num = 0;
     if (!*L) return;
-    if (al(*L)) { int n=0; while (an(*L)&&n<63) T.s[n++]=*L++; T.s[n]=0; T.kind=T_ID; return; }
+    if (al(*L)) { int n=0; while (an(*L)&&n<TOKSTR-1) T.s[n++]=*L++; T.s[n]=0; T.kind=T_ID; return; }
     if (dg(*L)) { long v=0; while (dg(*L)) v=v*10+(*L++-'0'); if (*L=='.'){L++;while(dg(*L))L++;} T.kind=T_NUM; T.num=v; return; }
-    if (*L=='"') { L++; int n=0; while (*L && *L!='"' && n<62){ if(*L=='\\'&&L[1]) T.s[n++]=*L++; T.s[n++]=*L++; } if(*L=='"')L++; T.s[n]=0; T.kind=T_STR; return; }
+    if (*L=='"') {
+        L++; int n=0, over=0;
+        /* 溢れても閉じ引用符までは必ず読み進める。ここで止まると、この先の
+           解析が文字列の中身をトークンとして読み始めてしまう。 */
+        while (*L && *L!='"') {
+            if (*L=='\\' && L[1]) { if(n<TOKSTR-2){T.s[n++]=*L;}else over=1; L++; }
+            if (n<TOKSTR-1) T.s[n++]=*L; else over=1;
+            L++;
+        }
+        if(*L=='"')L++;
+        T.s[n]=0; T.kind=T_STR;
+        if (over) a2c_fail("string literal too long (max 159 bytes)");
+        return; }
     { char a=L[0],b=L[1]; const char *two=0;
       if(a=='='&&b=='=')two="==";else if(a=='!'&&b=='=')two="!=";else if(a=='<'&&b=='=')two="<=";
       else if(a=='>'&&b=='=')two=">=";else if(a=='&'&&b=='&')two="&&";else if(a=='|'&&b=='|')two="||";
@@ -84,7 +101,7 @@ static int is_p(const char *p) { return T.kind==T_PUNCT && T.s[0]==p[0] && (p[1]
 static int is_kw(const char *k) { if (T.kind!=T_ID) return 0; int i=0; for(;k[i];i++) if(T.s[i]!=k[i]) return 0; return T.s[i]==0; }
 static int a2c_streq(const char *a, const char *b) { int i=0; for(;a[i]&&b[i];i++) if(a[i]!=b[i]) return 0; return a[i]==b[i]; }
 static void cpid(char *d) { int i=0; for(;T.s[i]&&i<47;i++) d[i]=T.s[i]; d[i]=0; }
-static void cpid_to(char *d){ int i=0; for(;T.s[i]&&i<63;i++) d[i]=T.s[i]; d[i]=0; }
+static void cpid_to(char *d){ int i=0; for(;T.s[i]&&i<TOKSTR-1;i++) d[i]=T.s[i]; d[i]=0; }
 
 /* ---- program model ------------------------------------------------ */
 #define MAXCLASS 16
@@ -216,10 +233,38 @@ static int parse_structure(const char *src)
     return 0;
 }
 
+/* トップレベルの var は C の大域変数にする。以前は main のローカルにしていたので、
+   メソッドの中から参照すると宣言の無い名前になり、生成 C が機内 cc で
+   "undefined variable" になっていた（g3 の `now stock.take(k)` がこれ）。 */
+#define MAXTOPV 64
+static char TOPV[MAXTOPV][48]; static int NTOPV;
+static int is_topvar(const char *n)
+{ for(int i=0;i<NTOPV;i++){int k=0;for(;n[k];k++)if(TOPV[i][k]!=n[k])goto no; if(TOPV[i][k]==0)return 1; no:;} return 0; }
+static void scan_topvars(void)
+{
+    NTOPV=0; if(!TOPLEVEL) return;
+    lsave_t sv=lex_save();
+    L=TOPLEVEL; lex_next();
+    int depth=0, guard=0;
+    while (T.kind!=T_EOF && ++guard<100000) {
+        if (is_p("{")) depth++;
+        else if (is_p("}")) { if(depth>0) depth--; }
+        else if (depth==0 && is_kw("var")) {
+            lex_next();
+            if (T.kind==T_ID && !is_topvar(T.s) && NTOPV<MAXTOPV) {
+                int k=0; for(;T.s[k]&&k<47;k++) TOPV[NTOPV][k]=T.s[k]; TOPV[NTOPV][k]=0; NTOPV++;
+            }
+            continue;                    /* 名前の分は下の lex_next で進む */
+        }
+        lex_next();
+    }
+    lex_load(sv);
+}
+
 /* ---- expression AST ----------------------------------------------- */
-enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_PRINT, N_AICALL, N_BIN, N_UN };
+enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_PRINT, N_AICALL, N_WEB, N_BIN, N_UN };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
-typedef struct { int k; long num; char s[64]; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
+typedef struct { int k; long num; char s[TOKSTR]; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
 #define MAXNODE 1024
 static enode_t ND[MAXNODE]; static int NND;
 static int mknode(int k){ if(NND>=MAXNODE) { a2c_fail("expression too large"); return 0; } int i=NND++; ND[i].k=k; ND[i].nargs=0; return i; }
@@ -307,6 +352,29 @@ static int parse_primary(void)
                受けるものだけを受け、それ以外はその場で失敗させる。 */
             int isprint = (a2c_streq(nm,"print") || a2c_streq(nm,"puts"));
             int isai    = a2c_streq(nm,"ai_call");
+            /* web_listen(port) / web_expose(path, "名前")
+               ポート指定はこの装置では無視され、公開ルートは既存の 80 番の
+               サーバに載る。web_expose の第2引数はトップレベルの var 名で、
+               板はアクター番号で持つので、ここで名前を解決して番号を渡す。 */
+            int isweb   = (a2c_streq(nm,"web_listen") || a2c_streq(nm,"web_expose"));
+            if (isweb) {
+                int n=mknode(N_WEB); ND[n].num = a2c_streq(nm,"web_expose"); lex_next();
+                while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){
+                    if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr();
+                    if(is_p(","))lex_next(); }
+                if(is_p(")"))lex_next();
+                if (ND[n].num) {                      /* web_expose */
+                    if (ND[n].nargs != 2) { a2c_fail("web_expose: expected (path, \"actor\")"); return 0; }
+                    int an = ND[n].args[1];
+                    if (ND[an].k != N_STR || !is_topvar(ND[an].s)) {
+                        char m[96]; int k=0; const char *pre="web_expose: unknown actor: ";
+                        while(pre[k] && k<(int)sizeof m-1){ m[k]=pre[k]; k++; }
+                        for(int j=0; ND[an].s[j] && k<(int)sizeof m-1; j++) m[k++]=ND[an].s[j];
+                        m[k]=0; a2c_fail(m); return 0;
+                    }
+                } else if (ND[n].nargs != 1) { a2c_fail("web_listen: expected (port)"); return 0; }
+                return n;
+            }
             if (!isprint && !isai) {
                 char m[96]; int k=0;
                 const char *pre="unknown function: ";
@@ -340,34 +408,6 @@ static int parse_eql(void){ int a=parse_rel(); for(;;){ int op; if(is_p("=="))op
 static int parse_and(void){ int a=parse_eql(); while(is_p("&&")){ lex_next(); a=bin(O_AND,a,parse_eql()); } return a; }
 static int parse_or (void){ int a=parse_and(); while(is_p("||")){ lex_next(); a=bin(O_OR,a,parse_and()); } return a; }
 static int parse_expr(void){ return parse_or(); }
-
-/* トップレベルの var は C の大域変数にする。以前は main のローカルにしていたので、
-   メソッドの中から参照すると宣言の無い名前になり、生成 C が機内 cc で
-   "undefined variable" になっていた（g3 の `now stock.take(k)` がこれ）。 */
-#define MAXTOPV 64
-static char TOPV[MAXTOPV][48]; static int NTOPV;
-static int is_topvar(const char *n)
-{ for(int i=0;i<NTOPV;i++){int k=0;for(;n[k];k++)if(TOPV[i][k]!=n[k])goto no; if(TOPV[i][k]==0)return 1; no:;} return 0; }
-static void scan_topvars(void)
-{
-    NTOPV=0; if(!TOPLEVEL) return;
-    lsave_t sv=lex_save();
-    L=TOPLEVEL; lex_next();
-    int depth=0, guard=0;
-    while (T.kind!=T_EOF && ++guard<100000) {
-        if (is_p("{")) depth++;
-        else if (is_p("}")) { if(depth>0) depth--; }
-        else if (depth==0 && is_kw("var")) {
-            lex_next();
-            if (T.kind==T_ID && !is_topvar(T.s) && NTOPV<MAXTOPV) {
-                int k=0; for(;T.s[k]&&k<47;k++) TOPV[NTOPV][k]=T.s[k]; TOPV[NTOPV][k]=0; NTOPV++;
-            }
-            continue;                    /* 名前の分は下の lex_next で進む */
-        }
-        lex_next();
-    }
-    lex_load(sv);
-}
 
 /* ---- output ------------------------------------------------------- */
 static char *OUT; static int OCAP, OPOS;
@@ -410,6 +450,14 @@ static void emit_node(int i)
     case N_PRINT: op_s("v_print("); if(e->nargs) emit_node(e->args[0]); else op_s("v_int(0)"); op_c(')'); break;
     case N_AICALL: op_s("v_ai_call("); if(e->nargs) emit_node(e->args[0]); else op_s("v_str(\"\")"); op_c(')'); break;
     case N_NOW: op_s("dispatch(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid); emit_args_filled(e->args,e->nargs); op_c(')'); break;
+    case N_WEB:
+        if (e->num) {                                  /* web_expose(path, "名前") */
+            op_s("cc_web_expose("); emit_node(e->args[0]);
+            op_s(", v_int_of(v_"); op_s(ND[e->args[1]].s); op_c(')'); op_c(')');
+        } else {                                       /* web_listen(port) */
+            op_s("cc_web_listen("); emit_node(e->args[0]); op_c(')');
+        }
+        break;
     case N_NOWDL:
         op_s("__dl_call(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid);
         emit_args_filled(e->args,e->nargs);

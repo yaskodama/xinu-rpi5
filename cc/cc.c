@@ -607,6 +607,52 @@ static long cc_gc_sweep(long threshold_ms, long dry)
 }
 static long cc_now_ms(void) { unsigned long frq=cc_cntfrq(); if(frq<1000)frq=1000; return v_int((long)(cc_now()/(frq/1000UL))); }
 
+/* ---- web_expose: パスとアクターの対応表 --------------------------------
+ * `web_expose("/echo", "echo")` で公開したアクターへ、GET /api/x/<path> から
+ * 到達できるようにする。この装置ではポート指定は無視され、公開ルートは
+ * 既存の 80 番のサーバに載る（web_listen はそのための印にすぎない）。
+ * 対応表は cc_actor_reset() では消さない — 公開はプログラムの寿命と同じで、
+ * 次のプログラムを載せたときに作り直される。 */
+#define WX_MAX  8
+#define WX_PATH 40
+static char g_wx_path[WX_MAX][WX_PATH];
+static int  g_wx_actor[WX_MAX];
+static int  g_nwx;
+static int  g_wx_port;                 /* 記録するだけ。待ち受けは既存の 80 番 */
+
+void cc_web_reset(void) { g_nwx = 0; g_wx_port = 0; }
+
+static long cc_web_listen(long port) { g_wx_port = (int)v_int_of(port); return v_int(0); }
+static long cc_web_expose(long path, long actor)
+{
+    char pb[WX_PATH]; const char *ps = v_render(path, pb, sizeof pb);
+    int id = (int)v_int_of(actor);
+    if (id < 0 || id >= ACT_MAX) return v_int(0);
+    int slot = -1;
+    for (int i = 0; i < g_nwx; i++) {          /* 同じパスなら上書き */
+        int k = 0; while (g_wx_path[i][k] && g_wx_path[i][k] == ps[k]) k++;
+        if (!g_wx_path[i][k] && !ps[k]) { slot = i; break; }
+    }
+    if (slot < 0) { if (g_nwx >= WX_MAX) return v_int(0); slot = g_nwx++; }
+    int k = 0; for (; ps[k] && k < WX_PATH - 1; k++) g_wx_path[slot][k] = ps[k];
+    g_wx_path[slot][k] = 0;
+    g_wx_actor[slot] = id;
+    return v_int(1);
+}
+/* tcp_server から引く。見つからなければ -1。 */
+int cc_web_lookup(const char *path)
+{
+    for (int i = 0; i < g_nwx; i++) {
+        int k = 0; while (g_wx_path[i][k] && g_wx_path[i][k] == path[k]) k++;
+        if (!g_wx_path[i][k] && !path[k]) return g_wx_actor[i];
+    }
+    return -1;
+}
+int cc_web_port(void) { return g_wx_port; }
+int cc_web_count(void) { return g_nwx; }
+const char *cc_web_path_at(int i) { return (i>=0 && i<g_nwx) ? g_wx_path[i] : 0; }
+int cc_web_actor_at(int i) { return (i>=0 && i<g_nwx) ? g_wx_actor[i] : -1; }
+
 /* select/saga/crash: not supported by the cooperative pump — resolve to inert
  * stubs so programs that merely reference them still JIT (most don't use them). */
 static long g_sel[4];
@@ -627,6 +673,7 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
 {
     unsigned long n = (unsigned long)(srclen < 0 ? 0 : srclen);
     g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0; g_res_objcls = 0; g_res_clsname = 0;
+    cc_web_reset();                      /* 公開ルートはプログラムと寿命を共にする */
     if (!arena_init(CC_ARENA)) return -2;
     g_err = 0; g_errbuf[0] = 0;
 
@@ -700,6 +747,30 @@ int cc_actor_send_msg(int to, const char *method, int arg, char *out, int outcap
     /* append "=> <rendered result>" */
     const char *arrow = "=> "; for (int i=0;arrow[i]&&g_caplen<g_capcap-1;i++) g_cap[g_caplen++]=arrow[i];
     { char rb[32]; const char *rs = v_render(res, rb, sizeof rb); for(int i=0;rs[i]&&g_caplen<g_capcap-1;i++) g_cap[g_caplen++]=rs[i]; }
+    if (g_caplen<g_capcap-1) g_cap[g_caplen++]='\n';
+    g_cap[(g_caplen<g_capcap)?g_caplen:(g_capcap-1)] = 0; g_cap = 0;
+    return 0;
+}
+
+/* 文字列を引数に渡す版。web_expose 経由の /api/x/<path>?args=<文字列> は
+   文字列を渡したいので、int 版とは別に用意する。 */
+int cc_actor_send_msg_str(int to, const char *method, const char *sarg, char *out, int outcap)
+{
+    if (!g_res_loaded || !g_dispatch || !g_res_methodid) {
+        const char *e = "no resident actor program\n";
+        int p=0; while (*e && p<outcap-1) out[p++]=*e++; out[p]=0; return -1;
+    }
+    long mid = g_res_methodid(v_str(method));
+    int midraw = (int)v_int_of(mid);
+    if (midraw < 0) {
+        const char *e = "unknown method\n"; int p=0; while(*e&&p<outcap-1)out[p++]=*e++; out[p]=0; return -1;
+    }
+    cc_set_deadline();
+    g_cap = out; g_capcap = outcap; g_caplen = 0;
+    long res = g_dispatch((long)to, (long)midraw, v_str(sarg), v_int(0), v_int(0), v_int(0));
+    cc_pump();
+    const char *arrow = "=> "; for (int i=0;arrow[i]&&g_caplen<g_capcap-1;i++) g_cap[g_caplen++]=arrow[i];
+    { char rb[64]; const char *rs = v_render(res, rb, sizeof rb); for(int i=0;rs[i]&&g_caplen<g_capcap-1;i++) g_cap[g_caplen++]=rs[i]; }
     if (g_caplen<g_capcap-1) g_cap[g_caplen++]='\n';
     g_cap[(g_caplen<g_capcap)?g_caplen:(g_capcap-1)] = 0; g_cap = 0;
     return 0;
@@ -796,6 +867,8 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_actor_suicide", (void *)&cc_actor_suicide  },
         { "cc_call",          (void *)&cc_call           },
         { "cc_select",        (void *)&cc_select         },
+        { "cc_web_listen",    (void *)&cc_web_listen     },
+        { "cc_web_expose",    (void *)&cc_web_expose     },
         { "cc_sel_arg",       (void *)&cc_sel_arg        },
         { "cc_actor_count",   (void *)&cc_actor_count    },
         { "cc_actor_alive",   (void *)&cc_actor_alive    },
@@ -845,6 +918,7 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     /* /cc reuses g_codebuf + the arena, so any resident actor program is now
      * invalid (its dispatch + string literals are about to be overwritten). */
     g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0; g_res_objcls = 0; g_res_clsname = 0;
+    cc_web_reset();                      /* 公開ルートはプログラムと寿命を共にする */
     if (!arena_init(CC_ARENA)) return -2;
     g_err = 0; g_errbuf[0] = 0;
 
@@ -879,7 +953,20 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     cc_pump();                           /* deliver async send() cascade       */
     if (retval) *retval = rc;
 
-    arena_free();
+    /* /cc で走らせたプログラムも常駐させる。web_expose で公開したアクターへ
+       あとから HTTP で到達できるようにするため（/actor/load と同じ扱い）。
+       アリーナは解放しない — JIT したコードが中の文字列リテラルを指している。
+       次の /cc が先頭で arena_init() し直すので、run をまたいで溜まりはしない。 */
+    { int moff = cc_func_offset("__method_id");
+      int coff = cc_func_offset("__obj_cls");
+      int noff = cc_func_offset("__cls_name");
+      g_res_methodid = (moff >= 0) ? (void *)(code + moff) : 0;
+      g_res_objcls   = (coff >= 0) ? (void *)(code + coff) : 0;
+      g_res_clsname  = (noff >= 0) ? (void *)(code + noff) : 0; }
+    if (g_dispatch && g_res_methodid) {
+        g_res_loaded = 1;
+        cc_snapshot_classnames();
+    }
     return 0;
 }
 
@@ -938,6 +1025,7 @@ int cc_compile(const char *src, int srclen)
     unsigned long n = (unsigned long)(srclen < 0 ? 0 : srclen);
     g_cc_ready = 0;
     g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0; g_res_objcls = 0; g_res_clsname = 0;
+    cc_web_reset();                      /* 公開ルートはプログラムと寿命を共にする */
     if (!arena_init(CC_ARENA)) return -2;
     g_err = 0; g_errbuf[0] = 0;
 
