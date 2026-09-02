@@ -12,10 +12,15 @@
 //   true / false                                    bool is int here: 1 / 0
 //   reply(e)                                        == `return e` on this device,
 //                                                   so it must end its block
+//   now t.m(a) timeout <ms> else <e>                deadline, checked AFTER the
+//                                                   call: the value matches the
+//                                                   canonical one, but the call
+//                                                   is never interrupted (the
+//                                                   pump is cooperative)
 // Not on this device, and each says so by name rather than miscompiling:
-//   future / await / select / timeout / spawn / remote / replyto / web_*
-// Of the 10 canonical guide samples this translates 5 (g1 g3 g6 g8 g9); the
-// other 5 need those runtime features.  Measure with the guide samples.
+//   future / await / select / spawn / remote / replyto / web_*
+// Of the 10 canonical guide samples this translates 6 (g1 g3 g6 g8 g9 g10); the
+// other 4 need those runtime features.  Measure with the guide samples.
 //
 // Runtime seam (provided by cc.c via cc_resolve_extern):
 //   v_int v_str v_add v_sub v_mul v_div v_lt v_le v_eq v_ne v_and v_or v_not
@@ -212,7 +217,7 @@ static int parse_structure(const char *src)
 }
 
 /* ---- expression AST ----------------------------------------------- */
-enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_PRINT, N_AICALL, N_BIN, N_UN };
+enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_PRINT, N_AICALL, N_BIN, N_UN };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
 typedef struct { int k; long num; char s[64]; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
 #define MAXNODE 1024
@@ -278,6 +283,19 @@ static int parse_primary(void)
         if(T.kind!=T_ID){a2c_fail("now: expected method");return 0;}
         int n=mknode(N_NOW); ND[n].mid=meth_id(T.s); ND[n].a=obj; lex_next();
         if(is_p("(")){lex_next(); while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){ if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); } if(is_p(")"))lex_next();}
+        /* 正典 AIPL の後置の期限:  now t.m(a) timeout <ms> else <式>
+           この装置の実行は協調ポンプで、dispatch は同期的に走りきる。
+           だから期限は「超えたか」の事後判定にしか使えない。返る値は
+           正典と同じ（超えたら else 節）だが、呼び出しは中断されない。 */
+        if (is_kw("timeout")) {
+            lex_next();
+            if(T.kind!=T_NUM) { a2c_fail("timeout: expected milliseconds"); return 0; }
+            ND[n].num = T.num; lex_next();
+            if(!is_kw("else")) { a2c_fail("timeout: expected 'else'"); return 0; }
+            lex_next();
+            ND[n].b = parse_expr();
+            ND[n].k = N_NOWDL;
+        }
         return n; }
     if (is_kw("self")) { int n=mknode(N_ID); ND[n].s[0]='s';ND[n].s[1]='e';ND[n].s[2]='l';ND[n].s[3]='f';ND[n].s[4]=0; lex_next(); return n; }
     if (is_p("(")) { lex_next(); int e=parse_expr(); if(is_p(")"))lex_next(); return e; }
@@ -392,6 +410,11 @@ static void emit_node(int i)
     case N_PRINT: op_s("v_print("); if(e->nargs) emit_node(e->args[0]); else op_s("v_int(0)"); op_c(')'); break;
     case N_AICALL: op_s("v_ai_call("); if(e->nargs) emit_node(e->args[0]); else op_s("v_str(\"\")"); op_c(')'); break;
     case N_NOW: op_s("dispatch(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid); emit_args_filled(e->args,e->nargs); op_c(')'); break;
+    case N_NOWDL:
+        op_s("__dl_call(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid);
+        emit_args_filled(e->args,e->nargs);
+        op_s(", "); op_n(e->num); op_s(", "); emit_node(e->b); op_c(')');
+        break;
     case N_UN:
         if(e->op==O_NOT){ op_s("v_not("); emit_node(e->a); op_c(')'); }
         else { op_s("v_sub(v_int(0), "); emit_node(e->a); op_c(')'); }
@@ -494,6 +517,14 @@ static void emit_program(void)
        ここで dispatch を宣言してはいけない。 */
     op_s("int __new_init(int id, int meth, int a0, int a1, int a2, int a3) {\n"
          "  if (id >= 0) { dispatch(id, meth, a0, a1, a2, a3); }\n  return id;\n}\n");
+    /* 期限つき呼び出しの受け皿。cc_now_ms と dispatch だけで書ける。
+       機内 cc は仮引数 8 個までなので self は渡さない（cc_call も捨てている）。 */
+    op_s("int __dl_call(int to, int meth, int a0, int a1, int a2, int a3, int ms, int elsev) {\n"
+         "  int t0; int r;\n"
+         "  t0 = v_int_of(cc_now_ms());\n"
+         "  r = dispatch(to, meth, a0, a1, a2, a3);\n"
+         "  if (v_int_of(cc_now_ms()) - t0 > ms) { return elsev; }\n"
+         "  return r;\n}\n");
     op_s("int g_spawn(int cls) {\n  int id; id = cc_actor_new();\n  if (id < 0) { return -1; }\n");
     op_s("  g_nobj = g_nobj + 1;\n  g_obj[id].cls = cls;\n");
     for (int ci=0; ci<NCLS; ci++) {
