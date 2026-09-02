@@ -1286,13 +1286,27 @@ static int http_build(const char *req, char *out, int max)
                                  "functions, recursion; builtins print/putchar/puts/actor_send.\n");
         } else {
             int srclen = 0; while (bodyp[srclen]) srclen++;
-            /* 本文が AIPL（"class " で始まる）なら、機内の abcl2c で C に
+            /* 本文が AIPL（最初の語が "class"）なら、機内の abcl2c で C に
                直してから JIT に渡す。シェルの cc/make が .abcl を透過的に
-               扱うのと同じ経路を HTTP からも使えるようにする。 */
+               扱うのと同じ経路を HTTP からも使えるようにする。
+
+               判定の前に空白とコメントを読み飛ばす。以前は本文の先頭が
+               literal に "class " のときしか見ていなかったので、
+               正典のガイド標本のように "// g1: …" で始まる AIPL が
+               C として扱われ、cc が "expected type" で落ちていた。
+               読み飛ばすのは判定のためだけで、abcl2c には本文をそのまま渡す
+               （abcl2c の字句解析器がコメントを扱う）。 */
             const char *runsrc = bodyp;
             int xlat_ok = 1;
-            if (bodyp[0]=='c'&&bodyp[1]=='l'&&bodyp[2]=='a'&&bodyp[3]=='s'&&
-                bodyp[4]=='s'&&(bodyp[5]==' '||bodyp[5]=='\t')) {
+            const char *hd = bodyp;
+            for (;;) {
+                while (*hd==' '||*hd=='\t'||*hd=='\r'||*hd=='\n') hd++;
+                if (hd[0]=='/'&&hd[1]=='/') { hd+=2; while (*hd && *hd!='\n') hd++; continue; }
+                if (hd[0]=='/'&&hd[1]=='*') { hd+=2; while (*hd && !(hd[0]=='*'&&hd[1]=='/')) hd++; if(*hd) hd+=2; continue; }
+                break;
+            }
+            if (hd[0]=='c'&&hd[1]=='l'&&hd[2]=='a'&&hd[3]=='s'&&hd[4]=='s'&&
+                (hd[5]==' '||hd[5]=='\t'||hd[5]=='\r'||hd[5]=='\n')) {
                 extern int         abcl2c(const char *, int, char *, int);
                 extern const char *abcl2c_error(void);
                 static char xlat[32768];

@@ -1,10 +1,21 @@
 // cc/abcl2c.c — on-device AIPL (.abcl) -> C translator (the xinu-jit subset).
 //
 // Turns a real AIPL actor program (classes / fields / methods / new / send /
-// now / if / while / return / print / arithmetic / strings) into the
+// now / reply / if / while / return / print / arithmetic / strings) into the
 // self-contained integer-subset C the on-device compiler (cc) JITs.  Same
 // shape as the host `aipl2c --xinu-jit`, but on the device so `cc foo.abcl`
 // and `make foo.abcl` run real AIPL with no host round-trip.
+//
+// Surface syntax follows the canonical AIPL guide (docs/samples/guide/g*.aipl):
+//   method m(x: D) : unit !{log, mut} @ 2 { ... }   annotations are read and dropped
+//   ++   string concatenation (maps to v_add; the runtime concatenates)
+//   true / false                                    bool is int here: 1 / 0
+//   reply(e)                                        == `return e` on this device,
+//                                                   so it must end its block
+// Not on this device, and each says so by name rather than miscompiling:
+//   future / await / select / timeout / spawn / remote / replyto / web_*
+// Of the 10 canonical guide samples this translates 5 (g1 g3 g6 g8 g9); the
+// other 5 need those runtime features.  Measure with the guide samples.
 //
 // Runtime seam (provided by cc.c via cc_resolve_extern):
 //   v_int v_str v_add v_sub v_mul v_div v_lt v_le v_eq v_ne v_and v_or v_not
@@ -54,6 +65,8 @@ static void lex_next(void)
     { char a=L[0],b=L[1]; const char *two=0;
       if(a=='='&&b=='=')two="==";else if(a=='!'&&b=='=')two="!=";else if(a=='<'&&b=='=')two="<=";
       else if(a=='>'&&b=='=')two=">=";else if(a=='&'&&b=='&')two="&&";else if(a=='|'&&b=='|')two="||";
+      /* ++ は文字列連結。'+' より先に見ないと 1+ +1 に割れる。 */
+      else if(a=='+'&&b=='+')two="++";else if(a=='-'&&b=='>')two="->";
       if(two){T.s[0]=two[0];T.s[1]=two[1];T.s[2]=0;L+=2;T.kind=T_PUNCT;return;}
       T.s[0]=a;T.s[1]=0;L++;T.kind=T_PUNCT;return; }
 }
@@ -97,6 +110,49 @@ static int field_idx(class_t *c, const char *name)
 static void skip_block(void) {           /* T is '{'; consume to matching '}' */
     int d=0; do { if(is_p("{"))d++; else if(is_p("}"))d--; lex_next(); } while(d>0&&T.kind!=T_EOF);
 }
+
+/* 型注釈を読み飛ばす。`unit` `int` `string` `bool` とクラス名、それに `list[int]`
+   のような添字つきを受ける。このバックエンドは値をタグ付き 64 ビットで持つので、
+   型そのものは使わない。読み飛ばすだけ。 */
+static int skip_type(void)
+{
+    if (T.kind!=T_ID) return a2c_fail("type: expected name");
+    lex_next();
+    if (is_p("[")) {                      /* list[int] / map[string,int] */
+        int d=0, guard=0;
+        do { if(is_p("["))d++; else if(is_p("]"))d--; lex_next(); }
+        while (d>0 && T.kind!=T_EOF && ++guard<64);
+        if (d>0) return a2c_fail("type: unbalanced '['");
+    }
+    return 0;
+}
+
+/* メソッド署名の後置注釈を読み飛ばす。正典 AIPL の
+     `method m(x: D) : unit !{log, mut} @ 2 { ... }`
+   の `: unit` `!{...}` `@ 2` の部分。従来の `-> T` も受ける。
+   ここが無いために、正典のガイド標本 10 本が全部 `method: expected '{'` で
+   落ちていた。効果と義務レベルは意味検査が正典側の担当なので、受理して捨てる。 */
+static int skip_method_annots(void)
+{
+    for (int guard=0; guard<16 && T.kind!=T_EOF; guard++) {
+        if (is_p("{")) return 0;
+        if (is_p(":") || is_p("->")) { lex_next(); if(skip_type()) return -1; continue; }
+        if (is_p("!")) {                          /* 効果注釈 !{ ... } */
+            lex_next(); if(!is_p("{")) return a2c_fail("effects: expected '{' after '!'");
+            int d=0, g2=0;
+            do { if(is_p("{"))d++; else if(is_p("}"))d--; lex_next(); }
+            while (d>0 && T.kind!=T_EOF && ++g2<128);
+            if (d>0) return a2c_fail("effects: unbalanced '{'");
+            continue;
+        }
+        if (is_p("@")) {                          /* 義務レベル @ N */
+            lex_next(); if(T.kind!=T_NUM) return a2c_fail("'@': expected level");
+            lex_next(); continue;
+        }
+        break;
+    }
+    return 0;
+}
 static int parse_structure(const char *src)
 {
     NCLS=0; NMNAME=0; TOPLEVEL=0; MAXF=1; a2c_err[0]=0;
@@ -114,16 +170,38 @@ static int parse_structure(const char *src)
                 lex_next(); if(T.kind!=T_ID) return a2c_fail("field: expected name");
                 if(c->nfield>=MAXFIELD) return a2c_fail("too many fields");
                 cpid(c->field[c->nfield]); long init=0; lex_next();
-                if(is_p("=")){ lex_next(); if(T.kind==T_NUM) init=T.num; while(!is_p(";")&&T.kind!=T_EOF) lex_next(); }
+                if(is_p(":")) { lex_next(); if(skip_type()) return -1; }   /* var n: int = 0; */
+                if(is_p("=")){
+                    lex_next();
+                    /* 初期値は long ひとつに入れて g_spawn が v_int で置く。整数と
+                       真偽値だけ持てる。以前は「数値でなければ黙って 0」だったので、
+                       文字列の初期値が何も言わずに 0 になっていた。名前をつけて断る。 */
+                    int neg=0; if(is_p("-")){ neg=1; lex_next(); }
+                    if(T.kind==T_NUM)        { init = neg ? -T.num : T.num; lex_next(); }
+                    else if(is_kw("true"))   { if(neg) return a2c_fail("field init: '-' on bool"); init=1; lex_next(); }
+                    else if(is_kw("false"))  { if(neg) return a2c_fail("field init: '-' on bool"); init=0; lex_next(); }
+                    else return a2c_fail("field init: only int/bool literals on this device");
+                }
                 c->finit[c->nfield]=init; c->nfield++; if(c->nfield>MAXF) MAXF=c->nfield;
-                if(is_p(";")) lex_next();
+                if(is_p(";")) lex_next(); else return a2c_fail("field: expected ';'");
             } else if (is_kw("method")) {
                 lex_next(); if(T.kind!=T_ID) return a2c_fail("method: expected name");
                 if(c->nmethod>=MAXMETHOD) return a2c_fail("too many methods");
                 int mi=c->nmethod++; cpid(c->method[mi].name); meth_id(c->method[mi].name); c->method[mi].nparam=0;
                 lex_next(); if(!is_p("(")) return a2c_fail("method: expected '('"); lex_next();
-                while(!is_p(")")&&T.kind!=T_EOF){ if(T.kind==T_ID && c->method[mi].nparam<MAXPARAM) cpid(c->method[mi].param[c->method[mi].nparam++]); lex_next(); if(is_p(",")) lex_next(); }
-                lex_next(); if(!is_p("{")) return a2c_fail("method: expected '{'");
+                /* 仮引数。`x: D` の型注釈を読む。以前は識別子を無条件に拾っていたので、
+                   `x: D` の `D` まで 2 つめの仮引数として数えていた。 */
+                while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){
+                    if(T.kind!=T_ID) return a2c_fail("method: expected parameter name");
+                    if(c->method[mi].nparam>=MAXPARAM) return a2c_fail("too many parameters (max 4)");
+                    cpid(c->method[mi].param[c->method[mi].nparam++]); lex_next();
+                    if(is_p(":")) { lex_next(); if(skip_type()) return -1; }
+                    if(is_p(",")) lex_next(); else break;
+                }
+                if(!is_p(")")) return a2c_fail("method: expected ')'");
+                lex_next();
+                if(skip_method_annots()) return -1;
+                if(!is_p("{")) return a2c_fail("method: expected '{'");
                 c->method[mi].body=Ts;       /* points at the '{' */
                 skip_block();
             } else return a2c_fail("class body: expected var/method");
@@ -166,8 +244,23 @@ static int parse_primary(void)
 
     if (T.kind==T_NUM) { int n=mknode(N_INT); ND[n].num=T.num; lex_next(); return n; }
     if (T.kind==T_STR) { int n=mknode(N_STR); cpid_to(ND[n].s); lex_next(); return n; }
+    /* 真偽値リテラル。このバックエンドは bool を int で持つので 1 / 0 に写す。
+       以前はキーワードでなかったため識別子として素通しし、未定義の v_true を
+       参照する C が出ていた（実機の cc が "undefined variable" で落ちる）。 */
+    if (is_kw("true"))  { int n=mknode(N_INT); ND[n].num=1; lex_next(); return n; }
+    if (is_kw("false")) { int n=mknode(N_INT); ND[n].num=0; lex_next(); return n; }
     if (is_kw("new")) { lex_next(); if(T.kind!=T_ID){a2c_fail("new: expected class");return 0;}
-        int ci=class_idx(T.s); int n=mknode(N_NEW); ND[n].ci=ci; lex_next();
+        int ci=class_idx(T.s);
+        /* 知らないクラス名だと class_idx が -1 を返す。以前はそれをそのまま
+           構文木に入れていたので、生成のときに CLS[-1] を読んでいた。
+           ホストでは ASan が捕まえるが、実機ではカーネルの領域外参照になる。 */
+        if (ci < 0) {
+            char m[96]; int k=0; const char *pre="new: unknown class: ";
+            while(pre[k] && k<(int)sizeof m-1){ m[k]=pre[k]; k++; }
+            for(int j=0; T.s[j] && k<(int)sizeof m-1; j++) m[k++]=T.s[j];
+            m[k]=0; a2c_fail(m); return 0;
+        }
+        int n=mknode(N_NEW); ND[n].ci=ci; lex_next();
         /* 引数を読み飛ばさずに構文木へ入れる。以前は '(' の次が ')' でないと
            何も進めずに戻っていたので、new A("x") で呼び出し側が無限ループした
            （実機ではカーネルごと固まる）。init があればそれに渡す。 */
@@ -221,11 +314,42 @@ static int parse_unary(void)
 static int bin(int op,int a,int b){ int n=mknode(N_BIN); ND[n].op=op; ND[n].a=a; ND[n].b=b; return n; }
 static int parse_mul(void){ int a=parse_unary(); for(;;){ int op; if(is_p("*"))op=O_MUL; else if(is_p("/"))op=O_DIV; else if(is_p("%")){a2c_fail("'%' not supported");return 0;} else break; lex_next(); a=bin(op,a,parse_unary()); } return a; }
 static int parse_add(void){ int a=parse_mul(); for(;;){ int op; if(is_p("+"))op=O_ADD; else if(is_p("-"))op=O_SUB; else break; lex_next(); a=bin(op,a,parse_mul()); } return a; }
-static int parse_rel(void){ int a=parse_add(); for(;;){ int op; if(is_p("<="))op=O_LE; else if(is_p(">="))op=O_GE; else if(is_p("<"))op=O_LT; else if(is_p(">"))op=O_GT; else break; lex_next(); a=bin(op,a,parse_add()); } return a; }
+/* 文字列連結。優先順位は 等値 < 比較 < ++ < 加減。ランタイムの v_add は
+   片方が文字列なら連結するので、O_ADD にそのまま写せる（cc.c:365）。 */
+static int parse_concat(void){ int a=parse_add(); while(is_p("++")){ lex_next(); a=bin(O_ADD,a,parse_add()); } return a; }
+static int parse_rel(void){ int a=parse_concat(); for(;;){ int op; if(is_p("<="))op=O_LE; else if(is_p(">="))op=O_GE; else if(is_p("<"))op=O_LT; else if(is_p(">"))op=O_GT; else break; lex_next(); a=bin(op,a,parse_concat()); } return a; }
 static int parse_eql(void){ int a=parse_rel(); for(;;){ int op; if(is_p("=="))op=O_EQ; else if(is_p("!="))op=O_NE; else break; lex_next(); a=bin(op,a,parse_rel()); } return a; }
 static int parse_and(void){ int a=parse_eql(); while(is_p("&&")){ lex_next(); a=bin(O_AND,a,parse_eql()); } return a; }
 static int parse_or (void){ int a=parse_and(); while(is_p("||")){ lex_next(); a=bin(O_OR,a,parse_and()); } return a; }
 static int parse_expr(void){ return parse_or(); }
+
+/* トップレベルの var は C の大域変数にする。以前は main のローカルにしていたので、
+   メソッドの中から参照すると宣言の無い名前になり、生成 C が機内 cc で
+   "undefined variable" になっていた（g3 の `now stock.take(k)` がこれ）。 */
+#define MAXTOPV 64
+static char TOPV[MAXTOPV][48]; static int NTOPV;
+static int is_topvar(const char *n)
+{ for(int i=0;i<NTOPV;i++){int k=0;for(;n[k];k++)if(TOPV[i][k]!=n[k])goto no; if(TOPV[i][k]==0)return 1; no:;} return 0; }
+static void scan_topvars(void)
+{
+    NTOPV=0; if(!TOPLEVEL) return;
+    lsave_t sv=lex_save();
+    L=TOPLEVEL; lex_next();
+    int depth=0, guard=0;
+    while (T.kind!=T_EOF && ++guard<100000) {
+        if (is_p("{")) depth++;
+        else if (is_p("}")) { if(depth>0) depth--; }
+        else if (depth==0 && is_kw("var")) {
+            lex_next();
+            if (T.kind==T_ID && !is_topvar(T.s) && NTOPV<MAXTOPV) {
+                int k=0; for(;T.s[k]&&k<47;k++) TOPV[NTOPV][k]=T.s[k]; TOPV[NTOPV][k]=0; NTOPV++;
+            }
+            continue;                    /* 名前の分は下の lex_next で進む */
+        }
+        lex_next();
+    }
+    lex_load(sv);
+}
 
 /* ---- output ------------------------------------------------------- */
 static char *OUT; static int OCAP, OPOS;
@@ -309,7 +433,10 @@ static void emit_stmt(void)
     if (is_p("{")) { op_s("  "); emit_block(); return; }
     if (is_kw("var")) {
         lex_next(); if(T.kind!=T_ID){a2c_fail("var: expected name");return;} char nm[48]; cpid(nm); lex_next();
-        op_s("  int v_"); op_s(nm); op_s(" = ");
+        if(is_p(":")) { lex_next(); if(skip_type()) return; }      /* var x: int = ... */
+        /* トップレベルの var は大域として先に宣言済みなので、ここでは代入だけ。 */
+        if (CC<0 && is_topvar(nm)) op_s("  v_"), op_s(nm), op_s(" = ");
+        else { op_s("  int v_"); op_s(nm); op_s(" = "); }
         if(is_p("=")){ lex_next(); int e=parse_expr(); emit_node(e); } else op_s("v_int(0)");
         op_s(";\n"); add_local(nm); if(is_p(";"))lex_next(); return;
     }
@@ -330,6 +457,22 @@ static void emit_stmt(void)
         return;
     }
     if (is_kw("send")) { emit_send(); return; }
+    /* reply(e) — この装置では戻り値そのもの。`now o.m()` は dispatch() の
+       返り値を受けるので（emit の N_NOW を見よ）、reply は return と同じ。
+       ただし return は本当にそこで抜けるので、後ろに文が続くと正典と意味が
+       ずれる。黙ってずらさず、その場で断る。 */
+    if (is_kw("reply")) {
+        lex_next(); if(!is_p("(")) { a2c_fail("reply: expected '('"); return; } lex_next();
+        op_s("  return ");
+        if (is_p(")")) op_s("v_int(0)");
+        else { int e=parse_expr(); if(a2c_err[0]) return; emit_node(e); }
+        op_s(";\n");
+        if(!is_p(")")) { a2c_fail("reply: expected ')'"); return; } lex_next();
+        if(is_p(";")) lex_next();
+        if(!is_p("}") && T.kind!=T_EOF)
+            a2c_fail("reply must be the last statement of its block on this device");
+        return;
+    }
     /* assignment (ID '=' expr) or expression statement */
     if (T.kind==T_ID) {
         lsave_t sv=lex_save(); char nm[48]; cpid(nm); lex_next();
@@ -359,6 +502,10 @@ static void emit_program(void)
         op_s("  }\n");
     }
     op_s("  return id;\n}\n\n");
+
+    scan_topvars();
+    for (int i=0;i<NTOPV;i++){ op_s("int v_"); op_s(TOPV[i]); op_s(";\n"); }
+    if (NTOPV) op_c('\n');
 
     for (int ci=0; ci<NCLS; ci++) {
         for (int mi=0; mi<CLS[ci].nmethod; mi++) {
