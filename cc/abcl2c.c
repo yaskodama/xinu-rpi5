@@ -261,6 +261,29 @@ static void scan_topvars(void)
     lex_load(sv);
 }
 
+/* ---- select（Pi 3 と同じ「フラグ＋横取り」方式）------------------------
+ * Pi 3 は select を待たない。次のように落としている:
+ *   ・select のある f は  __sel = sid  を立てて終わる
+ *   ・case job(k) -> 本体 は、メソッド job の先頭へ差し込む:
+ *       if (__sel == sid) { __sel = 0; 本体; f の残り } else { job の元の本体 }
+ *   ・timeout は、対応するメッセージが来なかったときに走る
+ * こうすると select を満たすメッセージは通常のメソッド呼び出しで届くので、
+ * サスペンドもメールボックス走査も要らない。Pi 5 でも同じ形にする。 */
+#define MAXSEL 8
+typedef struct {
+    int  cls;                  /* このクラスの                     */
+    int  owner;                /* このメソッドが持つ select        */
+    int  sid;                  /* 1 から振る識別子                 */
+    int  ncase;
+    int  cmid[4];              /* case が待つメソッド番号          */
+    char cvar[4][48];          /* case の仮引数名（1つまで）       */
+    const char *cbody[4];      /* case 本体（'{' を指す）          */
+    const char *tbody;         /* timeout 本体（無ければ 0）       */
+    const char *rest;          /* select の後ろに続く文の先頭      */
+} sel_t;
+static sel_t SEL[MAXSEL]; static int NSEL;
+static int  SELFIELD[MAXCLASS];        /* __sel の隠しフィールド番号。-1 = 無し */
+
 /* ---- expression AST ----------------------------------------------- */
 enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_FUT, N_AWAIT, N_AWAITDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
@@ -271,6 +294,7 @@ static int mknode(int k){ if(NND>=MAXNODE) { a2c_fail("expression too large"); r
 
 /* current emit context */
 static int   CC;                         /* current class idx, -1 = top level  */
+static int   CURMETH = -1;               /* 生成中のメソッド番号（select 用）  */
 static char  LOCAL[64][48]; static int NLOCAL;
 static int   is_local(const char *n){ for(int i=0;i<NLOCAL;i++){int k=0;for(;n[k];k++)if(LOCAL[i][k]!=n[k])goto no; if(LOCAL[i][k]==0)return 1; no:;} return 0; }
 static void  add_local(const char *n){ if(NLOCAL<64){int k=0;for(;n[k]&&k<47;k++)LOCAL[NLOCAL][k]=n[k];LOCAL[NLOCAL][k]=0;NLOCAL++;} }
@@ -438,6 +462,93 @@ static int parse_and(void){ int a=parse_eql(); while(is_p("&&")){ lex_next(); a=
 static int parse_or (void){ int a=parse_and(); while(is_p("||")){ lex_next(); a=bin(O_OR,a,parse_and()); } return a; }
 static int parse_expr(void){ return parse_or(); }
 
+/* 各メソッドの本体を走査して select を拾い、SEL[] に積む。
+   併せて、select を使うクラスへ隠しフィールド __sel を足す。
+   本体は原文へのポインタで持っているので、ここでも lex し直して位置を控える。 */
+static int scan_selects(void)
+{
+    NSEL = 0;
+    for (int i=0;i<MAXCLASS;i++) SELFIELD[i] = -1;
+    lsave_t sv = lex_save();
+    for (int ci=0; ci<NCLS; ci++) {
+        for (int mi=0; mi<CLS[ci].nmethod; mi++) {
+            L = CLS[ci].method[mi].body; lex_next();      /* '{' から */
+            if (!is_p("{")) continue;
+            lex_next();
+            int depth = 0;
+            while (T.kind!=T_EOF) {
+                if (is_p("{")) { depth++; lex_next(); continue; }
+                if (is_p("}")) { if (depth==0) break; depth--; lex_next(); continue; }
+                if (depth==0 && is_kw("select")) {
+                    if (NSEL>=MAXSEL) { lex_load(sv); return a2c_fail("too many selects"); }
+                    sel_t *sp = &SEL[NSEL]; sp->cls=ci; sp->owner=mi; sp->sid=NSEL+1;
+                    sp->ncase=0; sp->tbody=0; sp->rest=0;
+                    lex_next();
+                    if(!is_p("{")) { lex_load(sv); return a2c_fail("select: expected '{'"); }
+                    lex_next();
+                    while (!is_p("}") && T.kind!=T_EOF) {
+                        if (is_kw("case")) {
+                            lex_next();
+                            if(T.kind!=T_ID) { lex_load(sv); return a2c_fail("select: expected a message name"); }
+                            if(sp->ncase>=4) { lex_load(sv); return a2c_fail("select: too many cases (max 4)"); }
+                            int k = sp->ncase;
+                            sp->cmid[k]=meth_id(T.s); sp->cvar[k][0]=0; lex_next();
+                            if(is_p("(")){ lex_next();
+                                if(T.kind==T_ID){ int q=0; for(;T.s[q]&&q<47;q++) sp->cvar[k][q]=T.s[q]; sp->cvar[k][q]=0; lex_next(); }
+                                while(!is_p(")")&&T.kind!=T_EOF) lex_next();
+                                if(is_p(")")) lex_next(); }
+                            if(is_p(":")) { lex_next(); if(skip_type()) { lex_load(sv); return -1; } }
+                            if(is_p("->")) lex_next();
+                            if(!is_p("{")) { lex_load(sv); return a2c_fail("select: expected '{' after case"); }
+                            sp->cbody[k]=Ts; skip_block(); sp->ncase++;
+                        } else if (is_kw("timeout")) {
+                            lex_next(); if(T.kind==T_NUM) lex_next();
+                            if(is_p("->")) lex_next();
+                            if(!is_p("{")) { lex_load(sv); return a2c_fail("select: expected '{' after timeout"); }
+                            sp->tbody=Ts; skip_block();
+                        } else { lex_load(sv); return a2c_fail("select: expected 'case' or 'timeout'"); }
+                    }
+                    if(is_p("}")) lex_next();
+                    if(sp->ncase==0) { lex_load(sv); return a2c_fail("select: no case"); }
+                    sp->rest = Ts;                      /* select の後ろ */
+                    NSEL++;
+                    /* このクラスに __sel が無ければ足す */
+                    if (SELFIELD[ci] < 0) {
+                        class_t *c = &CLS[ci];
+                        if (c->nfield >= MAXFIELD) { lex_load(sv); return a2c_fail("too many fields (__sel)"); }
+                        const char *nm = "__sel";
+                        int q=0; for(;nm[q];q++) c->field[c->nfield][q]=nm[q]; c->field[c->nfield][q]=0;
+                        c->finit[c->nfield] = 0;
+                        SELFIELD[ci] = c->nfield;
+                        c->nfield++; if(c->nfield>MAXF) MAXF=c->nfield;
+                    }
+                    continue;
+                }
+                lex_next();
+            }
+        }
+    }
+    lex_load(sv);
+    return 0;
+}
+
+/* このメソッドを待っている select（横取り）を探す */
+static sel_t *sel_intercept(int ci, int mid, int *which)
+{
+    for (int i=0;i<NSEL;i++) {
+        if (SEL[i].cls != ci) continue;
+        for (int k=0;k<SEL[i].ncase;k++)
+            if (SEL[i].cmid[k]==mid) { if(which)*which=k; return &SEL[i]; }
+    }
+    return 0;
+}
+/* このメソッド自身が持つ select */
+static sel_t *sel_owner(int ci, int mi)
+{
+    for (int i=0;i<NSEL;i++) if (SEL[i].cls==ci && SEL[i].owner==mi) return &SEL[i];
+    return 0;
+}
+
 /* ---- output ------------------------------------------------------- */
 static char *OUT; static int OCAP, OPOS;
 static void op_c(char c){ if(OPOS<OCAP-1) OUT[OPOS++]=c; }
@@ -536,6 +647,10 @@ static void emit_send(void)
     if(is_p("(")){ lex_next(); while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){ if(na<4) args[na++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); } if(is_p(")"))lex_next(); }
     if(is_p(";")) lex_next();
     op_s("  enqueue(v_int_of("); emit_node(obj); op_s("), "); op_n(mid); emit_args_filled(args,na); op_s(");\n");
+    /* トップレベルでは、積んだらその場で配る。Pi 3 はアクターが実プロセスなので
+       send した相手が先に走る。Pi 5 は FIFO に積むだけなので、後続の now が
+       先に相手のメソッドへ入ってしまい select の横取りが効かない。順序を揃える。 */
+    if (CC < 0) op_s("  cc_pump_now();\n");
 }
 static void emit_stmt(void)
 {
@@ -567,60 +682,8 @@ static void emit_stmt(void)
         return;
     }
     if (is_kw("send")) { emit_send(); return; }
-    /* select { case m(x) -> { ... }  timeout <ms> -> { ... } }
-       協調ポンプなので待てない。cc_select は「いま FIFO に来ている自分宛」を
-       覗くだけで、無ければ -1（timeout 節へ）。Pi 3 は継続分割で本当に待てるので
-       そこは性格が違う。 */
-    if (is_kw("select")) {
-        lex_next();
-        if(!is_p("{")) { a2c_fail("select: expected '{'"); return; }
-        lex_next();
-        int mids[4]; int nmid=0;
-        const char *cbody[4]; char cvar[4][48];
-        const char *tbody = 0;
-        while (!is_p("}") && T.kind!=T_EOF && !a2c_err[0]) {
-            if (is_kw("case")) {
-                lex_next();
-                if(T.kind!=T_ID) { a2c_fail("select: expected a message name"); return; }
-                if(nmid>=4) { a2c_fail("select: too many cases (max 4)"); return; }
-                mids[nmid]=meth_id(T.s); cvar[nmid][0]=0; lex_next();
-                if(is_p("(")){ lex_next();
-                    if(T.kind==T_ID){ int k=0; for(;T.s[k]&&k<47;k++) cvar[nmid][k]=T.s[k]; cvar[nmid][k]=0; lex_next(); }
-                    while(!is_p(")")&&T.kind!=T_EOF) lex_next();
-                    if(is_p(")")) lex_next(); }
-                if(is_p(":")) { lex_next(); if(skip_type()) return; }
-                if(is_p("->")) lex_next();
-                if(!is_p("{")) { a2c_fail("select: expected '{' after case"); return; }
-                cbody[nmid]=Ts; skip_block(); nmid++;
-            } else if (is_kw("timeout")) {
-                lex_next();
-                if(T.kind==T_NUM) lex_next();          /* 期限の値は使わない */
-                if(is_p("->")) lex_next();
-                if(!is_p("{")) { a2c_fail("select: expected '{' after timeout"); return; }
-                tbody=Ts; skip_block();
-            } else { a2c_fail("select: expected 'case' or 'timeout'"); return; }
-        }
-        if(is_p("}")) lex_next();
-        if(nmid==0) { a2c_fail("select: no case"); return; }
-        lsave_t sv = lex_save();
-        op_s("  { int __sm = v_int_of(cc_select(v_int(self), "); op_n(nmid);
-        for(int k=0;k<4;k++){ op_s(", "); if(k<nmid) op_n(mids[k]); else op_s("-1"); }
-        op_s("));\n");
-        for(int k=0;k<nmid;k++){
-            op_s(k ? "  else if (__sm == " : "  if (__sm == "); op_n(mids[k]); op_s(") {\n");
-            if(cvar[k][0]){ op_s("  int v_"); op_s(cvar[k]); op_s(" = cc_sel_arg(v_int(0));\n"); add_local(cvar[k]); }
-            L=cbody[k]; lex_next(); emit_block();
-            op_s("  }\n");
-        }
-        if(tbody){ op_s("  else {\n"); L=tbody; lex_next(); emit_block(); op_s("  }\n"); }
-        op_s("  }\n");
-        lex_load(sv);
-        return;
-    }
-    /* reply(e) — この装置では戻り値そのもの。`now o.m()` は dispatch() の
-       返り値を受けるので（emit の N_NOW を見よ）、reply は return と同じ。
-       ただし return は本当にそこで抜けるので、後ろに文が続くと正典と意味が
-       ずれる。黙ってずらさず、その場で断る。 */
+    /* reply(e) — この装置では戻り値そのもの。`now o.m()` は dispatch の
+       返り値を受けるので return と同じ。後ろに文が続くと意味がずれるので断る。 */
     if (is_kw("reply")) {
         lex_next(); if(!is_p("(")) { a2c_fail("reply: expected '('"); return; } lex_next();
         op_s("  return ");
@@ -631,6 +694,18 @@ static void emit_stmt(void)
         if(is_p(";")) lex_next();
         if(!is_p("}") && T.kind!=T_EOF)
             a2c_fail("reply must be the last statement of its block on this device");
+        return;
+    }
+    /* select は Pi 3 と同じ「フラグを立てて終わる」形に落とす。
+       本体（case / timeout / 残り）は scan_selects が控えてあり、
+       横取りとして相手のメソッドの先頭に出す。ここでは番号を立てるだけ。 */
+    if (is_kw("select")) {
+        sel_t *sp = (CC>=0) ? sel_owner(CC, CURMETH) : 0;
+        if (!sp) { a2c_fail("select: メソッドの中でだけ使えます"); return; }
+        /* 走査時と同じところまで読み飛ばす */
+        lex_next();
+        if(is_p("{")) { L = sp->rest; lex_next(); }
+        op_s("  g_obj[self].f["); op_n(SELFIELD[CC]); op_s("] = v_int("); op_n(sp->sid); op_s(");\n");
         return;
     }
     /* assignment (ID '=' expr) or expression statement */
@@ -671,6 +746,7 @@ static void emit_program(void)
     }
     op_s("  return id;\n}\n\n");
 
+    scan_selects();
     scan_topvars();
     for (int i=0;i<NTOPV;i++){ op_s("int v_"); op_s(TOPV[i]); op_s(";\n"); }
     if (NTOPV) op_c('\n');
@@ -679,12 +755,65 @@ static void emit_program(void)
         for (int mi=0; mi<CLS[ci].nmethod; mi++) {
             op_s("int m_"); op_s(CLS[ci].name); op_c('_'); op_s(CLS[ci].method[mi].name);
             op_s("(int self, int a0, int a1, int a2, int a3) {\n");
-            CC=ci; NLOCAL=0;
+            CC=ci; NLOCAL=0; CURMETH=mi;
             for (int p=0; p<CLS[ci].method[mi].nparam; p++){ op_s("  int v_"); op_s(CLS[ci].method[mi].param[p]); op_s(" = a"); op_n(p); op_s(";\n"); add_local(CLS[ci].method[mi].param[p]); }
+            /* このメソッドを待っている select があれば、先頭で横取りする。
+               case の仮引数は受け側の仮引数へ位置で対応づく（Pi 3 と同じ）。 */
+            int which = -1;
+            sel_t *ip = sel_intercept(ci, meth_id(CLS[ci].method[mi].name), &which);
+            if (ip) {
+                op_s("  if (v_int_of(g_obj[self].f["); op_n(SELFIELD[ci]); op_s("]) == "); op_n(ip->sid); op_s(") {\n");
+                op_s("    g_obj[self].f["); op_n(SELFIELD[ci]); op_s("] = v_int(0);\n");
+                if (ip->cvar[which][0] && CLS[ci].method[mi].nparam>0
+                    && !a2c_streq(ip->cvar[which], CLS[ci].method[mi].param[0])) {
+                    op_s("    int v_"); op_s(ip->cvar[which]); op_s(" = a0;\n");
+                    add_local(ip->cvar[which]);
+                }
+                L=ip->cbody[which]; lex_next(); emit_block();      /* case 本体 */
+                if (ip->rest) {                                     /* select の残り */
+                    L=ip->rest; lex_next();
+                    while (!is_p("}") && T.kind!=T_EOF && !a2c_err[0]) emit_stmt();
+                }
+                op_s("    return v_int(0);\n  }\n");
+                NLOCAL=0;
+                for (int p=0; p<CLS[ci].method[mi].nparam; p++) add_local(CLS[ci].method[mi].param[p]);
+            }
             L=CLS[ci].method[mi].body; lex_next();   /* re-lex the body from '{' */
             emit_block();
             op_s("  return 0;\n}\n\n");
         }
+    }
+
+    /* select の timeout 節。Pi 3 は別アクタ __Timer に wait(ms) させて
+       「まだ待っていたら timeout 節を走らせる」形にしている。この装置には
+       待てる実行体が無いので、FIFO を配り切っても誰も名乗り出なかったときに
+       走らせる ―― 「そのメッセージは来なかった」という意味では同じ。
+       ★ 期限の値（ミリ秒）は使えない。時間ではなく「もう来ない」で判定する。 */
+    int nsel_tmo = 0;
+    for (int i=0;i<NSEL;i++) if (SEL[i].tbody) nsel_tmo++;
+    if (nsel_tmo) {
+        for (int i=0;i<NSEL;i++) {
+            if (!SEL[i].tbody) continue;
+            sel_t *sp = &SEL[i];
+            op_s("int __seltmo"); op_n(sp->sid); op_s("(int self) {\n");
+            CC=sp->cls; NLOCAL=0; CURMETH=sp->owner;
+            L=sp->tbody; lex_next(); emit_block();          /* timeout 本体 */
+            if (sp->rest) {                                  /* select の残り */
+                L=sp->rest; lex_next();
+                while (!is_p("}") && T.kind!=T_EOF && !a2c_err[0]) emit_stmt();
+            }
+            op_s("  return v_int(0);\n}\n\n");
+        }
+        op_s("int __sel_sweep() {\n  int i;\n  i = 0;\n  while (i < 1024) {\n");
+        for (int i=0;i<NSEL;i++) {
+            if (!SEL[i].tbody) continue;
+            sel_t *sp = &SEL[i];
+            op_s("    if (g_obj[i].cls == "); op_n(sp->cls); op_s(") {\n");
+            op_s("      if (v_int_of(g_obj[i].f["); op_n(SELFIELD[sp->cls]); op_s("]) == "); op_n(sp->sid); op_s(") {\n");
+            op_s("        g_obj[i].f["); op_n(SELFIELD[sp->cls]); op_s("] = v_int(0);\n");
+            op_s("        __seltmo"); op_n(sp->sid); op_s("(i);\n      }\n    }\n");
+        }
+        op_s("    i = i + 1;\n  }\n  return 0;\n}\n\n");
     }
 
     op_s("int dispatch(int self, int meth, int a0, int a1, int a2, int a3) {\n  int c; c = g_obj[self].cls;\n");
@@ -710,6 +839,7 @@ static void emit_program(void)
     CC=-1; NLOCAL=0;
     L=TOPLEVEL; lex_next();
     while (T.kind!=T_EOF && !a2c_err[0]) emit_stmt();
+    if (nsel_tmo) op_s("  cc_pump_now();\n  __sel_sweep();\n");
     op_s("  return 0;\n}\n");
     if (OPOS<OCAP) OUT[OPOS]=0;
 }

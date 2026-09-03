@@ -267,6 +267,13 @@ static char        g_ccrun_out[2048];
 static long        g_ccrun_rv;
 static int         g_ccrun_rc;      /* cc_compile() result: 0 ok, <0 error     */
 static int         g_ccrun_aborted;
+/* ランナーが本当に終わったか。以前は proc_resched() が1回返れば完了と
+   見なしていたが、それは「ランナーは決してブロックしない」前提だった。
+   wait() を足したらランナーが眠り、スケジューラが呼び出し元へ戻ってしまい、
+   出力を取りこぼしたうえ、眠ったままのプロセスが静的スタックを掴み続けて
+   次の実行と衝突して板が固まった。完了の印を見て待つ。 */
+static volatile int g_ccrun_done;
+static int          g_ccrun_pid = -1;
 
 /* Runs in the dedicated cc-run process: BOTH the compile and the execute
  * happen here, so the whole JIT machinery uses this process's own stack and
@@ -288,6 +295,7 @@ static void ccrun_proc_entry(void)
         g_ccrun_rv = cc_exec_compiled(g_ccrun_out, sizeof g_ccrun_out, &g_ccrun_aborted);
     }
     cc_set_on_proc(0);
+    g_ccrun_done = 1;
     proc_exit();
 }
 
@@ -347,9 +355,39 @@ static int cc_compile_and_run(const char *path)
     static unsigned char ccrun_stack[CCRUN_STK] __attribute__((aligned(16)));
     g_ccrun_src = csrc; g_ccrun_len = clen;
     g_ccrun_out[0] = 0; g_ccrun_rv = 0; g_ccrun_rc = 0; g_ccrun_aborted = 0;
+    /* 前のランナーがまだ生きているなら、この静的スタックは使い回せない。
+       黙って上書きすると、前のプロセスのフレームを壊して板が固まる。 */
+    if (g_ccrun_pid >= 0 && !proc_is_free(g_ccrun_pid)) {
+        uart_puts("cc: 前の実行がまだ終わっていません\n"); return 1;
+    }
+    g_ccrun_done = 0;
     int pid = proc_create_static(ccrun_proc_entry, ccrun_stack, CCRUN_STK, "cc-run");
     if (pid < 0) { uart_puts("cc: proc_create failed (no slot)\n"); return 1; }
-    proc_resched();                 /* surrender CPU; returns after proc_exit() */
+    g_ccrun_pid = pid;
+    /* ランナーが「消える」まで待つ。proc_resched() の1回では足りない —
+       wait() でランナーが眠ると、その瞬間にここへ戻ってくるからだ。
+       完了の印（g_ccrun_done）は proc_exit の前に立つので、スタックを
+       使い回してよいかの判断には PR_FREE（proc_is_free）を使う。
+       眠っている間はタイマ割り込みが起こしてくれるので、回し続ければ進む。
+       長い wait の間はこのプロセス（HTTP 経由なら RX 処理）が止まるが、
+       板は固まらない。保険として上限を置く。 */
+    { unsigned long t0, hz, ct;
+      __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz)); if (hz < 1000) hz = 1000;
+      __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t0));
+      unsigned long limit = t0 + hz * 15UL;              /* 15 秒で見切る */
+      for (;;) {
+          if (proc_is_free(pid)) break;
+          __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+          if (ct >= limit) break;
+          proc_resched();
+      }
+      if (!proc_is_free(pid)) {
+          /* 見切った。この静的スタックはもう使えないので、次回は断る
+             （g_ccrun_pid を残したままにする）。板は動き続ける。 */
+          uart_puts("cc: 実行が 15 秒で終わりませんでした。以後 cc は使えません（要再起動）\n");
+      } else {
+          for (int k = 0; k < 4; k++) proc_resched();    /* 最後の ctxsw を通す */
+      } }
 
     if (g_ccrun_rc != 0) {
         uart_puts("cc: "); uart_puts(cc_last_error()); uart_putc('\n');

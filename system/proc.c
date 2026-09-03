@@ -314,6 +314,15 @@ void proc_yield(void)
 
 /* Process voluntarily exits.  Marks slot free, picks next ready
  * (or NULLPROC if none), and ctxsw away — never returns. */
+/* そのスロットがもう空いているか。cc-run のように静的スタックを使い回す
+   呼び出し元が、「ランナーが本当に消えたか」を確かめてから次を始めるため。
+   proc_exit() が PR_FREE を立てたあと ctxsw で去り、以後スタックには触れない。 */
+int proc_is_free(int pid)
+{
+    if (pid < 0 || pid >= NPROC) return 1;
+    return proctab[pid].state == PR_FREE;
+}
+
 void proc_exit(void)
 {
     int me = currpid;

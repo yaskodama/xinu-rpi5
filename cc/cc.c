@@ -588,6 +588,10 @@ static void cc_pump(void)
         }
     }
 }
+/* 生成コードから呼べるポンプ。トップレベルの send の直後に配るために使う
+   （Pi 3 はアクターが実プロセスなので send した相手が先に走る。順序を揃える）。 */
+static long cc_pump_now(void) { cc_pump(); return v_int(0); }
+
 /* `now a.m(x)` — synchronous call, returns the handler's value. */
 static long cc_call(long self, long to, long method, long a0, long a1, long a2, long a3)
 {
@@ -986,6 +990,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_web_listen",    (void *)&cc_web_listen     },
         { "cc_web_expose",    (void *)&cc_web_expose     },
         { "cc_wait",          (void *)&cc_wait           },
+        { "cc_pump_now",      (void *)&cc_pump_now       },
         { "cc_future",        (void *)&cc_future         },
         { "cc_await",         (void *)&cc_await          },
         { "cc_await_dl",      (void *)&cc_await_dl       },

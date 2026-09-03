@@ -56,6 +56,7 @@ void proc_ready(int pid);
 void proc_resched(void);
 void proc_yield(void);
 void proc_exit(void);
+int  proc_is_free(int pid);
 
 /* Real-time additions (ported from rpi4): priority dispatch, timed sleep, and
  * timer-driven preemption.  Preemption is OFF by default (proc_set_preempt(1)
