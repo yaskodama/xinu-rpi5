@@ -577,16 +577,19 @@ static void emit_node(int i)
     case N_INT: op_s("v_int("); op_n(e->num); op_c(')'); break;
     case N_STR: op_s("v_str(\""); op_s(e->s); op_s("\")"); break;
     case N_ID:  emit_ident(e->s); break;
-    case N_NEW:
-        if (e->nargs) {
-            int im = -1;
-            for (int k=0; k<CLS[e->ci].nmethod; k++)
-                if (a2c_streq(CLS[e->ci].method[k].name,"init")) { im = meth_id("init"); break; }
-            if (im < 0) { a2c_fail("new: class has no init to take arguments"); break; }
+    case N_NEW: {
+        /* init は new のときに必ず呼ばれる（正典）。以前は引数があるときだけ
+           呼んでいたので、`new C()` で `method init()` が黙って走らなかった。
+           Pi 3 側（compile.ml）も同じ穴だったので両方直した。 */
+        int im = -1;
+        for (int k=0; k<CLS[e->ci].nmethod; k++)
+            if (a2c_streq(CLS[e->ci].method[k].name,"init")) { im = meth_id("init"); break; }
+        if (e->nargs && im < 0) { a2c_fail("new: class has no init to take arguments"); break; }
+        if (im >= 0) {
             op_s("v_int(__new_init(g_spawn("); op_n(e->ci); op_s("), "); op_n(im);
             emit_args_filled(e->args, e->nargs); op_s("))");
         } else { op_s("v_int(g_spawn("); op_n(e->ci); op_s("))"); }
-        break;
+        break; }
     case N_PRINT: op_s("v_print("); if(e->nargs) emit_node(e->args[0]); else op_s("v_int(0)"); op_c(')'); break;
     case N_AICALL: op_s("v_ai_call("); if(e->nargs) emit_node(e->args[0]); else op_s("v_str(\"\")"); op_c(')'); break;
     case N_NOW: op_s("dispatch(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid); emit_args_filled(e->args,e->nargs); op_c(')'); break;
