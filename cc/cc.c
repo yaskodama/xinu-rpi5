@@ -127,11 +127,27 @@ static void emit_dec(long v)
    潰すだけで板は固まらない。そちらだけ長い予算を与えられるようにする。
    1回ごとに既定へ戻す — 長い予算がインライン経路へ漏れないように。 */
 static unsigned long g_timeout_ms = CC_TIMEOUT_MS;
-static int           g_on_proc;      /* 別プロセスで走っているか（wait が使える） */
+/* 専用プロセス・専用スタックで走っているか。ここでだけ wait() が本物の休眠になる。
+   ★ 呼び出し元の文脈で眠ってはいけない。HTTP の処理は net_proc と wm ループ
+      （NULLPROC）のどちらからでも入りうる（loader/main.c の net_proc_main と
+      serial_io_tick が両方 genet_rx_tick を呼び、g_rx_busy で片方が空振りする）。
+      NULLPROC で proc_sleep_us すると、ready が空なら自分自身へ ctxsw することに
+      なって眠らない。だから /cc も「専用プロセスを立てて完了を待つ」形にした
+      （shell/shell.c の cc_run_source_proc）。 */
+static int           g_on_proc;
+/* 1 回の run で眠ってよい合計（ミリ秒）。ランナーを立てた側は「消えるまで
+   proc_resched() を回す」ことでしかランナーを進められない（NULLPROC からは
+   プリエンプションが効かないので、誰も回さなくなったランナーは二度と走らない）。
+   その見切り（15 秒）より確実に短く終わるよう、眠れる合計に上限を置く。 */
+#define CC_SLEEP_BUDGET_MS 10000UL
+static unsigned long g_sleep_left_ms;
 void cc_set_timeout_ms(unsigned long ms) { g_timeout_ms = ms ? ms : CC_TIMEOUT_MS; }
 void cc_set_on_proc(int on)              { g_on_proc = on; }
 static unsigned long g_deadline;
 static int           g_aborted;
+/* 見切った側から「もう帰ってこい」と伝える。ランナーが次に走ったとき、
+   cc_tick() が偽になって即座に抜ける。 */
+void cc_request_abort(void)              { g_aborted = 1; g_deadline = 0; }
 
 static unsigned long cc_now(void)
 {
@@ -146,6 +162,7 @@ static void cc_set_deadline(void)
     g_deadline = cc_now() + (frq / 1000UL) * g_timeout_ms;
     g_aborted = 0;
     g_timeout_ms = CC_TIMEOUT_MS;      /* 次の run へ持ち越さない */
+    g_sleep_left_ms = CC_SLEEP_BUDGET_MS;
 }
 static int cc_tick(void)
 {
@@ -641,16 +658,33 @@ static long cc_wait(long ms)
     long v = v_int_of(ms);
     if (v <= 0) return v_int(0);
     if (!g_on_proc) {
-        /* インライン経路（割り込みを塞いだ RX 処理の中）で寝ると板が固まる。
-           寝ないが、黙って通すと「待ったつもり」で結果が変わるので、出力に
+        /* 呼び出し元の文脈で走っている（専用プロセスではない）。ここで眠ると
+           板が固まる。黙って通すと「待ったつもり」で結果が変わるので、出力に
            はっきり出して打ち切る。cc_error() は実行を止めないので使わない。 */
-        emit_str("\ncc: wait() はこの経路では使えません"
-                 "（シェルの cc/make なら待てます）。ここで打ち切ります。\n");
+        emit_str("\ncc: wait() はこの経路では使えません。ここで打ち切ります。\n");
         g_aborted = 1;
         g_deadline = 0;          /* 次の cc_tick() でループから抜ける */
         return v_int(0);
     }
-    proc_sleep_us((unsigned long)v * 1000UL);
+    if ((unsigned long)v > g_sleep_left_ms) {
+        /* 見切り（15 秒）を跨ぐほど眠らせない。跨ぐと、誰も proc_resched() を
+           回さなくなったランナーが静的スタックを握ったまま残り、以後 cc が
+           使えなくなる（再起動が要る）。 */
+        emit_str("\ncc: wait() の合計がこの実行の上限（10 秒）を超えました。ここで打ち切ります。\n");
+        g_aborted = 1;
+        g_deadline = 0;
+        return v_int(0);
+    }
+    g_sleep_left_ms -= (unsigned long)v;
+    {
+        /* 眠った分は「暴走」ではないので、期限を同じだけ後ろへずらす。
+           そうしないと wait(300) が 250ms の打ち切り予算を食い潰す。 */
+        unsigned long frq;
+        __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(frq));
+        if (frq < 1000UL) frq = 1000UL;
+        proc_sleep_us((unsigned long)v * 1000UL);
+        g_deadline += (frq / 1000UL) * (unsigned long)v;
+    }
     return v_int(0);
 }
 static long cc_now_ms(void) { unsigned long frq=cc_cntfrq(); if(frq<1000)frq=1000; return v_int((long)(cc_now()/(frq/1000UL))); }

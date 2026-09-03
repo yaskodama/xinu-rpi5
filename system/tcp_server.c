@@ -1319,9 +1319,19 @@ static int http_build(const char *req, char *out, int max)
                 } else { runsrc = xlat; srclen = xr; }
             }
             if (xlat_ok) {
-                static char ccout[512];
+                static char ccout[1024];
                 long rv = 0;
-                int rc = cc_run_source(runsrc, srclen, ccout, (int)sizeof ccout, &rv);
+                /* ★ 専用プロセスで走らせる。以前はこの場（HTTP を処理している
+                   文脈）で cc_run_source を直に呼んでいたので、wait() が使えず
+                   g7 だけシェル経路と食い違っていた。
+                   ここで眠るわけにはいかない —— HTTP の処理は net_proc からも
+                   wm ループ（NULLPROC）からも入りうるし、NULLPROC で
+                   proc_sleep_us すると ready が空なら自分自身へ ctxsw して眠らない。
+                   代わりにシェルの cc と同じ「別プロセス・静的スタックで走らせて
+                   消えるまで回す」形にする。中身は cc_run_source そのものなので、
+                   常駐（web_expose のルート、/api/actors）の扱いは変わらない。 */
+                extern int cc_run_source_proc(const char *, int, char *, int, long *);
+                int rc = cc_run_source_proc(runsrc, srclen, ccout, (int)sizeof ccout, &rv);
                 bl = s_put(body, bl, ccout);
                 if (rc == 0) { bl = s_put(body, bl, "=> "); bl = s_putdec(body, bl, rv); bl = s_put(body, bl, "\n"); }
             }

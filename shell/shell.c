@@ -274,6 +274,10 @@ static int         g_ccrun_aborted;
    次の実行と衝突して板が固まった。完了の印を見て待つ。 */
 static volatile int g_ccrun_done;
 static int          g_ccrun_pid = -1;
+/* ランナーのスタックはファイル有効域に置いて、シェルの cc と HTTP の /cc で
+   共有する。共有すれば g_ccrun_pid の見張り一つで両方の同時実行を防げる
+   （別々に持つと、同じアリーナと同じ g_codebuf を二つのプロセスが奪い合う）。 */
+static unsigned char g_ccrun_stack[CCRUN_STK] __attribute__((aligned(16)));
 
 /* Runs in the dedicated cc-run process: BOTH the compile and the execute
  * happen here, so the whole JIT machinery uses this process's own stack and
@@ -297,6 +301,100 @@ static void ccrun_proc_entry(void)
     cc_set_on_proc(0);
     g_ccrun_done = 1;
     proc_exit();
+}
+
+/* HTTP の /cc から使う入口。cc_run_source をそのまま専用プロセスで走らせるので、
+   常駐（web_expose のルート、/api/actors、__method_id）の扱いは従来と変わらない。
+   変わるのは「どのスタックで走るか」だけで、そのおかげで wait() が使える。 */
+static void ccrun_source_entry(void)
+{
+    extern int  cc_run_source(const char *, int, char *, int, long *);
+    extern void cc_set_timeout_ms(unsigned long);
+    extern void cc_set_on_proc(int);
+    cc_set_on_proc(1);
+    cc_set_timeout_ms(5000);        /* 暴走の予算。眠った分は cc_wait が差し引く */
+    g_ccrun_rc = cc_run_source(g_ccrun_src, g_ccrun_len,
+                               g_ccrun_out, sizeof g_ccrun_out, &g_ccrun_rv);
+    cc_set_on_proc(0);
+    g_ccrun_done = 1;
+    proc_exit();
+}
+
+/* ランナーを立てて、本当に消えるまで回す。
+   戻り値 0=完了 / -1=前のランナーが生きている / -2=スロット無し / -3=15秒で見切った */
+static int ccrun_spawn_and_wait(void (*entry)(void), const char *src, int len)
+{
+    /* 前のランナーがまだ生きているなら、この静的スタックは使い回せない。
+       黙って上書きすると、前のプロセスのフレームを壊して板が固まる。
+       ただし「見切って置き去りにしたランナー」は、誰かが proc_resched() を
+       回さないかぎり永久に走らない（NULLPROC からはプリエンプションが効かない）。
+       そのまま断ると以後 cc が二度と使えないので、ここで少しだけ回して
+       片づける機会を与える。 */
+    if (g_ccrun_pid >= 0 && !proc_is_free(g_ccrun_pid)) {
+        extern void cc_request_abort(void);
+        cc_request_abort();                       /* 起きたら即座に抜けさせる */
+        unsigned long hz, t0, ct;
+        __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz)); if (hz < 1000) hz = 1000;
+        __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t0));
+        unsigned long lim = t0 + hz * 3UL;        /* 3 秒だけ付き合う */
+        while (!proc_is_free(g_ccrun_pid)) {
+            __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+            if (ct >= lim) return -1;
+            proc_resched();
+        }
+    }
+    g_ccrun_src = src; g_ccrun_len = len;
+    g_ccrun_out[0] = 0; g_ccrun_rv = 0; g_ccrun_rc = 0; g_ccrun_aborted = 0;
+    g_ccrun_done = 0;
+    int pid = proc_create_static(entry, g_ccrun_stack, CCRUN_STK, "cc-run");
+    if (pid < 0) return -2;
+    g_ccrun_pid = pid;
+    /* proc_resched() の1回では足りない — wait() でランナーが眠ると、その瞬間に
+       ここへ戻ってくるからだ。完了の印（g_ccrun_done）は proc_exit の前に立つので、
+       スタックを使い回してよいかの判断には PR_FREE（proc_is_free）を使う。
+       眠っている間はタイマ割り込みが起こしてくれるので、回し続ければ進む。
+       長い wait の間はこのプロセス（HTTP 経由なら RX 処理）が止まるが板は固まらない。
+       保険として上限を置く。 */
+    { unsigned long t0, hz, ct;
+      __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz)); if (hz < 1000) hz = 1000;
+      __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t0));
+      unsigned long limit = t0 + hz * 15UL;              /* 15 秒で見切る */
+      for (;;) {
+          if (proc_is_free(pid)) break;
+          __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+          if (ct >= limit) break;
+          proc_resched();
+      }
+      if (!proc_is_free(pid)) {
+          /* 見切る。起きたら即座に抜けるよう印をつけておく ―― 次の呼び出しが
+             少し回してやれば片づいて、cc は使えるまま戻る。 */
+          extern void cc_request_abort(void);
+          cc_request_abort();
+          return -3;
+      }
+      for (int k = 0; k < 4; k++) proc_resched();    /* 最後の ctxsw を通す */
+    }
+    return 0;
+}
+
+/* tcp_server.c（POST /cc）から呼ぶ。cc_run_source と同じ約束で返す:
+   0=成功（*rv = main() の戻り）/ <0=失敗（out に "cc: …"）。
+   ランナーが立てられないときだけ out に日本語の理由を入れて -3 を返す。 */
+int cc_run_source_proc(const char *src, int srclen, char *out, int outcap, long *rv)
+{
+    int wrc = ccrun_spawn_and_wait(ccrun_source_entry, src, srclen);
+    if (wrc != 0) {
+        const char *m = (wrc == -1) ? "cc: 前の実行がまだ終わっていません\n"
+                      : (wrc == -2) ? "cc: proc_create failed (no slot)\n"
+                                    : "cc: 実行が 15 秒で終わりませんでした\n";
+        int p = 0; while (m[p] && p < outcap - 1) { out[p] = m[p]; p++; }
+        out[p] = 0;
+        return -3;
+    }
+    { int p = 0; while (g_ccrun_out[p] && p < outcap - 1) { out[p] = g_ccrun_out[p]; p++; }
+      out[p] = 0; }
+    if (rv) *rv = g_ccrun_rv;
+    return g_ccrun_rc;
 }
 
 /* A .abcl/.aipl source is real AIPL — translate it to C with the on-device
@@ -352,42 +450,11 @@ static int cc_compile_and_run(const char *path)
      * static stack (not getmem) is mandatory: cc/make are dispatched from
      * genet_rx_tick (USB-keyboard pump + HTTP /run), where getmem() — which is
      * not reentrant against the main thread — would race and wedge the box. */
-    static unsigned char ccrun_stack[CCRUN_STK] __attribute__((aligned(16)));
-    g_ccrun_src = csrc; g_ccrun_len = clen;
-    g_ccrun_out[0] = 0; g_ccrun_rv = 0; g_ccrun_rc = 0; g_ccrun_aborted = 0;
-    /* 前のランナーがまだ生きているなら、この静的スタックは使い回せない。
-       黙って上書きすると、前のプロセスのフレームを壊して板が固まる。 */
-    if (g_ccrun_pid >= 0 && !proc_is_free(g_ccrun_pid)) {
-        uart_puts("cc: 前の実行がまだ終わっていません\n"); return 1;
-    }
-    g_ccrun_done = 0;
-    int pid = proc_create_static(ccrun_proc_entry, ccrun_stack, CCRUN_STK, "cc-run");
-    if (pid < 0) { uart_puts("cc: proc_create failed (no slot)\n"); return 1; }
-    g_ccrun_pid = pid;
-    /* ランナーが「消える」まで待つ。proc_resched() の1回では足りない —
-       wait() でランナーが眠ると、その瞬間にここへ戻ってくるからだ。
-       完了の印（g_ccrun_done）は proc_exit の前に立つので、スタックを
-       使い回してよいかの判断には PR_FREE（proc_is_free）を使う。
-       眠っている間はタイマ割り込みが起こしてくれるので、回し続ければ進む。
-       長い wait の間はこのプロセス（HTTP 経由なら RX 処理）が止まるが、
-       板は固まらない。保険として上限を置く。 */
-    { unsigned long t0, hz, ct;
-      __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz)); if (hz < 1000) hz = 1000;
-      __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t0));
-      unsigned long limit = t0 + hz * 15UL;              /* 15 秒で見切る */
-      for (;;) {
-          if (proc_is_free(pid)) break;
-          __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
-          if (ct >= limit) break;
-          proc_resched();
-      }
-      if (!proc_is_free(pid)) {
-          /* 見切った。この静的スタックはもう使えないので、次回は断る
-             （g_ccrun_pid を残したままにする）。板は動き続ける。 */
-          uart_puts("cc: 実行が 15 秒で終わりませんでした。以後 cc は使えません（要再起動）\n");
-      } else {
-          for (int k = 0; k < 4; k++) proc_resched();    /* 最後の ctxsw を通す */
-      } }
+    int wrc = ccrun_spawn_and_wait(ccrun_proc_entry, csrc, clen);
+    if (wrc == -1) { uart_puts("cc: 前の実行がまだ終わっていません\n"); return 1; }
+    if (wrc == -2) { uart_puts("cc: proc_create failed (no slot)\n"); return 1; }
+    if (wrc == -3)
+        uart_puts("cc: 実行が 15 秒で終わりませんでした。以後 cc は使えません（要再起動）\n");
 
     if (g_ccrun_rc != 0) {
         uart_puts("cc: "); uart_puts(cc_last_error()); uart_putc('\n');
