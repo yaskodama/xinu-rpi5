@@ -21,6 +21,7 @@
 #include "uart.h"
 #include "kmalloc.h"
 #include "actor.h"
+#include "critical.h"
 
 extern void kfree(void *p);
 
@@ -195,11 +196,18 @@ static long cc_gfx_rotate_line(long turns)
 static char  g_vheap[32768];   /* bigger: holds chat history + LLM replies */
 static int   g_vheaplen;
 static void  vheap_reset(void) { g_vheaplen = 0; }
+/* 確保はタイマ割り込みに割られてはいけない。future をプロセスで走らせると、
+   awaiting 側と future 側の両方が JIT コードの中で確保しうる。スケジューラは
+   単一 currpid（単一コア）なので、割り込みを止めれば足りる。 */
 static char *vheap_alloc(int n)
 {
-    if (g_vheaplen + n > (int)sizeof(g_vheap)) return 0;
-    char *p = &g_vheap[g_vheaplen];
-    g_vheaplen += (n + 7) & ~7;           /* keep the next block 8-aligned */
+    unsigned long d = irq_save();
+    char *p = 0;
+    if (g_vheaplen + n <= (int)sizeof(g_vheap)) {
+        p = &g_vheap[g_vheaplen];
+        g_vheaplen += (n + 7) & ~7;       /* keep the next block 8-aligned */
+    }
+    irq_restore(d);
     return p;
 }
 
@@ -256,15 +264,20 @@ int  cc_lheap_overflows(void) { return g_lheap_overflows; }
 static void  lheap_reset(void) { g_lheaplen = 0; g_lheap_overflows = 0; }
 static long *lheap_alloc(int ncells)
 {
+    unsigned long d = irq_save();          /* vheap_alloc と同じ理由 */
     if (ncells < 0 || g_lheaplen + ncells > (int)(sizeof(g_lheap)/sizeof(g_lheap[0]))) {
-        if (g_lheap_overflows == 0) {                       /* one-shot log */
+        int first = (g_lheap_overflows == 0);
+        g_lheap_overflows++;
+        irq_restore(d);
+        if (first) {                                        /* one-shot log */
             extern void uart_puts(const char *);
             uart_puts("[cc] lheap OVERFLOW — array_set returns stale ref; bump g_lheap\n");
         }
-        g_lheap_overflows++;
         return 0;
     }
-    long *p = &g_lheap[g_lheaplen]; g_lheaplen += ncells; return p;
+    long *p = &g_lheap[g_lheaplen]; g_lheaplen += ncells;
+    irq_restore(d);
+    return p;
 }
 static long *v_list_ptr(long w) { return (long *)((unsigned long)w & V_PTR_MASK); }
 static long  v_list_new(void)
@@ -623,11 +636,112 @@ static long cc_wait(long ms)
     extern void proc_sleep_us(unsigned long us);
     long v = v_int_of(ms);
     if (v <= 0) return v_int(0);
-    if (!g_on_proc) { cc_error("wait() needs the separate-process path (shell cc/make)"); return v_int(0); }
+    if (!g_on_proc) {
+        /* インライン経路（割り込みを塞いだ RX 処理の中）で寝ると板が固まる。
+           寝ないが、黙って通すと「待ったつもり」で結果が変わるので、出力に
+           はっきり出して打ち切る。cc_error() は実行を止めないので使わない。 */
+        emit_str("\ncc: wait() はこの経路では使えません"
+                 "（シェルの cc/make なら待てます）。ここで打ち切ります。\n");
+        g_aborted = 1;
+        g_deadline = 0;          /* 次の cc_tick() でループから抜ける */
+        return v_int(0);
+    }
     proc_sleep_us((unsigned long)v * 1000UL);
     return v_int(0);
 }
 static long cc_now_ms(void) { unsigned long frq=cc_cntfrq(); if(frq<1000)frq=1000; return v_int((long)(cc_now()/(frq/1000UL))); }
+
+/* ---- future / await ------------------------------------------------------
+ * `var f = future o.m(x); ... var v = await f;`
+ *
+ * この装置のアクターはプロセスではなく、単一 FIFO を cc_pump() がその場で
+ * 流し切る協調モデル。だから future を「本当に並行」にするには、呼び出しを
+ * 別の Xinu プロセスに載せるしかない。スタックは静的（getmem は ISR 経路から
+ * 呼べない）。スロットは 4 本まで。
+ *
+ * 排他: スケジューラは単一 currpid なので、値ヒープの確保を irq_save で
+ * 囲めば足りる（vheap_alloc / lheap_alloc を参照）。
+ *
+ * インライン経路（割り込みを塞いだ RX 処理の中）では使えない。そこで寝ると
+ * 板が固まる。wait() と同じ扱いで、名前を出して断る。
+ */
+#define FUT_MAX 4
+#define FUT_STK (16 * 1024)
+static unsigned char g_fut_stk[FUT_MAX][FUT_STK] __attribute__((aligned(16)));
+static struct {
+    int  used;            /* スロットが使用中           */
+    int  done;            /* 呼び出しが終わった         */
+    int  pid;             /* 走らせているプロセス       */
+    long to, meth, a0, a1, a2, a3;
+    long val;             /* 返ってきた値               */
+} g_fut[FUT_MAX];
+
+static void fut_run(int i)
+{
+    if (g_dispatch) g_fut[i].val = g_dispatch(g_fut[i].to, g_fut[i].meth,
+                                              g_fut[i].a0, g_fut[i].a1,
+                                              g_fut[i].a2, g_fut[i].a3);
+    else            g_fut[i].val = v_int(0);
+    g_fut[i].done = 1;
+}
+/* proc_create_static は引数を渡せないので、スロットごとに入口を用意する。 */
+static void fut_entry0(void) { fut_run(0); }
+static void fut_entry1(void) { fut_run(1); }
+static void fut_entry2(void) { fut_run(2); }
+static void fut_entry3(void) { fut_run(3); }
+
+void cc_future_reset(void)
+{
+    for (int i = 0; i < FUT_MAX; i++) { g_fut[i].used = 0; g_fut[i].done = 0; g_fut[i].pid = -1; }
+}
+
+static long cc_future(long to, long meth, long a0, long a1, long a2, long a3)
+{
+    extern int  proc_create_static(void (*)(void), void *, unsigned long, const char *);
+    extern int  proc_is_free(int);
+    if (!g_on_proc) {
+        emit_str("\ncc: future はこの経路では使えません"
+                 "（シェルの cc/make なら並行に走ります）。ここで打ち切ります。\n");
+        g_aborted = 1; g_deadline = 0;
+        return v_int(-1);
+    }
+    int i = -1;
+    for (int k = 0; k < FUT_MAX; k++) {
+        /* 使い終わって、プロセスも本当に消えたスロットだけ再利用する。 */
+        if (!g_fut[k].used || (g_fut[k].done && proc_is_free(g_fut[k].pid))) { i = k; break; }
+    }
+    if (i < 0) { emit_str("\ncc: future が多すぎます（同時に 4 本まで）\n"); return v_int(-1); }
+    g_fut[i].used = 1; g_fut[i].done = 0; g_fut[i].val = v_int(0);
+    g_fut[i].to = to; g_fut[i].meth = meth;
+    g_fut[i].a0 = a0; g_fut[i].a1 = a1; g_fut[i].a2 = a2; g_fut[i].a3 = a3;
+    void (*ent[FUT_MAX])(void) = { fut_entry0, fut_entry1, fut_entry2, fut_entry3 };
+    g_fut[i].pid = proc_create_static(ent[i], g_fut_stk[i], FUT_STK, "aipl-future");
+    if (g_fut[i].pid < 0) { g_fut[i].used = 0; emit_str("\ncc: future のプロセスを作れません\n"); return v_int(-1); }
+    return v_int(i);                       /* ハンドル = スロット番号 */
+}
+
+/* 期限つきで待つ。ms <= 0 なら打ち切り予算いっぱいまで待つ。
+   期限切れなら elsev を返す（そのときも走っているプロセスは止めない —
+   止める手段が無いので、終わるまでスロットは再利用しない）。 */
+static long fut_wait(int i, long ms, long elsev, int has_else)
+{
+    extern void proc_resched(void);
+    if (i < 0 || i >= FUT_MAX || !g_fut[i].used) return v_int(0);
+    unsigned long frq = cc_cntfrq(); if (frq < 1000) frq = 1000;
+    unsigned long limit = cc_now() + (frq / 1000UL) * (unsigned long)(ms > 0 ? ms : 10000);
+    while (!g_fut[i].done) {
+        if (cc_now() >= limit) {
+            if (has_else) return elsev;
+            emit_str("\ncc: await が期限内に解けませんでした\n");
+            return v_int(0);
+        }
+        proc_resched();
+    }
+    return g_fut[i].val;
+}
+static long cc_await(long h)                 { return fut_wait((int)v_int_of(h), 0, v_int(0), 0); }
+static long cc_await_dl(long h, long ms, long elsev)
+{ return fut_wait((int)v_int_of(h), v_int_of(ms), elsev, 1); }
 
 /* ---- web_expose: パスとアクターの対応表 --------------------------------
  * `web_expose("/echo", "echo")` で公開したアクターへ、GET /api/x/<path> から
@@ -696,6 +810,7 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     unsigned long n = (unsigned long)(srclen < 0 ? 0 : srclen);
     g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0; g_res_objcls = 0; g_res_clsname = 0;
     cc_web_reset();                      /* 公開ルートはプログラムと寿命を共にする */
+    cc_future_reset();
     if (!arena_init(CC_ARENA)) return -2;
     g_err = 0; g_errbuf[0] = 0;
 
@@ -892,6 +1007,9 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_web_listen",    (void *)&cc_web_listen     },
         { "cc_web_expose",    (void *)&cc_web_expose     },
         { "cc_wait",          (void *)&cc_wait           },
+        { "cc_future",        (void *)&cc_future         },
+        { "cc_await",         (void *)&cc_await          },
+        { "cc_await_dl",      (void *)&cc_await_dl       },
         { "cc_sel_arg",       (void *)&cc_sel_arg        },
         { "cc_actor_count",   (void *)&cc_actor_count    },
         { "cc_actor_alive",   (void *)&cc_actor_alive    },
@@ -942,6 +1060,7 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
      * invalid (its dispatch + string literals are about to be overwritten). */
     g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0; g_res_objcls = 0; g_res_clsname = 0;
     cc_web_reset();                      /* 公開ルートはプログラムと寿命を共にする */
+    cc_future_reset();
     if (!arena_init(CC_ARENA)) return -2;
     g_err = 0; g_errbuf[0] = 0;
 
@@ -1049,6 +1168,7 @@ int cc_compile(const char *src, int srclen)
     g_cc_ready = 0;
     g_res_loaded = 0; g_dispatch = 0; g_res_methodid = 0; g_res_objcls = 0; g_res_clsname = 0;
     cc_web_reset();                      /* 公開ルートはプログラムと寿命を共にする */
+    cc_future_reset();
     if (!arena_init(CC_ARENA)) return -2;
     g_err = 0; g_errbuf[0] = 0;
 

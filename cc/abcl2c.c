@@ -262,7 +262,7 @@ static void scan_topvars(void)
 }
 
 /* ---- expression AST ----------------------------------------------- */
-enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN };
+enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_FUT, N_AWAIT, N_AWAITDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
 typedef struct { int k; long num; char s[TOKSTR]; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
 #define MAXNODE 1024
@@ -276,13 +276,14 @@ static int   is_local(const char *n){ for(int i=0;i<NLOCAL;i++){int k=0;for(;n[k
 static void  add_local(const char *n){ if(NLOCAL<64){int k=0;for(;n[k]&&k<47;k++)LOCAL[NLOCAL][k]=n[k];LOCAL[NLOCAL][k]=0;NLOCAL++;} }
 
 static int parse_expr(void);
+static int parse_unary(void);
 static int parse_primary(void)
 {
     /* 正典 AIPL にあって、この機内前段が持たない構文。識別子として素通しすると
        壊れた C（v_timeout / v_replyto など）が出て cc 側で分かりにくく落ちる。
        ここで名前を挙げて断る。読み進まないまま上位が回ることも防げる。 */
     if (T.kind==T_ID) {
-        static const char *ni[] = { "future","await","select","reply","replyto",
+        static const char *ni[] = { "select","reply","replyto",
                                     "timeout","spawn","remote", 0 };
         for (int i=0; ni[i]; i++) if (a2c_streq(T.s, ni[i])) {
             char m[80]; int k=0; const char *pre="not supported on this device: ";
@@ -321,6 +322,22 @@ static int parse_primary(void)
                 if(is_p(",")) lex_next();
             }
             if(is_p(")")) lex_next(); else return (a2c_fail("new: expected ')'"), 0);
+        }
+        return n; }
+    if (is_kw("future")) { lex_next(); int obj=parse_primary();
+        if(!is_p(".")){a2c_fail("future: expected .method");return 0;} lex_next();
+        if(T.kind!=T_ID){a2c_fail("future: expected method");return 0;}
+        int n=mknode(N_FUT); ND[n].mid=meth_id(T.s); ND[n].a=obj; lex_next();
+        if(is_p("(")){lex_next(); while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){ if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); } if(is_p(")"))lex_next();}
+        return n; }
+    if (is_kw("await")) { lex_next();
+        int n=mknode(N_AWAIT); ND[n].a=parse_unary();
+        if (is_kw("timeout")) {                       /* await f timeout <ms> else <式> */
+            lex_next();
+            if(T.kind!=T_NUM) { a2c_fail("timeout: expected milliseconds"); return 0; }
+            ND[n].num = T.num; lex_next();
+            if(!is_kw("else")) { a2c_fail("timeout: expected 'else'"); return 0; }
+            lex_next(); ND[n].b = parse_expr(); ND[n].k = N_AWAITDL;
         }
         return n; }
     if (is_kw("now")) { lex_next(); int obj=parse_primary();
@@ -470,6 +487,15 @@ static void emit_node(int i)
         } else {                                       /* web_listen(port) */
             op_s("cc_web_listen("); emit_node(e->args[0]); op_c(')');
         }
+        break;
+    case N_FUT:
+        op_s("cc_future(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid);
+        emit_args_filled(e->args,e->nargs); op_c(')');
+        break;
+    case N_AWAIT:   op_s("cc_await("); emit_node(e->a); op_c(')'); break;
+    case N_AWAITDL:
+        op_s("cc_await_dl("); emit_node(e->a); op_s(", "); op_n(e->num);
+        op_s(", "); emit_node(e->b); op_c(')');
         break;
     case N_NOWDL:
         op_s("__dl_call(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid);
