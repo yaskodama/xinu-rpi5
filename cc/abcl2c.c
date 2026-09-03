@@ -283,7 +283,7 @@ static int parse_primary(void)
        壊れた C（v_timeout / v_replyto など）が出て cc 側で分かりにくく落ちる。
        ここで名前を挙げて断る。読み進まないまま上位が回ることも防げる。 */
     if (T.kind==T_ID) {
-        static const char *ni[] = { "select","reply","replyto",
+        static const char *ni[] = { "reply","replyto",
                                     "timeout","spawn","remote", 0 };
         for (int i=0; ni[i]; i++) if (a2c_streq(T.s, ni[i])) {
             char m[80]; int k=0; const char *pre="not supported on this device: ";
@@ -567,6 +567,56 @@ static void emit_stmt(void)
         return;
     }
     if (is_kw("send")) { emit_send(); return; }
+    /* select { case m(x) -> { ... }  timeout <ms> -> { ... } }
+       協調ポンプなので待てない。cc_select は「いま FIFO に来ている自分宛」を
+       覗くだけで、無ければ -1（timeout 節へ）。Pi 3 は継続分割で本当に待てるので
+       そこは性格が違う。 */
+    if (is_kw("select")) {
+        lex_next();
+        if(!is_p("{")) { a2c_fail("select: expected '{'"); return; }
+        lex_next();
+        int mids[4]; int nmid=0;
+        const char *cbody[4]; char cvar[4][48];
+        const char *tbody = 0;
+        while (!is_p("}") && T.kind!=T_EOF && !a2c_err[0]) {
+            if (is_kw("case")) {
+                lex_next();
+                if(T.kind!=T_ID) { a2c_fail("select: expected a message name"); return; }
+                if(nmid>=4) { a2c_fail("select: too many cases (max 4)"); return; }
+                mids[nmid]=meth_id(T.s); cvar[nmid][0]=0; lex_next();
+                if(is_p("(")){ lex_next();
+                    if(T.kind==T_ID){ int k=0; for(;T.s[k]&&k<47;k++) cvar[nmid][k]=T.s[k]; cvar[nmid][k]=0; lex_next(); }
+                    while(!is_p(")")&&T.kind!=T_EOF) lex_next();
+                    if(is_p(")")) lex_next(); }
+                if(is_p(":")) { lex_next(); if(skip_type()) return; }
+                if(is_p("->")) lex_next();
+                if(!is_p("{")) { a2c_fail("select: expected '{' after case"); return; }
+                cbody[nmid]=Ts; skip_block(); nmid++;
+            } else if (is_kw("timeout")) {
+                lex_next();
+                if(T.kind==T_NUM) lex_next();          /* 期限の値は使わない */
+                if(is_p("->")) lex_next();
+                if(!is_p("{")) { a2c_fail("select: expected '{' after timeout"); return; }
+                tbody=Ts; skip_block();
+            } else { a2c_fail("select: expected 'case' or 'timeout'"); return; }
+        }
+        if(is_p("}")) lex_next();
+        if(nmid==0) { a2c_fail("select: no case"); return; }
+        lsave_t sv = lex_save();
+        op_s("  { int __sm = v_int_of(cc_select(v_int(self), "); op_n(nmid);
+        for(int k=0;k<4;k++){ op_s(", "); if(k<nmid) op_n(mids[k]); else op_s("-1"); }
+        op_s("));\n");
+        for(int k=0;k<nmid;k++){
+            op_s(k ? "  else if (__sm == " : "  if (__sm == "); op_n(mids[k]); op_s(") {\n");
+            if(cvar[k][0]){ op_s("  int v_"); op_s(cvar[k]); op_s(" = cc_sel_arg(v_int(0));\n"); add_local(cvar[k]); }
+            L=cbody[k]; lex_next(); emit_block();
+            op_s("  }\n");
+        }
+        if(tbody){ op_s("  else {\n"); L=tbody; lex_next(); emit_block(); op_s("  }\n"); }
+        op_s("  }\n");
+        lex_load(sv);
+        return;
+    }
     /* reply(e) — この装置では戻り値そのもの。`now o.m()` は dispatch() の
        返り値を受けるので（emit の N_NOW を見よ）、reply は return と同じ。
        ただし return は本当にそこで抜けるので、後ろに文が続くと正典と意味が

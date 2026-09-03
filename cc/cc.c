@@ -654,94 +654,41 @@ static long cc_now_ms(void) { unsigned long frq=cc_cntfrq(); if(frq<1000)frq=100
 /* ---- future / await ------------------------------------------------------
  * `var f = future o.m(x); ... var v = await f;`
  *
- * この装置のアクターはプロセスではなく、単一 FIFO を cc_pump() がその場で
- * 流し切る協調モデル。だから future を「本当に並行」にするには、呼び出しを
- * 別の Xinu プロセスに載せるしかない。スタックは静的（getmem は ISR 経路から
- * 呼べない）。スロットは 4 本まで。
+ * **この装置に並行性は無い。** `future` は\その場で\走る。
+ * 呼び出しを別プロセスに載せて本当に並行にする実装も書いたが、実機で板が
+ * 固まった（値ヒープを排他しても、g_deadline / g_cap / cc_pump の FIFO が
+ * プロセスをまたいで共有のままだった）。Pi 3 も継続分割で実現していて
+ * 並行には走らないので、性格を揃える意味でもこちらを採る。
  *
- * 排他: スケジューラは単一 currpid なので、値ヒープの確保を irq_save で
- * 囲めば足りる（vheap_alloc / lheap_alloc を参照）。
- *
- * インライン経路（割り込みを塞いだ RX 処理の中）では使えない。そこで寝ると
- * 板が固まる。wait() と同じ扱いで、名前を出して断る。
+ * したがって `future o.m(x)` は dispatch をその場で呼び、値をスロットに置いて
+ * ハンドルを返すだけ。`await h` はそのスロットを読む。期限つきの `await` は
+ * 値が既にあるので決して切れない（正典と同じ値になる）。
+ * 「投げておいて後で受け取る」という意味は失われる。
  */
-#define FUT_MAX 4
-#define FUT_STK (16 * 1024)
-static unsigned char g_fut_stk[FUT_MAX][FUT_STK] __attribute__((aligned(16)));
-static struct {
-    int  used;            /* スロットが使用中           */
-    int  done;            /* 呼び出しが終わった         */
-    int  pid;             /* 走らせているプロセス       */
-    long to, meth, a0, a1, a2, a3;
-    long val;             /* 返ってきた値               */
-} g_fut[FUT_MAX];
+#define FUT_MAX 8
+static struct { int used; long val; } g_fut[FUT_MAX];
+static int g_futn;
 
-static void fut_run(int i)
-{
-    if (g_dispatch) g_fut[i].val = g_dispatch(g_fut[i].to, g_fut[i].meth,
-                                              g_fut[i].a0, g_fut[i].a1,
-                                              g_fut[i].a2, g_fut[i].a3);
-    else            g_fut[i].val = v_int(0);
-    g_fut[i].done = 1;
-}
-/* proc_create_static は引数を渡せないので、スロットごとに入口を用意する。 */
-static void fut_entry0(void) { fut_run(0); }
-static void fut_entry1(void) { fut_run(1); }
-static void fut_entry2(void) { fut_run(2); }
-static void fut_entry3(void) { fut_run(3); }
-
-void cc_future_reset(void)
-{
-    for (int i = 0; i < FUT_MAX; i++) { g_fut[i].used = 0; g_fut[i].done = 0; g_fut[i].pid = -1; }
-}
+void cc_future_reset(void) { g_futn = 0; for (int i=0;i<FUT_MAX;i++) g_fut[i].used = 0; }
 
 static long cc_future(long to, long meth, long a0, long a1, long a2, long a3)
 {
-    extern int  proc_create_static(void (*)(void), void *, unsigned long, const char *);
-    extern int  proc_is_free(int);
-    if (!g_on_proc) {
-        emit_str("\ncc: future はこの経路では使えません"
-                 "（シェルの cc/make なら並行に走ります）。ここで打ち切ります。\n");
-        g_aborted = 1; g_deadline = 0;
-        return v_int(-1);
-    }
     int i = -1;
-    for (int k = 0; k < FUT_MAX; k++) {
-        /* 使い終わって、プロセスも本当に消えたスロットだけ再利用する。 */
-        if (!g_fut[k].used || (g_fut[k].done && proc_is_free(g_fut[k].pid))) { i = k; break; }
-    }
-    if (i < 0) { emit_str("\ncc: future が多すぎます（同時に 4 本まで）\n"); return v_int(-1); }
-    g_fut[i].used = 1; g_fut[i].done = 0; g_fut[i].val = v_int(0);
-    g_fut[i].to = to; g_fut[i].meth = meth;
-    g_fut[i].a0 = a0; g_fut[i].a1 = a1; g_fut[i].a2 = a2; g_fut[i].a3 = a3;
-    void (*ent[FUT_MAX])(void) = { fut_entry0, fut_entry1, fut_entry2, fut_entry3 };
-    g_fut[i].pid = proc_create_static(ent[i], g_fut_stk[i], FUT_STK, "aipl-future");
-    if (g_fut[i].pid < 0) { g_fut[i].used = 0; emit_str("\ncc: future のプロセスを作れません\n"); return v_int(-1); }
-    return v_int(i);                       /* ハンドル = スロット番号 */
+    for (int k = 0; k < FUT_MAX; k++) if (!g_fut[k].used) { i = k; break; }
+    if (i < 0) { emit_str("\ncc: future が多すぎます（同時に 8 本まで）\n"); return v_int(-1); }
+    g_fut[i].used = 1;
+    g_fut[i].val  = g_dispatch ? g_dispatch(to, meth, a0, a1, a2, a3) : v_int(0);
+    if (i >= g_futn) g_futn = i + 1;
+    return v_int(i);
 }
-
-/* 期限つきで待つ。ms <= 0 なら打ち切り予算いっぱいまで待つ。
-   期限切れなら elsev を返す（そのときも走っているプロセスは止めない —
-   止める手段が無いので、終わるまでスロットは再利用しない）。 */
-static long fut_wait(int i, long ms, long elsev, int has_else)
+static long fut_get(int i)
 {
-    extern void proc_resched(void);
     if (i < 0 || i >= FUT_MAX || !g_fut[i].used) return v_int(0);
-    unsigned long frq = cc_cntfrq(); if (frq < 1000) frq = 1000;
-    unsigned long limit = cc_now() + (frq / 1000UL) * (unsigned long)(ms > 0 ? ms : 10000);
-    while (!g_fut[i].done) {
-        if (cc_now() >= limit) {
-            if (has_else) return elsev;
-            emit_str("\ncc: await が期限内に解けませんでした\n");
-            return v_int(0);
-        }
-        proc_resched();
-    }
     return g_fut[i].val;
 }
-static long cc_await(long h)                 { return fut_wait((int)v_int_of(h), 0, v_int(0), 0); }
-static long cc_await_dl(long h, long ms, long elsev)
-{ return fut_wait((int)v_int_of(h), v_int_of(ms), elsev, 1); }
+static long cc_await(long h) { return fut_get((int)v_int_of(h)); }
+/* 期限つきの await。値は既に出ているので期限は切れない。elsev は使わない。 */
+static long cc_await_dl(long h, long ms, long elsev) { (void)ms; (void)elsev; return fut_get((int)v_int_of(h)); }
 
 /* ---- web_expose: パスとアクターの対応表 --------------------------------
  * `web_expose("/echo", "echo")` で公開したアクターへ、GET /api/x/<path> から
@@ -791,8 +738,40 @@ int cc_web_actor_at(int i) { return (i>=0 && i<g_nwx) ? g_wx_actor[i] : -1; }
 
 /* select/saga/crash: not supported by the cooperative pump — resolve to inert
  * stubs so programs that merely reference them still JIT (most don't use them). */
+/* select { case m(x) -> ... }  ---------------------------------------------
+ * 協調ポンプなので「待つ」ことはできない。代わりに　**いま FIFO に積まれている
+ * 自分宛のメッセージ** を覗き、case の並びと一致するものがあればそれを取り出して
+ * 引数を g_sel に置き、そのメソッド番号を返す。無ければ -1（timeout 節へ）。
+ *
+ * つまり　**期限は待ち時間ではなく「いま来ているか」の判定**になる。
+ * Pi 3 は継続分割で本当に待てるので、そこは性格が違う。ガイドに明記する。
+ *
+ * 取り出したメッセージは FIFO から取り除く（cc_pump が二重に配送しないように）。 */
 static long g_sel[4];
-static long cc_select(long s,long n,long m0,long m1,long m2,long m3){(void)s;(void)n;(void)m0;(void)m1;(void)m2;(void)m3;return v_int(-1);}
+static long cc_select(long self, long n, long m0, long m1, long m2, long m3)
+{
+    long want[4] = { m0, m1, m2, m3 };
+    int nn = (int)n; if (nn < 0) nn = 0; if (nn > 4) nn = 4;
+    for (int i = g_qh; i != g_qt; i = (i + 1) % MQ_MAX) {
+        if (g_mq[i].to != self) continue;
+        for (int k = 0; k < nn; k++) {
+            if (want[k] < 0 || g_mq[i].mid != want[k]) continue;
+            g_sel[0]=g_mq[i].a0; g_sel[1]=g_mq[i].a1;
+            g_sel[2]=g_mq[i].a2; g_sel[3]=g_mq[i].a3;
+            long mid = g_mq[i].mid;
+            /* 取り出した分を詰める */
+            int j = i;
+            while (j != g_qh) {
+                int pv = (j - 1 + MQ_MAX) % MQ_MAX;
+                g_mq[j] = g_mq[pv];
+                j = pv;
+            }
+            g_qh = (g_qh + 1) % MQ_MAX;
+            return v_int((long)mid);
+        }
+    }
+    return v_int(-1);
+}
 static long cc_sel_arg(long i){return (i>=0&&i<4)?g_sel[i]:v_int(0);}
 static long cc_saga_reset(void){return v_int(0);}
 static long cc_saga_fail(void){return v_int(0);}
