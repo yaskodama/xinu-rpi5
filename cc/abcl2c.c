@@ -743,7 +743,10 @@ static void emit_program(void)
          "  r = dispatch(to, meth, a0, a1, a2, a3);\n"
          "  if (v_int_of(cc_now_ms()) - t0 > ms) { return elsev; }\n"
          "  return r;\n}\n");
-    op_s("int g_spawn(int cls) {\n  int id; id = cc_actor_new();\n  if (id < 0) { return -1; }\n");
+    /* アクタを作れなかったら黙って -1 を返さず、はっきり言う。
+       黙ると「なぜか動かない」になり、実機では領域外参照まで進む。 */
+    op_s("int g_spawn(int cls) {\n  int id; id = cc_actor_new();\n"
+         "  if (id < 0) { v_print(v_str(\"cc: アクタを作れませんでした（資源不足）\")); return -1; }\n");
     op_s("  g_nobj = g_nobj + 1;\n  g_obj[id].cls = cls;\n");
     for (int ci=0; ci<NCLS; ci++) {
         op_s("  if (cls == "); op_n(ci); op_s(") {\n");
@@ -824,7 +827,12 @@ static void emit_program(void)
         op_s("    i = i + 1;\n  }\n  return 0;\n}\n\n");
     }
 
-    op_s("int dispatch(int self, int meth, int a0, int a1, int a2, int a3) {\n  int c; c = g_obj[self].cls;\n");
+    /* self が負なら何もしない。アクタを作れなかったとき（NPROC 枯渇など）
+       g_spawn は -1 を返すので、そのまま dispatch に渡ると g_obj[-1] を読む
+       ―― 領域外参照で板が壊れる。Pi 4 の actorproc.c 自身が「それで箱が
+       壊れる」と書いている。三機とも同じ形なので、生成側で塞ぐ。 */
+    op_s("int dispatch(int self, int meth, int a0, int a1, int a2, int a3) {\n"
+         "  int c;\n  if (self < 0) { return v_int(0); }\n  c = g_obj[self].cls;\n");
     for (int ci=0; ci<NCLS; ci++) {
         op_s("  if (c == "); op_n(ci); op_s(") {\n");
         for (int mi=0; mi<CLS[ci].nmethod; mi++){ op_s("    if (meth == "); op_n(meth_id(CLS[ci].method[mi].name)); op_s(") return m_"); op_s(CLS[ci].name); op_c('_'); op_s(CLS[ci].method[mi].name); op_s("(self, a0, a1, a2, a3);\n"); }
