@@ -111,7 +111,7 @@ static void cpid_to(char *d){ int i=0; for(;T.s[i]&&i<TOKSTR-1;i++) d[i]=T.s[i];
 #define MAXMNAME 48
 typedef struct {
     char name[48];
-    char field[MAXFIELD][48]; long finit[MAXFIELD]; int nfield;
+    char field[MAXFIELD][48]; long finit[MAXFIELD]; char finit_bool[MAXFIELD]; int nfield;
     struct { char name[48]; char param[MAXPARAM][48]; int nparam; const char *body; } method[MAXMETHOD];
     int nmethod;
 } class_t;
@@ -191,7 +191,7 @@ static int parse_structure(const char *src)
             if (is_kw("var")) {
                 lex_next(); if(T.kind!=T_ID) return a2c_fail("field: expected name");
                 if(c->nfield>=MAXFIELD) return a2c_fail("too many fields");
-                cpid(c->field[c->nfield]); long init=0; lex_next();
+                cpid(c->field[c->nfield]); long init=0; int isb=0; lex_next();
                 if(is_p(":")) { lex_next(); if(skip_type()) return -1; }   /* var n: int = 0; */
                 if(is_p("=")){
                     lex_next();
@@ -200,11 +200,12 @@ static int parse_structure(const char *src)
                        文字列の初期値が何も言わずに 0 になっていた。名前をつけて断る。 */
                     int neg=0; if(is_p("-")){ neg=1; lex_next(); }
                     if(T.kind==T_NUM)        { init = neg ? -T.num : T.num; lex_next(); }
-                    else if(is_kw("true"))   { if(neg) return a2c_fail("field init: '-' on bool"); init=1; lex_next(); }
-                    else if(is_kw("false"))  { if(neg) return a2c_fail("field init: '-' on bool"); init=0; lex_next(); }
+                    else if(is_kw("true"))   { if(neg) return a2c_fail("field init: '-' on bool"); init=1; isb=1; lex_next(); }
+                    else if(is_kw("false"))  { if(neg) return a2c_fail("field init: '-' on bool"); init=0; isb=1; lex_next(); }
                     else return a2c_fail("field init: only int/bool literals on this device");
                 }
-                c->finit[c->nfield]=init; c->nfield++; if(c->nfield>MAXF) MAXF=c->nfield;
+                c->finit[c->nfield]=init; c->finit_bool[c->nfield]=(char)isb;
+                c->nfield++; if(c->nfield>MAXF) MAXF=c->nfield;
                 if(is_p(";")) lex_next(); else return a2c_fail("field: expected ';'");
             } else if (is_kw("method")) {
                 lex_next(); if(T.kind!=T_ID) return a2c_fail("method: expected name");
@@ -285,7 +286,7 @@ static sel_t SEL[MAXSEL]; static int NSEL;
 static int  SELFIELD[MAXCLASS];        /* __sel の隠しフィールド番号。-1 = 無し */
 
 /* ---- expression AST ----------------------------------------------- */
-enum { N_NIL, N_INT, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_FUT, N_AWAIT, N_AWAITDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN };
+enum { N_NIL, N_INT, N_BOOL, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_FUT, N_AWAIT, N_AWAITDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
 typedef struct { int k; long num; char s[TOKSTR]; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
 #define MAXNODE 1024
@@ -322,8 +323,8 @@ static int parse_primary(void)
     /* 真偽値リテラル。このバックエンドは bool を int で持つので 1 / 0 に写す。
        以前はキーワードでなかったため識別子として素通しし、未定義の v_true を
        参照する C が出ていた（実機の cc が "undefined variable" で落ちる）。 */
-    if (is_kw("true"))  { int n=mknode(N_INT); ND[n].num=1; lex_next(); return n; }
-    if (is_kw("false")) { int n=mknode(N_INT); ND[n].num=0; lex_next(); return n; }
+    if (is_kw("true"))  { int n=mknode(N_BOOL); ND[n].num=1; lex_next(); return n; }
+    if (is_kw("false")) { int n=mknode(N_BOOL); ND[n].num=0; lex_next(); return n; }
     if (is_kw("new")) { lex_next(); if(T.kind!=T_ID){a2c_fail("new: expected class");return 0;}
         int ci=class_idx(T.s);
         /* 知らないクラス名だと class_idx が -1 を返す。以前はそれをそのまま
@@ -518,7 +519,7 @@ static int scan_selects(void)
                         if (c->nfield >= MAXFIELD) { lex_load(sv); return a2c_fail("too many fields (__sel)"); }
                         const char *nm = "__sel";
                         int q=0; for(;nm[q];q++) c->field[c->nfield][q]=nm[q]; c->field[c->nfield][q]=0;
-                        c->finit[c->nfield] = 0;
+                        c->finit[c->nfield] = 0; c->finit_bool[c->nfield] = 0;
                         SELFIELD[ci] = c->nfield;
                         c->nfield++; if(c->nfield>MAXF) MAXF=c->nfield;
                     }
@@ -575,6 +576,8 @@ static void emit_node(int i)
     switch(e->k){
     case N_NIL: op_s("v_int(0)"); break;
     case N_INT: op_s("v_int("); op_n(e->num); op_c(')'); break;
+    /* 真偽値は専用の値にする。印字で true / false に戻すため（正典どおり）。 */
+    case N_BOOL: op_s("v_bool("); op_n(e->num); op_c(')'); break;
     case N_STR: op_s("v_str(\""); op_s(e->s); op_s("\")"); break;
     case N_ID:  emit_ident(e->s); break;
     case N_NEW: {
@@ -744,7 +747,9 @@ static void emit_program(void)
     op_s("  g_nobj = g_nobj + 1;\n  g_obj[id].cls = cls;\n");
     for (int ci=0; ci<NCLS; ci++) {
         op_s("  if (cls == "); op_n(ci); op_s(") {\n");
-        for (int f=0; f<CLS[ci].nfield; f++){ op_s("    g_obj[id].f["); op_n(f); op_s("] = v_int("); op_n(CLS[ci].finit[f]); op_s(");\n"); }
+        for (int f=0; f<CLS[ci].nfield; f++){ op_s("    g_obj[id].f["); op_n(f);
+            op_s(CLS[ci].finit_bool[f] ? "] = v_bool(" : "] = v_int(");
+            op_n(CLS[ci].finit[f]); op_s(");\n"); }
         op_s("  }\n");
     }
     op_s("  return id;\n}\n\n");

@@ -233,18 +233,29 @@ static char *vheap_alloc(int n)
  * the low 48 bits, so the tag is free and is masked off before deref. */
 #define V_FLOAT_TAG  (1UL << 60)
 #define V_LIST_TAG   (1UL << 61)        /* tags a pointer into the list heap */
+/* 真偽値。ビット 62 を立て、最下位ビットは 0（＝整数ではない）にして、値は
+   ビット 1 に持つ。こうしないと `b = 1` としか印字できなかった（正典は
+   `b = true`）。整数の側にタグを載せる案は負の数と衝突する ―― `v_int(-1)` は
+   上位ビットが全部立つので、上位ビットを印にすると負の数が真偽値に化ける。
+   Pi 3 の VM（0x20000000）と役割は同じ。 */
+#define V_BOOL_TAG   (1UL << 62)
 #define V_PTR_MASK   ((1UL << 48) - 1)
 
 static long   v_int(long n)        { return (n << 1) | 1L; }
 static long   v_str(const char *p) { return (long)p; }
 static int    v_is_int(long w)     { return (w & 1L) != 0; }
+static int    v_is_bool(long w)    { return !(w & 1L) && (((unsigned long)w >> 62) & 1UL); }
+static long   v_bool(long b)       { return (long)(V_BOOL_TAG | (b ? 2UL : 0UL)); }
 static int    v_is_float(long w)   { return !(w & 1L) && (((unsigned long)w >> 60) & 1UL); }
 static int    v_is_list(long w)    { return !(w & 1L) && (((unsigned long)w >> 61) & 1UL); }
-static int    v_is_str(long w)     { return !(w & 1L) && w != 0 && !v_is_float(w) && !v_is_list(w); }
-static long   v_int_of(long w)     { return v_is_int(w) ? (w >> 1) : 0; }
+static int    v_is_str(long w)     { return !(w & 1L) && w != 0 && !v_is_float(w) && !v_is_list(w) && !v_is_bool(w); }
+/* 真偽値は算術と比較では 0/1 の整数として振る舞う（印字のときだけ true/false）。 */
+static long   v_int_of(long w)     { return v_is_int(w) ? (w >> 1)
+                                          : (v_is_bool(w) ? ((w >> 1) & 1L) : 0); }
 static double v_to_float(long w)
 {
     if (v_is_int(w))   return (double)(w >> 1);
+    if (v_is_bool(w))  return (double)((w >> 1) & 1L);
     if (v_is_float(w)) return *(double *)((unsigned long)w & V_PTR_MASK);
     return 0.0;
 }
@@ -351,6 +362,7 @@ static int v_truthy(long w)
 {
     if (w == 0) return 0;
     if (v_is_int(w))   return (w >> 1) != 0;
+    if (v_is_bool(w))  return (w & 2L) != 0;   /* false は 0 ではないので先に見る */
     if (v_is_float(w)) return v_to_float(w) != 0.0;
     if (v_is_list(w))  return v_list_ptr(w)[0] != 0;   /* non-empty */
     return ((const char *)w)[0] != 0;
@@ -372,6 +384,7 @@ static const char *v_render(long w, char *buf, int cap)
         buf[i] = 0;
         return buf;
     }
+    if (v_is_bool(w)) return (w & 2L) ? "true" : "false";
     if (v_is_str(w)) return (const char *)w;
     if (v_is_float(w)) {
         double d = v_to_float(w);
@@ -428,8 +441,8 @@ static long v_div(long a, long b)
     if (v_is_float(a) || v_is_float(b)) { double d = v_to_float(b); return v_floatval(d != 0.0 ? v_to_float(a)/d : 0.0); }
     long d = v_int_of(b); return v_int(d ? v_int_of(a)/d : 0);
 }
-static long v_lt(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_int(v_to_float(a) <  v_to_float(b)); return v_int(v_int_of(a) <  v_int_of(b)); }
-static long v_le(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_int(v_to_float(a) <= v_to_float(b)); return v_int(v_int_of(a) <= v_int_of(b)); }
+static long v_lt(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_bool(v_to_float(a) <  v_to_float(b)); return v_bool(v_int_of(a) <  v_int_of(b)); }
+static long v_le(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_bool(v_to_float(a) <= v_to_float(b)); return v_bool(v_int_of(a) <= v_int_of(b)); }
 static int  v_streq(long a, long b)
 {
     const char *x = (const char *)a, *y = (const char *)b;
@@ -439,15 +452,15 @@ static int  v_streq(long a, long b)
 }
 static long v_eq(long a, long b)
 {
-    if (v_is_str(a) && v_is_str(b)) return v_int(v_streq(a, b));
-    if (v_is_str(a) || v_is_str(b)) return v_int(0);
-    if (v_is_float(a) || v_is_float(b)) return v_int(v_to_float(a) == v_to_float(b));
-    return v_int(v_int_of(a) == v_int_of(b));
+    if (v_is_str(a) && v_is_str(b)) return v_bool(v_streq(a, b));
+    if (v_is_str(a) || v_is_str(b)) return v_bool(0);
+    if (v_is_float(a) || v_is_float(b)) return v_bool(v_to_float(a) == v_to_float(b));
+    return v_bool(v_int_of(a) == v_int_of(b));
 }
-static long v_ne(long a, long b)  { return v_int(!v_int_of(v_eq(a, b))); }
-static long v_and(long a, long b) { return v_int(v_truthy(a) && v_truthy(b)); }
-static long v_or(long a, long b)  { return v_int(v_truthy(a) || v_truthy(b)); }
-static long v_not(long a)         { return v_int(!v_truthy(a)); }
+static long v_ne(long a, long b)  { return v_bool(!v_truthy(v_eq(a, b))); }
+static long v_and(long a, long b) { return v_bool(v_truthy(a) && v_truthy(b)); }
+static long v_or(long a, long b)  { return v_bool(v_truthy(a) || v_truthy(b)); }
+static long v_not(long a)         { return v_bool(!v_truthy(a)); }
 static void v_print(long w)
 {
     if (v_is_list(w)) {                 /* print arbitrarily long lists directly */
@@ -990,6 +1003,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "__cc_tick",  (void *)&cc_tick       },
         /* AIPL value_t runtime — the --xinu-jit backend's call seam. */
         { "v_int",       (void *)&v_int        },
+        { "v_bool",      (void *)&v_bool       },
         { "v_str",       (void *)&v_str        },
         { "v_floatlit",  (void *)&v_floatlit   },
         { "v_add",       (void *)&v_add        },
