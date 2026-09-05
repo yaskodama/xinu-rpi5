@@ -1222,8 +1222,17 @@ static int http_build(const char *req, char *out, int max)
               ここを読んで、手元のビルドと突き合わせること。 */
         ctype = "text/plain";
         { extern const char *kernel_build_id(void);
+          extern void aipl_remote_stats(unsigned long *o);
+          unsigned long st[5];
           bl = s_put(body, bl, "build ");
           bl = s_put(body, bl, kernel_build_id());
+          bl = s_put(body, bl, "\n");
+          aipl_remote_stats(st);
+          bl = s_put(body, bl, "remote tx_q=");    bl = s_putdec(body, bl, (long)st[0]);
+          bl = s_put(body, bl, " rx_q=");          bl = s_putdec(body, bl, (long)st[1]);
+          bl = s_put(body, bl, " rx_r=");          bl = s_putdec(body, bl, (long)st[2]);
+          bl = s_put(body, bl, " rx_match=");      bl = s_putdec(body, bl, (long)st[3]);
+          bl = s_put(body, bl, " timeout=");       bl = s_putdec(body, bl, (long)st[4]);
           bl = s_put(body, bl, "\n"); }
     } else if (str_starts(rpath, "/microsd/write/")) {
         /* Persistent FAT32 write to the microSD root: POST /microsd/write/<NAME>

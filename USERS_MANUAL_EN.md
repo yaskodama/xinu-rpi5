@@ -275,7 +275,41 @@ The canonical language is split into 25 features, each checked on this board
 | `replyto` / `answer` / parameter type `reply` | yes | see the limits below |
 | `acquire` / `release` | yes | see the limits below |
 | Type / effect / level annotations | accepted, discarded | checked on the canonical side (`tc`) |
-| `remote("host","actor")` | no | unsupported |
+| `remote("host:port","actor")` | yes | see below; carried over UDP/9010 |
+
+**`remote(...)`.** Send to, or call, an actor another node has published with
+`web_expose`.
+
+```
+var d = now remote("192.168.3.101", "echo").say(21) timeout 2000 else -1;
+send remote("192.168.3.50", "echo").say(5);
+```
+
+It is carried over UDP/9010. The datagram is one line of readable ASCII, and
+all three boards plus the Mac host VM speak it (so `tcpdump` and `nc` show it
+as it is).
+
+```
+Q <reqid> <actor> <method> <arg...>
+R <reqid> <value>
+```
+
+- What travels is the method **name**, not its number: numbers differ per board,
+  so the receiving board resolves the name with its own `__method_id`.
+- One argument. A string of digits arrives as an integer on the other side
+  (the canonical `step(3)` takes one).
+- What comes back is the value re-read from the text the other side rendered.
+  **No type is carried** — the promise holds because the canonical type checker
+  has already matched the types on both sides.
+- A deadline, an unknown host and an unknown method are all failures. With
+  `else` you get that value; without it you get `err` (`result<t>`).
+- The destination MAC is never resolved with ARP. The first request goes out
+  with a broadcast destination MAC and a unicast destination IP, and the
+  decision to take it is made by the receiver. The reply goes back to the
+  requesting frame's sender, so no ARP is needed, and the MAC learned there is
+  remembered — later requests are unicast. That is enough for a handful of
+  boards in a lab and breaks less than another ARP state machine.
+
 
 **Limits of `replyto` / `answer`.** On this device `reply(v)` *is* the return
 value, so passing a reply destination as a value needs a slot: **one reply slot

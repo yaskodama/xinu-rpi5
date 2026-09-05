@@ -71,6 +71,14 @@ static int peer_lookup(const unsigned char *ip, unsigned char *mac)
     return 0;
 }
 
+/* ---- 計器 ----------------------------------------------------------------
+   remote が黙って失敗したとき、どこで落ちているのかを外から読むための数。
+   「板が生きている」ことと「電文が通っている」ことは別なので、
+   推測でコードを直す前にここを見る。GET /version が出す。 */
+static unsigned long g_n_tx_q, g_n_rx_q, g_n_rx_r, g_n_rx_match, g_n_timeout;
+void aipl_remote_stats(unsigned long *o)
+{ o[0]=g_n_tx_q; o[1]=g_n_rx_q; o[2]=g_n_rx_r; o[3]=g_n_rx_match; o[4]=g_n_timeout; }
+
 /* ---- 待っている応答（同時に 1 本） --------------------------------------- */
 static volatile int  g_wait_id = -1;          /* 待っている reqid。-1 = 待っていない */
 static volatile int  g_have    = 0;
@@ -181,6 +189,7 @@ int aipl_remote_handle(const unsigned char *f, int len)
 
     /* ---- 応答が来た ---- */
     if (buf[0] == 'R' && buf[1] == ' ') {
+        g_n_rx_r++;
         int p = 2, id = 0;
         while (buf[p] >= '0' && buf[p] <= '9') { id = id * 10 + (buf[p] - '0'); p++; }
         if (buf[p] == ' ') p++;
@@ -189,12 +198,14 @@ int aipl_remote_handle(const unsigned char *f, int len)
             while (buf[p] && k < (int)sizeof g_reply - 1) g_reply[k++] = buf[p++];
             g_reply[k] = 0;
             g_have = 1;
+            g_n_rx_match++;
         }
         return 1;
     }
 
     /* ---- 要求が来た ---- */
     if (buf[0] == 'Q' && buf[1] == ' ') {
+        g_n_rx_q++;
         int p = 2, id = 0;
         while (buf[p] >= '0' && buf[p] <= '9') { id = id * 10 + (buf[p] - '0'); p++; }
         if (buf[p] == ' ') p++;
@@ -305,11 +316,12 @@ int aipl_remote_call(const char *hostport, const char *actor, const char *meth,
 
     g_have = 0; g_wait_id = id;
     if (send_udp(mac, ip, port, AIPL_PORT, q, n) < 0) { g_wait_id = -1; return -1; }
+    g_n_tx_q++;
 
     if (timeout_ms <= 0) timeout_ms = 2000;
     t0 = timer_ticks();                                  /* 100 Hz */
     while (!g_have) {
-        if ((long)((timer_ticks() - t0) * 10) >= timeout_ms) { g_wait_id = -1; return -2; }
+        if ((long)((timer_ticks() - t0) * 10) >= timeout_ms) { g_wait_id = -1; g_n_timeout++; return -2; }
         net_rx_pump();               /* ★ これが無いと応答を誰も拾わない */
         proc_sleep_us(2000);         /* 譲る。塞がない */
     }
