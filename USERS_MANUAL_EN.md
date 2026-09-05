@@ -249,6 +249,50 @@ curl 'http://192.168.3.101/api/x/echo?method=say&args=hi'
   => echo: hi
 ```
 
+
+#### How much of AIPL runs here
+
+The canonical language is split into 25 features, each checked on this board
+(only programs that pass the canonical checker `tc` are posted). **25 of 25 run.**
+
+| Feature | Runs | Notes |
+|---|---|---|
+| `class` / `method` / `var` / fields | yes | |
+| `new` / `init` / `send` / `send!` | yes | `new` always calls `init` |
+| `now` / `future` / `await` / deadlines | yes | |
+| `select` / `case` / `timeout` | yes | interception spliced at the top of the awaited method |
+| Booleans and comparisons | yes | printed as `true` / `false` |
+| Strings and `++` | yes | |
+| `wait(ms)` | yes | at most 10 s of sleep per run |
+| `web_listen` / `web_expose` | yes | |
+| `ai_call` | yes | on-board model; nothing leaves the box |
+| `float` and float literals | yes | distinguished by a value tag |
+| Arrays (`array_*`) | yes | |
+| Math builtins (`sqrt` `exp` `log` `sin` … 15 of them) | yes | within 1e-11 of libm |
+| `call` / calling one's own method | yes | |
+| Deadline without `else` (`result<t>`) | yes | failure prints as `err` |
+| `is_ok` / `value` | yes | |
+| `replyto` / `answer` / parameter type `reply` | yes | see the limits below |
+| `acquire` / `release` | yes | see the limits below |
+| Type / effect / level annotations | accepted, discarded | checked on the canonical side (`tc`) |
+| `remote("host","actor")` | no | unsupported |
+
+**Limits of `replyto` / `answer`.** On this device `reply(v)` *is* the return
+value, so passing a reply destination as a value needs a slot: **one reply slot
+is taken per `now`**. Only a call that actually reads `replyto` uses its slot;
+a call that does not is passed straight through, so the execution order of
+existing programs is unchanged. If the destination is never answered, the pump
+is run 64 times and then the call gives up with
+`cc: now: the actor given the reply destination never answered`.
+At most 32 reply destinations may be in flight, nested `now` at most 16 deep.
+
+**Limits of `acquire` / `release`.** Pairing and acquisition order are checked
+by the canonical type checker. What the device keeps is a **runtime watch only**:
+it reports a `release` of a resource that is not held, and anything still held
+at the end of a run. It is **not a blocking lock** — between `acquire` and
+`release` control passes to another actor only across a `wait` or a `now`, and
+blocking there could stop the whole board.
+
 ### 8.2 The on-board language model (`ai_call`)
 
 A small model (Karpathy's `stories260K`) is baked into the kernel and callable

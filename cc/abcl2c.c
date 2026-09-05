@@ -230,7 +230,23 @@ static int parse_structure(const char *src)
                     if(T.kind==T_NUM)        { init = neg ? -T.num : T.num; lex_next(); }
                     else if(is_kw("true"))   { if(neg) return a2c_fail("field init: '-' on bool"); init=1; isb=1; lex_next(); }
                     else if(is_kw("false"))  { if(neg) return a2c_fail("field init: '-' on bool"); init=0; isb=1; lex_next(); }
-                    else return a2c_fail("field init: only int/bool literals on this device");
+                    else if(is_kw("new")){
+                        /* var b = new K(); ── 正典ではアクターはフィールドに持つ
+                           （フィールドの型は初期化子で決まるので、局所変数に
+                           逃がすと `send target is not actor` になる）。
+                           クラス番号だけ控えておき、実体は g_spawn が作る。 */
+                        if(neg) return a2c_fail("field init: '-' on new");
+                        lex_next();
+                        if(T.kind!=T_ID) return a2c_fail("field init: new: expected a class name");
+                        int kc=-1; for(int k=0;k<NCLS;k++) if(a2c_streq(CLS[k].name,T.s)){kc=k;break;}
+                        if(kc<0) return a2c_fail("field init: new: unknown class (定義の順に書くこと)");
+                        lex_next();
+                        if(is_p("(")){ lex_next();
+                            if(!is_p(")")) return a2c_fail("field init: new: 引数つきはこの装置では書けません");
+                            lex_next(); }
+                        init=kc; isb=3;
+                    }
+                    else return a2c_fail("field init: only int/bool literals, or new K(), on this device");
                 }
                 c->finit[c->nfield]=init; c->finit_bool[c->nfield]=(char)isb;
                 c->nfield++; if(c->nfield>MAXF) MAXF=c->nfield;
@@ -336,7 +352,7 @@ static int parse_primary(void)
        壊れた C（v_timeout / v_replyto など）が出て cc 側で分かりにくく落ちる。
        ここで名前を挙げて断る。読み進まないまま上位が回ることも防げる。 */
     if (T.kind==T_ID) {
-        static const char *ni[] = { "reply","replyto",
+        static const char *ni[] = { "reply",
                                     "timeout","spawn","remote", 0 };
         for (int i=0; ni[i]; i++) if (a2c_streq(T.s, ni[i])) {
             char m[80]; int k=0; const char *pre="not supported on this device: ";
@@ -344,6 +360,12 @@ static int parse_primary(void)
             for(int j=0; ni[i][j] && k<(int)sizeof m-1; j++) m[k++]=ni[i][j];
             m[k]=0; a2c_fail(m); return 0;
         }
+    }
+
+    /* replyto — いま処理しているメッセージの返信先。丸括弧を取らないので
+       他の組込みとは別に扱う。 */
+    if (T.kind==T_ID && a2c_streq(T.s,"replyto")) {
+        int n=mknode(N_RT); ND[n].s2="cc_replyto"; ND[n].nargs=0; lex_next(); return n;
     }
 
     if (T.kind==T_NUM) {
@@ -460,6 +482,10 @@ static int parse_primary(void)
             else if (a2c_streq(nm,"neg"))   rtfn = "v_m_neg";
             if      (a2c_streq(nm,"is_ok")) rtfn = "cc_is_ok";
             else if (a2c_streq(nm,"value")) rtfn = "cc_value";
+            /* 返信先の一級性と資源の順序（正典 第3段） */
+            else if (a2c_streq(nm,"answer"))  rtfn = "cc_answer";
+            else if (a2c_streq(nm,"acquire")) rtfn = "cc_acquire";
+            else if (a2c_streq(nm,"release")) rtfn = "cc_release";
             if (rtfn) {
                 int n=mknode(N_RT); ND[n].s2 = rtfn; lex_next();
                 while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){
@@ -684,7 +710,9 @@ static void emit_node(int i)
         break;
     case N_PRINT: op_s("v_print("); if(e->nargs) emit_node(e->args[0]); else op_s("v_int(0)"); op_c(')'); break;
     case N_AICALL: op_s("v_ai_call("); if(e->nargs) emit_node(e->args[0]); else op_s("v_str(\"\")"); op_c(')'); break;
-    case N_NOW: op_s("dispatch(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid); emit_args_filled(e->args,e->nargs); op_c(')'); break;
+    case N_NOW:
+        op_s("__now(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid);
+        emit_args_filled(e->args,e->nargs); op_c(')'); break;
     case N_WAIT: op_s("cc_wait("); emit_node(e->args[0]); op_c(')'); break;
     case N_WEB:
         if (e->num) {                                  /* web_expose(path, "名前") */
@@ -834,12 +862,23 @@ static void emit_program(void)
        ここで dispatch を宣言してはいけない。 */
     op_s("int __new_init(int id, int meth, int a0, int a1, int a2, int a3) {\n"
          "  if (id >= 0) { dispatch(id, meth, a0, a1, a2, a3); }\n  return id;\n}\n");
+    /* now の受け皿。返信先スロットの掛け金を dispatch の前後に打つ。
+       ★ 機内 C コンパイラはコンマ演算子を持たない。掛け金を式の中に
+          埋めると "cc: expected token" になり、しかも前置きに入っているので
+          どのプログラムも通らなくなる。順序は必ず文で作ること。 */
+    op_s("int __now(int to, int meth, int a0, int a1, int a2, int a3) {\n"
+         "  int r;\n"
+         "  cc_now_push();\n"
+         "  r = dispatch(to, meth, a0, a1, a2, a3);\n"
+         "  return cc_now_pop(r);\n}\n");
     /* 期限つき呼び出しの受け皿。cc_now_ms と dispatch だけで書ける。
        機内 cc は仮引数 8 個までなので self は渡さない（cc_call も捨てている）。 */
     op_s("int __dl_call(int to, int meth, int a0, int a1, int a2, int a3, int ms, int elsev) {\n"
          "  int t0; int r;\n"
          "  t0 = v_int_of(cc_now_ms());\n"
+         "  cc_now_push();\n"
          "  r = dispatch(to, meth, a0, a1, a2, a3);\n"
+         "  r = cc_now_pop(r);\n"
          "  if (v_int_of(cc_now_ms()) - t0 > ms) { return elsev; }\n"
          "  return r;\n}\n");
     /* アクタを作れなかったら黙って -1 を返さず、はっきり言う。
@@ -857,6 +896,18 @@ static void emit_program(void)
     for (int ci=0; ci<NCLS; ci++) {
         op_s("  if (cls == "); op_n(ci); op_s(") {\n");
         for (int f=0; f<CLS[ci].nfield; f++){ op_s("    g_obj[id].f["); op_n(f);
+            if (CLS[ci].finit_bool[f] == 3) {
+                /* var b = new K(); ── 実体をここで作る。K が init を持つなら呼ぶ。
+                   K が自分自身を持つと止まらないので、正典側でそれは書けない。 */
+                int kc = (int)CLS[ci].finit[f];
+                int im = -1;
+                for (int k=0; k<CLS[kc].nmethod; k++)
+                    if (a2c_streq(CLS[kc].method[k].name,"init")) { im = meth_id("init"); break; }
+                if (im >= 0) { op_s("] = v_int(__new_init(g_spawn("); op_n(kc);
+                               op_s("), "); op_n(im); op_s(", v_int(0), v_int(0), v_int(0), v_int(0)));\n"); }
+                else         { op_s("] = v_int(g_spawn("); op_n(kc); op_s("));\n"); }
+                continue;
+            }
             op_s(CLS[ci].finit_bool[f] == 2 ? "] = v_floatlit("
                : CLS[ci].finit_bool[f]      ? "] = v_bool(" : "] = v_int(");
             op_n(CLS[ci].finit[f]); op_s(");\n"); }
