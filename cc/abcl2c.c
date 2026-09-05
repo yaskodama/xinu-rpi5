@@ -392,8 +392,9 @@ static int parse_primary(void)
             lex_next();
             if(T.kind!=T_NUM) { a2c_fail("timeout: expected milliseconds"); return 0; }
             ND[n].num = T.num; lex_next();
-            if(!is_kw("else")) { a2c_fail("timeout: expected 'else'"); return 0; }
-            lex_next(); ND[n].b = parse_expr(); ND[n].k = N_AWAITDL;
+            /* else を書かなければ result<tau>。失敗は v_err() で表す。 */
+            if(!is_kw("else")) { ND[n].b = -1; ND[n].k = N_AWAITDL; }
+            else { lex_next(); ND[n].b = parse_expr(); ND[n].k = N_AWAITDL; }
         }
         return n; }
     if (is_kw("now")) { lex_next(); int obj=parse_primary();
@@ -409,10 +410,9 @@ static int parse_primary(void)
             lex_next();
             if(T.kind!=T_NUM) { a2c_fail("timeout: expected milliseconds"); return 0; }
             ND[n].num = T.num; lex_next();
-            if(!is_kw("else")) { a2c_fail("timeout: expected 'else'"); return 0; }
-            lex_next();
-            ND[n].b = parse_expr();
-            ND[n].k = N_NOWDL;
+            /* else を書かなければ result<tau>（失敗は v_err()）。 */
+            if(!is_kw("else")) { ND[n].b = -1; ND[n].k = N_NOWDL; }
+            else { lex_next(); ND[n].b = parse_expr(); ND[n].k = N_NOWDL; }
         }
         return n; }
     if (is_kw("self")) { int n=mknode(N_ID); ND[n].s[0]='s';ND[n].s[1]='e';ND[n].s[2]='l';ND[n].s[3]='f';ND[n].s[4]=0; lex_next(); return n; }
@@ -442,6 +442,24 @@ static int parse_primary(void)
             else if (a2c_streq(nm,"array_set"))   rtfn = "v_list_set";
             else if (a2c_streq(nm,"array_len"))   rtfn = "v_list_len";
             else if (a2c_streq(nm,"array_zeros")) rtfn = "v_list_zeros";
+            /* 数学組込み（正典 Core.Math）。ランタイムに実装がある。 */
+            else if (a2c_streq(nm,"sqrt"))  rtfn = "v_m_sqrt";
+            else if (a2c_streq(nm,"exp"))   rtfn = "v_m_exp";
+            else if (a2c_streq(nm,"log"))   rtfn = "v_m_log";
+            else if (a2c_streq(nm,"log10")) rtfn = "v_m_log10";
+            else if (a2c_streq(nm,"sin"))   rtfn = "v_m_sin";
+            else if (a2c_streq(nm,"cos"))   rtfn = "v_m_cos";
+            else if (a2c_streq(nm,"tan"))   rtfn = "v_m_tan";
+            else if (a2c_streq(nm,"asin"))  rtfn = "v_m_asin";
+            else if (a2c_streq(nm,"acos"))  rtfn = "v_m_acos";
+            else if (a2c_streq(nm,"atan"))  rtfn = "v_m_atan";
+            else if (a2c_streq(nm,"floor")) rtfn = "v_m_floor";
+            else if (a2c_streq(nm,"ceil"))  rtfn = "v_m_ceil";
+            else if (a2c_streq(nm,"round")) rtfn = "v_m_round";
+            else if (a2c_streq(nm,"abs"))   rtfn = "v_m_abs";
+            else if (a2c_streq(nm,"neg"))   rtfn = "v_m_neg";
+            if      (a2c_streq(nm,"is_ok")) rtfn = "cc_is_ok";
+            else if (a2c_streq(nm,"value")) rtfn = "cc_value";
             if (rtfn) {
                 int n=mknode(N_RT); ND[n].s2 = rtfn; lex_next();
                 while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){
@@ -683,12 +701,16 @@ static void emit_node(int i)
     case N_AWAIT:   op_s("cc_await("); emit_node(e->a); op_c(')'); break;
     case N_AWAITDL:
         op_s("cc_await_dl("); emit_node(e->a); op_s(", "); op_n(e->num);
-        op_s(", "); emit_node(e->b); op_c(')');
+        op_s(", ");
+        if (e->b < 0) op_s("v_err()"); else emit_node(e->b);      /* else 無し = result */
+        op_c(')');
         break;
     case N_NOWDL:
         op_s("__dl_call(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid);
         emit_args_filled(e->args,e->nargs);
-        op_s(", "); op_n(e->num); op_s(", "); emit_node(e->b); op_c(')');
+        op_s(", "); op_n(e->num); op_s(", ");
+        if (e->b < 0) op_s("v_err()"); else emit_node(e->b);      /* else 無し = result */
+        op_c(')');
         break;
     case N_UN:
         if(e->op==O_NOT){ op_s("v_not("); emit_node(e->a); op_c(')'); }

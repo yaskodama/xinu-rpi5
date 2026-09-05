@@ -239,12 +239,20 @@ static char *vheap_alloc(int n)
    上位ビットが全部立つので、上位ビットを印にすると負の数が真偽値に化ける。
    Pi 3 の VM（0x20000000）と役割は同じ。 */
 #define V_BOOL_TAG   (1UL << 62)
+/* 失敗を表す予約値。`now o.m() timeout N`（else 無し）は result<τ> を返す ――
+   成功なら値そのもの、失敗ならこの一つの値。観測するのは is_ok / value だけ
+   なので、ok を包む必要がない。最下位ビット 0（＝整数ではない）で、
+   浮動小数(60)・リスト(61)・真偽値(62) のどれとも重ならないビットを使う。 */
+#define V_ERR_TAG    (1UL << 59)
 #define V_PTR_MASK   ((1UL << 48) - 1)
 
 static long   v_int(long n)        { return (n << 1) | 1L; }
 static long   v_str(const char *p) { return (long)p; }
 static int    v_is_int(long w)     { return (w & 1L) != 0; }
 static int    v_is_bool(long w)    { return !(w & 1L) && (((unsigned long)w >> 62) & 1UL); }
+static int    v_is_err(long w)    { return !(w & 1L) && (((unsigned long)w >> 59) & 1UL)
+                                           && !(((unsigned long)w >> 60) & 7UL); }
+static long   v_err(void)         { return (long)V_ERR_TAG; }
 static long   v_bool(long b)       { return (long)(V_BOOL_TAG | (b ? 2UL : 0UL)); }
 static int    v_is_float(long w)   { return !(w & 1L) && (((unsigned long)w >> 60) & 1UL); }
 static int    v_is_list(long w)    { return !(w & 1L) && (((unsigned long)w >> 61) & 1UL); }
@@ -363,6 +371,7 @@ static int v_truthy(long w)
     if (w == 0) return 0;
     if (v_is_int(w))   return (w >> 1) != 0;
     if (v_is_bool(w))  return (w & 2L) != 0;   /* false は 0 ではないので先に見る */
+    if (v_is_err(w))   return 0;               /* 失敗は偽 */
     if (v_is_float(w)) return v_to_float(w) != 0.0;
     if (v_is_list(w))  return v_list_ptr(w)[0] != 0;   /* non-empty */
     return ((const char *)w)[0] != 0;
@@ -385,6 +394,7 @@ static const char *v_render(long w, char *buf, int cap)
         return buf;
     }
     if (v_is_bool(w)) return (w & 2L) ? "true" : "false";
+    if (v_is_err(w))  return "err";
     if (v_is_str(w)) return (const char *)w;
     if (v_is_float(w)) {
         double d = v_to_float(w);
@@ -701,6 +711,144 @@ static long cc_wait(long ms)
     return v_int(0);
 }
 static long cc_now_ms(void) { unsigned long frq=cc_cntfrq(); if(frq<1000)frq=1000; return v_int((long)(cc_now()/(frq/1000UL))); }
+
+/* ---- 数学組込み（freestanding。libm は無い）---------------------------
+ * 正典 AIPL の Core.Math: sin cos tan asin acos atan sqrt exp log10
+ *                        abs floor ceil round neg
+ * AArch64 の fsqrt 以外は多項式で作る。精度は Mac 上で libm と突き合わせて
+ * 確かめてある（相対誤差 1e-12 以下を目標）。 */
+#define VM_PI  3.14159265358979323846
+#define VM_PI2 1.57079632679489661923
+
+static double m_sqrt(double x)
+{
+    double r; __asm__ ("fsqrt %d0, %d1" : "=w"(r) : "w"(x)); return r;
+}
+static double m_abs(double x)   { return x < 0 ? -x : x; }
+static double m_floor(double x) { double t = (double)(long)x; return (x < 0 && t != x) ? t - 1 : t; }
+static double m_ceil(double x)  { double t = (double)(long)x; return (x > 0 && t != x) ? t + 1 : t; }
+static double m_round(double x) { return x < 0 ? -m_floor(-x + 0.5) : m_floor(x + 0.5); }
+
+/* exp: x = k*ln2 + r,  |r| <= ln2/2。 e^r を 12 次のテイラーで、2^k は指数を直に置く。 */
+static double m_exp(double x)
+{
+    if (x >  709.0) x =  709.0;
+    if (x < -745.0) return 0.0;
+    const double LN2 = 0.69314718055994530942;
+    double kf = m_floor(x / LN2 + 0.5);
+    double r  = x - kf * LN2;
+    double s = 1.0, t = 1.0;
+    for (int i = 1; i <= 12; i++) { t = t * r / (double)i; s += t; }
+    long k = (long)kf;
+    union { double d; unsigned long u; } p; p.u = ((unsigned long)(1023 + k)) << 52;
+    return s * p.d;
+}
+/* log: x = m * 2^e （m in [1,2)）。ln m は atanh 級数で。 */
+static double m_log(double x)
+{
+    if (x <= 0) return 0.0;
+    union { double d; unsigned long u; } v; v.d = x;
+    long e = (long)((v.u >> 52) & 0x7FF) - 1023;
+    v.u = (v.u & 0x800FFFFFFFFFFFFFUL) | (1023UL << 52);   /* m in [1,2) */
+    double m = v.d;
+    if (m > 1.4142135623730951) { m *= 0.5; e += 1; }
+    double z = (m - 1.0) / (m + 1.0), z2 = z * z, s = 0.0, t = z;
+    for (int i = 1; i <= 25; i += 2) { s += t / (double)i; t *= z2; }
+    return 2.0 * s + (double)e * 0.69314718055994530942;
+}
+static double m_log10(double x) { return m_log(x) * 0.43429448190325182765; }
+
+/* sin/cos: 2π で畳み、さらに象限で [-π/4, π/4] まで縮めてから級数。
+   縮めないと |x| が π 近くで桁落ちする（実測で 2.4e-4 の誤差が出た）。 */
+static double sc_poly_sin(double x)
+{
+    double s = x, t = x, x2 = x * x;
+    for (int i = 1; i <= 7; i++) { t = -t * x2 / (double)((2*i) * (2*i + 1)); s += t; }
+    return s;
+}
+static double sc_poly_cos(double x)
+{
+    double s = 1.0, t = 1.0, x2 = x * x;
+    for (int i = 1; i <= 7; i++) { t = -t * x2 / (double)((2*i - 1) * (2*i)); s += t; }
+    return s;
+}
+static double m_sin(double x)
+{
+    double n = m_floor(x / VM_PI2 + 0.5);          /* π/2 単位に畳む */
+    double r = x - n * VM_PI2;
+    long q = ((long)n) & 3; if (q < 0) q += 4;
+    switch (q) {
+      case 0: return  sc_poly_sin(r);
+      case 1: return  sc_poly_cos(r);
+      case 2: return -sc_poly_sin(r);
+      default:return -sc_poly_cos(r);
+    }
+}
+static double m_cos(double x)
+{
+    double n = m_floor(x / VM_PI2 + 0.5);
+    double r = x - n * VM_PI2;
+    long q = ((long)n) & 3; if (q < 0) q += 4;
+    switch (q) {
+      case 0: return  sc_poly_cos(r);
+      case 1: return -sc_poly_sin(r);
+      case 2: return -sc_poly_cos(r);
+      default:return  sc_poly_sin(r);
+    }
+}
+static double m_tan(double x) { double c = m_cos(x); return c == 0.0 ? 0.0 : m_sin(x) / c; }
+
+/* atan: |x|<=1 に落としたあと、さらに tan(π/12) 以下まで縮めてから級数。
+   縮めないと x が 1 に近いところで級数が収束せず 1e-2 も外れる（実測）。 */
+static double m_atan(double x)
+{
+    int neg = x < 0; if (neg) x = -x;
+    int inv = x > 1.0; if (inv) x = 1.0 / x;
+    double add = 0.0;
+    if (x > 0.26794919243112270647) {              /* tan(π/12) */
+        const double S3 = 1.73205080756887729353;  /* √3 */
+        x = (x * S3 - 1.0) / (x + S3);
+        add = VM_PI / 6.0;
+    }
+    double s = 0.0, t = x, x2 = x * x;
+    for (int i = 1; i <= 31; i += 2) { s += ((i % 4 == 1) ? t : -t) / (double)i; t *= x2; }
+    s += add;
+    if (inv) s = VM_PI2 - s;
+    return neg ? -s : s;
+}
+static double m_asin(double x)
+{
+    if (x >=  1.0) return  VM_PI2;
+    if (x <= -1.0) return -VM_PI2;
+    return m_atan(x / m_sqrt(1.0 - x * x));
+}
+static double m_acos(double x) { return VM_PI2 - m_asin(x); }
+
+/* 値ランタイムへの入口。引数も戻り値も value_t（整数でも浮動小数でも受ける）。 */
+static long v_m_sqrt (long a) { return v_floatval(m_sqrt (v_to_float(a))); }
+static long v_m_exp  (long a) { return v_floatval(m_exp  (v_to_float(a))); }
+static long v_m_log  (long a) { return v_floatval(m_log  (v_to_float(a))); }
+static long v_m_log10(long a) { return v_floatval(m_log10(v_to_float(a))); }
+static long v_m_sin  (long a) { return v_floatval(m_sin  (v_to_float(a))); }
+static long v_m_cos  (long a) { return v_floatval(m_cos  (v_to_float(a))); }
+static long v_m_tan  (long a) { return v_floatval(m_tan  (v_to_float(a))); }
+static long v_m_asin (long a) { return v_floatval(m_asin (v_to_float(a))); }
+static long v_m_acos (long a) { return v_floatval(m_acos (v_to_float(a))); }
+static long v_m_atan (long a) { return v_floatval(m_atan (v_to_float(a))); }
+static long v_m_floor(long a) { return v_floatval(m_floor(v_to_float(a))); }
+static long v_m_ceil (long a) { return v_floatval(m_ceil (v_to_float(a))); }
+static long v_m_round(long a) { return v_floatval(m_round(v_to_float(a))); }
+/* abs と neg は整数のまま来たら整数で返す（正典も型で分かれる）。 */
+static long v_m_abs  (long a) { if (v_is_int(a)) { long n=v_int_of(a); return v_int(n<0?-n:n); }
+                                return v_floatval(m_abs(v_to_float(a))); }
+static long v_m_neg  (long a) { if (v_is_int(a)) return v_int(-v_int_of(a));
+                                return v_floatval(-v_to_float(a)); }
+
+/* ---- result<tau>: is_ok / value ---------------------------------------
+ * `now o.m() timeout N`（else 無し）は成功なら値、失敗なら v_err() を返す。
+ * 観測はこの二つだけ。value(r, 既定) は失敗のとき既定を返す。 */
+static long cc_is_ok(long r)          { return v_bool(!v_is_err(r)); }
+static long cc_value(long r, long dflt) { return v_is_err(r) ? dflt : r; }
 
 /* ---- future / await ------------------------------------------------------
  * `var f = future o.m(x); ... var v = await f;`
@@ -1042,6 +1190,17 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_future",        (void *)&cc_future         },
         { "cc_await",         (void *)&cc_await          },
         { "cc_await_dl",      (void *)&cc_await_dl       },
+        { "cc_is_ok",         (void *)&cc_is_ok          },
+        { "v_m_sqrt",  (void *)&v_m_sqrt  }, { "v_m_exp",   (void *)&v_m_exp   },
+        { "v_m_log",   (void *)&v_m_log   }, { "v_m_log10", (void *)&v_m_log10 },
+        { "v_m_sin",   (void *)&v_m_sin   }, { "v_m_cos",   (void *)&v_m_cos   },
+        { "v_m_tan",   (void *)&v_m_tan   }, { "v_m_asin",  (void *)&v_m_asin  },
+        { "v_m_acos",  (void *)&v_m_acos  }, { "v_m_atan",  (void *)&v_m_atan  },
+        { "v_m_floor", (void *)&v_m_floor }, { "v_m_ceil",  (void *)&v_m_ceil  },
+        { "v_m_round", (void *)&v_m_round }, { "v_m_abs",   (void *)&v_m_abs   },
+        { "v_m_neg",   (void *)&v_m_neg   },
+        { "cc_value",         (void *)&cc_value          },
+        { "v_err",            (void *)&v_err             },
         { "cc_sel_arg",       (void *)&cc_sel_arg        },
         { "cc_actor_count",   (void *)&cc_actor_count    },
         { "cc_actor_alive",   (void *)&cc_actor_alive    },
