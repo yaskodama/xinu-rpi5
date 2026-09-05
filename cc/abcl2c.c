@@ -330,7 +330,7 @@ static sel_t SEL[MAXSEL]; static int NSEL;
 static int  SELFIELD[MAXCLASS];        /* __sel の隠しフィールド番号。-1 = 無し */
 
 /* ---- expression AST ----------------------------------------------- */
-enum { N_NIL, N_INT, N_BOOL, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_FUT, N_AWAIT, N_AWAITDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN, N_RT, N_SELFCALL, N_FLT, N_REMOTE };
+enum { N_NIL, N_INT, N_BOOL, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_FUT, N_AWAIT, N_AWAITDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN, N_RT, N_SELFCALL, N_FLT, N_REMOTE, N_SPAWN };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
 typedef struct { int k; long num; char s[TOKSTR]; const char *s2; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
 #define MAXNODE 1024
@@ -353,7 +353,7 @@ static int parse_primary(void)
        ここで名前を挙げて断る。読み進まないまま上位が回ることも防げる。 */
     if (T.kind==T_ID) {
         static const char *ni[] = { "reply",
-                                    "timeout","spawn", 0 };
+                                    "timeout", 0 };
         for (int i=0; ni[i]; i++) if (a2c_streq(T.s, ni[i])) {
             char m[80]; int k=0; const char *pre="not supported on this device: ";
             while(pre[k] && k<(int)sizeof m-1){ m[k]=pre[k]; k++; }
@@ -508,6 +508,28 @@ static int parse_primary(void)
                     if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr();
                     if(is_p(","))lex_next(); }
                 if(is_p(")"))lex_next();
+                return n;
+            }
+            /* spawn("クラス名", "名前") — 名前を付けてアクタを作る。
+               この装置には「名前つきアクタ表」が別にあるわけではなく、
+               公開表（web_expose のもの）がそれである。作った番号をその名前で
+               載せれば remote("host","名前") からも /api/x/名前 からも届く。 */
+            if (a2c_streq(nm,"spawn")) {
+                lex_next();
+                if(T.kind!=T_STR){ a2c_fail("spawn: 第1引数はクラス名の文字列"); return 0; }
+                int ci=-1; for(int k=0;k<NCLS;k++) if(a2c_streq(CLS[k].name,T.s)){ci=k;break;}
+                if(ci<0){ a2c_fail("spawn: 知らないクラスです（定義より後で書くこと）"); return 0; }
+                lex_next();
+                if(!is_p(",")){ a2c_fail("spawn: expected ','"); return 0; } lex_next();
+                if(T.kind!=T_STR){ a2c_fail("spawn: 第2引数は名前の文字列"); return 0; }
+                int n=mknode(N_SPAWN); ND[n].ci=ci;
+                { /* 公開名は '/' 始まりで載せる（web_expose と同じ形にする） */
+                  int k=0; ND[n].s[k++]='/';
+                  for(int j=0; T.s[j] && k<TOKSTR-1; j++) ND[n].s[k++]=T.s[j];
+                  ND[n].s[k]=0; }
+                lex_next();
+                if(is_p(")")) lex_next();
+                else { a2c_fail("spawn: expected ')'"); return 0; }
                 return n;
             }
             if (isweb) {
@@ -750,6 +772,16 @@ static void emit_node(int i)
         op_s("__now(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid);
         emit_args_filled(e->args,e->nargs); op_c(')'); break;
     case N_WAIT: op_s("cc_wait("); emit_node(e->args[0]); op_c(')'); break;
+    case N_SPAWN: {
+        int im = -1;
+        for (int k=0; k<CLS[e->ci].nmethod; k++)
+            if (a2c_streq(CLS[e->ci].method[k].name,"init")) { im = meth_id("init"); break; }
+        op_s("cc_web_expose(v_str(\""); op_s(e->s); op_s("\"), ");
+        if (im >= 0) { op_s("__new_init(g_spawn("); op_n(e->ci); op_s("), "); op_n(im);
+                       op_s(", v_int(0), v_int(0), v_int(0), v_int(0))"); }
+        else         { op_s("g_spawn("); op_n(e->ci); op_c(')'); }
+        op_c(')');
+        break; }
     case N_WEB:
         if (e->num) {                                  /* web_expose(path, "名前") */
             op_s("cc_web_expose("); emit_node(e->args[0]);
