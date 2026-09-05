@@ -286,8 +286,14 @@ static void genet_rx_tick(void)
    詰まるのと同じ理由）。待つ側が自分で回さないと、相手の応答は届いていても
    誰も拾わず、必ず期限切れになる ―― 実機でそうなった。
    g_rx_busy の番人が中にあるので、割り込みと重なっても安全に空振りする。 */
+/* 汲み取りが本当に呼ばれて環を見ているかを数える。
+   pump_calls=0 なら呼ばれていない、frames=0 なら環に何も来ていない。 */
+static unsigned long g_pump_calls, g_pump_frames;
+void net_rx_pump_stats(unsigned long *o) { o[0]=g_pump_calls; o[1]=g_pump_frames; }
+
 void net_rx_pump(void)
 {
+    g_pump_calls++;
     /* ★ genet_rx_tick() を呼んではいけない。いま我々は「その中」にいる
        （/cc の要求を配っている最中）ので、g_rx_busy に弾かれて何もしない。
        それが「応答は板に届いているのに、待ち手が必ず期限切れになる」正体
@@ -297,6 +303,7 @@ void net_rx_pump(void)
        させないため。 */
     unsigned char *pkt; int len; int budget = 16;
     while (budget-- > 0 && (len = genet_rx_poll(&pkt)) > 0) {
+        g_pump_frames++;
         static unsigned char cp[1600];
         int n = (len < 1600) ? len : 1600;
         for (int i = 0; i < n; i++) cp[i] = pkt[i];

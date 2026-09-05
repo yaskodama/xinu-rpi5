@@ -75,13 +75,44 @@ static int peer_lookup(const unsigned char *ip, unsigned char *mac)
    remote が黙って失敗したとき、どこで落ちているのかを外から読むための数。
    「板が生きている」ことと「電文が通っている」ことは別なので、
    推測でコードを直す前にここを見る。GET /version が出す。 */
-static unsigned long g_n_tx_q, g_n_rx_q, g_n_rx_r, g_n_rx_match, g_n_timeout;
+static unsigned long g_n_tx_q, g_n_rx_q, g_n_rx_r, g_n_rx_match, g_n_timeout, g_n_retx;
 /* 突き合わせが外れたときに、何と何を比べたのかを残す。
    数だけでは「番号が違う」のか「待っていなかった」のかが分かれない。 */
 static long g_dbg_seen_id = -1, g_dbg_wait_at_seen = -2;
+/* 送った時刻と、応答を見た時刻（100Hz の刻み）。差が期限に張り付いていれば
+   「実行が終わってから届いた」、ほぼ 0 なら「届いているのに噛み合わない」。 */
+static unsigned long g_dbg_send_t, g_dbg_seen_t, g_dbg_loops;
 void aipl_remote_stats(unsigned long *o)
 { o[0]=g_n_tx_q; o[1]=g_n_rx_q; o[2]=g_n_rx_r; o[3]=g_n_rx_match; o[4]=g_n_timeout;
-  o[5]=(unsigned long)g_dbg_seen_id; o[6]=(unsigned long)g_dbg_wait_at_seen; }
+  o[5]=(unsigned long)g_dbg_seen_id; o[6]=(unsigned long)g_dbg_wait_at_seen;
+  o[7]=g_dbg_send_t; o[8]=g_dbg_seen_t; o[9]=g_dbg_loops; o[10]=g_n_retx; }
+
+/* ---- 応答の控え（at-most-once） ------------------------------------------
+   要求は再送する（UDP なので落ちる）。素朴に作ると相手のメソッドが二度走る。
+   (送り主 IP, reqid) で最後の答えを覚えておき、同じものが来たら実行せずに
+   控えを返す。これで「高々一度」になる。 */
+#define ANS_MAX 4
+static struct { unsigned char ip[4]; int id; char val[160]; unsigned char used; } g_ans[ANS_MAX];
+static int g_ans_next;
+
+static const char *ans_lookup(const unsigned char *ip, int id)
+{
+    for (int i = 0; i < ANS_MAX; i++)
+        if (g_ans[i].used && g_ans[i].id == id
+         && g_ans[i].ip[0]==ip[0] && g_ans[i].ip[1]==ip[1]
+         && g_ans[i].ip[2]==ip[2] && g_ans[i].ip[3]==ip[3])
+            return g_ans[i].val;
+    return 0;
+}
+static void ans_store(const unsigned char *ip, int id, const char *val)
+{
+    int i = g_ans_next; g_ans_next = (g_ans_next + 1) % ANS_MAX;
+    for (int k = 0; k < 4; k++) g_ans[i].ip[k] = ip[k];
+    g_ans[i].id = id;
+    { int k = 0; while (val[k] && k < (int)sizeof g_ans[0].val - 1) { g_ans[i].val[k] = val[k]; k++; }
+      g_ans[i].val[k] = 0; }
+    g_ans[i].used = 1;
+}
 
 /* ---- 待っている応答（同時に 1 本） --------------------------------------- */
 static volatile int  g_wait_id = -1;          /* 待っている reqid。-1 = 待っていない */
@@ -198,6 +229,7 @@ int aipl_remote_handle(const unsigned char *f, int len)
         while (buf[p] >= '0' && buf[p] <= '9') { id = id * 10 + (buf[p] - '0'); p++; }
         if (buf[p] == ' ') p++;
         g_dbg_seen_id = id; g_dbg_wait_at_seen = g_wait_id;
+        g_dbg_seen_t = timer_ticks();
         if (g_wait_id == id) {
             int k = 0;
             while (buf[p] && k < (int)sizeof g_reply - 1) g_reply[k++] = buf[p++];
@@ -226,6 +258,19 @@ int aipl_remote_handle(const unsigned char *f, int len)
 
         /* 公開名からアクター番号を引く。web_expose の表は "/echo" のように
            先頭が '/' なので、両方の書き方を受ける。 */
+        /* 同じ要求の再送なら、走らせずに前の答えを返す */
+        { const char *prev = ans_lookup(ip + 12, id);
+          if (prev) {
+              char out[224]; int at = 0;
+              at = put(out, at, sizeof out, "R ");
+              at = put_num(out, at, sizeof out, id);
+              at = put(out, at, sizeof out, " ");
+              at = put(out, at, sizeof out, prev);
+              at = put(out, at, sizeof out, "\n");
+              send_udp(f + 6, ip + 12, sport, AIPL_PORT, out, at);
+              return 1;
+          } }
+
         int target = -1;
         for (int i = 0; i < cc_web_count(); i++) {
             const char *pth = cc_web_path_at(i);
@@ -238,6 +283,8 @@ int aipl_remote_handle(const unsigned char *f, int len)
         if (target < 0) put(val, 0, sizeof val, "err");
         else if (cc_remote_dispatch(target, meth, arg, val, sizeof val) != 0)
             put(val, 0, sizeof val, "err");
+
+        ans_store(ip + 12, id, val);
 
         char out[224]; int at = 0;
         at = put(out, at, sizeof out, "R ");
@@ -322,14 +369,28 @@ int aipl_remote_call(const char *hostport, const char *actor, const char *meth,
     g_have = 0; g_wait_id = id;
     if (send_udp(mac, ip, port, AIPL_PORT, q, n) < 0) { g_wait_id = -1; return -1; }
     g_n_tx_q++;
+    g_dbg_send_t = timer_ticks(); g_dbg_loops = 0;
 
     if (timeout_ms <= 0) timeout_ms = 2000;
     t0 = timer_ticks();                                  /* 100 Hz */
-    while (!g_have) {
-        if ((long)((timer_ticks() - t0) * 10) >= timeout_ms) { g_wait_id = -1; g_n_timeout++; return -2; }
-        net_rx_pump();               /* ★ これが無いと応答を誰も拾わない */
-        proc_sleep_us(2000);         /* 譲る。塞がない */
-    }
+    /* ★ UDP の要求応答なのに再送していなかった ―― これが「応答は届いている
+       のに拾えない」の実際の中身だった。計器いわく、待ちの輪は 1 秒に数回しか
+       回らず、環からの取り出しも遅れる。落ちた一発をそのまま待てば必ず期限切れ
+       になる。相手に繰り返し返させたら通った、という実測がそれを示した。
+       200ms ごとに出し直す。相手は (送り主, reqid) の控えを持つので、
+       メソッドが二度走ることはない。 */
+    { unsigned long last_tx = t0;
+      while (!g_have) {
+          if ((long)((timer_ticks() - t0) * 10) >= timeout_ms) { g_wait_id = -1; g_n_timeout++; return -2; }
+          g_dbg_loops++;
+          net_rx_pump();
+          if (timer_ticks() - last_tx >= 20) {          /* 20 刻み = 200ms */
+              send_udp(mac, ip, port, AIPL_PORT, q, n);
+              last_tx = timer_ticks();
+              g_n_retx++;
+          }
+          proc_sleep_us(2000);       /* 譲る。塞がない */
+      } }
     g_wait_id = -1;
     { int k = 0; while (g_reply[k] && k < outcap - 1) { out[k] = g_reply[k]; k++; } out[k] = 0; }
     return 0;

@@ -1223,7 +1223,7 @@ static int http_build(const char *req, char *out, int max)
         ctype = "text/plain";
         { extern const char *kernel_build_id(void);
           extern void aipl_remote_stats(unsigned long *o);
-          unsigned long st[7];
+          unsigned long st[11], ps[2];
           bl = s_put(body, bl, "build ");
           bl = s_put(body, bl, kernel_build_id());
           bl = s_put(body, bl, "\n");
@@ -1235,6 +1235,14 @@ static int http_build(const char *req, char *out, int max)
           bl = s_put(body, bl, " timeout=");       bl = s_putdec(body, bl, (long)st[4]);
           bl = s_put(body, bl, " seen_id=");       bl = s_putdec(body, bl, (long)st[5]);
           bl = s_put(body, bl, " wait_at_seen=");  bl = s_putdec(body, bl, (long)st[6]);
+          bl = s_put(body, bl, "\nremote send_t=");  bl = s_putdec(body, bl, (long)st[7]);
+          bl = s_put(body, bl, " seen_t=");        bl = s_putdec(body, bl, (long)st[8]);
+          bl = s_put(body, bl, " loops=");         bl = s_putdec(body, bl, (long)st[9]);
+          bl = s_put(body, bl, " retx=");          bl = s_putdec(body, bl, (long)st[10]);
+          { extern void net_rx_pump_stats(unsigned long *o);
+            net_rx_pump_stats(ps);
+            bl = s_put(body, bl, " pump_calls=");  bl = s_putdec(body, bl, (long)ps[0]);
+            bl = s_put(body, bl, " pump_frames="); bl = s_putdec(body, bl, (long)ps[1]); }
           bl = s_put(body, bl, "\n"); }
     } else if (str_starts(rpath, "/microsd/write/")) {
         /* Persistent FAT32 write to the microSD root: POST /microsd/write/<NAME>
