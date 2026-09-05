@@ -1214,6 +1214,17 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "}");
         }
         bl = s_put(body, bl, "]}\n");
+    } else if (str_starts(rpath, "/version")) {
+        /* いま走っているカーネルの版を名乗る。
+           ★ 焼いたあと「HTTP が応答した」を「再起動した」と取り違えて、
+              古いカーネルに向かって実験を続けたことがある。板が生きている
+              ことと、焼いたものが走っていることは別である。焼いたら必ず
+              ここを読んで、手元のビルドと突き合わせること。 */
+        ctype = "text/plain";
+        { extern const char *kernel_build_id(void);
+          bl = s_put(body, bl, "build ");
+          bl = s_put(body, bl, kernel_build_id());
+          bl = s_put(body, bl, "\n"); }
     } else if (str_starts(rpath, "/microsd/write/")) {
         /* Persistent FAT32 write to the microSD root: POST /microsd/write/<NAME>
          * with the file content as the request body (8.3 name, <= one cluster). */

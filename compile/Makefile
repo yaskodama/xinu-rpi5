@@ -191,6 +191,12 @@ obj/pi5/main_os2.o: main.c | obj/pi5
 obj/pi5/video_os3.o: video.c | obj/pi5
 	$(CC) $(PI5_CFLAGS) -DSCREEN_WIDTH=1280 -DSCREEN_HEIGHT=720 -c $< -o $@
 
+# 版を名乗るファイルだけは毎回コンパイルし直す。そうしないと
+# __DATE__ / __TIME__ が古いままになり、GET /version が嘘をつく。
+.PHONY: FORCE
+FORCE:
+obj/pi5/kversion.o obj/pi4/kversion.o obj/qemu/kversion.o: FORCE
+
 obj/pi5/%.o: %.c  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
 obj/pi5/%.o: %.S  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
 obj/pi4/%.o: %.c  | obj/pi4  ; $(CC) $(PI4_CFLAGS)  -c $< -o $@

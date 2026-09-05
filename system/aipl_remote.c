@@ -290,6 +290,7 @@ int aipl_remote_call(const char *hostport, const char *actor, const char *meth,
                      const char *arg, long timeout_ms, char *out, int outcap)
 {
     extern void proc_sleep_us(unsigned long us);
+    extern void net_rx_pump(void);          /* 待つ側が自分で受信を回す */
     unsigned char ip[4], mac[6]; unsigned short port;
     char q[288]; int n, id;
     unsigned long t0;
@@ -309,7 +310,8 @@ int aipl_remote_call(const char *hostport, const char *actor, const char *meth,
     t0 = timer_ticks();                                  /* 100 Hz */
     while (!g_have) {
         if ((long)((timer_ticks() - t0) * 10) >= timeout_ms) { g_wait_id = -1; return -2; }
-        proc_sleep_us(2000);                             /* 譲る。塞がない */
+        net_rx_pump();               /* ★ これが無いと応答を誰も拾わない */
+        proc_sleep_us(2000);         /* 譲る。塞がない */
     }
     g_wait_id = -1;
     { int k = 0; while (g_reply[k] && k < outcap - 1) { out[k] = g_reply[k]; k++; } out[k] = 0; }
