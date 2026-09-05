@@ -1228,6 +1228,101 @@ int cc_actor_send_msg_str(int to, const char *method, const char *sarg, char *ou
     return 0;
 }
 
+
+/* ===== remote("host:port","actor") =======================================
+ * 正典では送信先は「アクター参照の変数」か remote(...) である。後者は他ノード。
+ * 運びかたは system/aipl_remote.c（UDP/9010）。ここは AIPL 側の見え方だけ。
+ *
+ * 返ってくるのは相手が v_render で描いた文字列なので、値に読み直す。
+ * "42" は整数、"true"/"false" は真偽値、それ以外は文字列にする。
+ * 相手の型は分からない ―― 型を運ぶのではなく、描かれたものを読み直している。
+ * 正典の型検査器が両側の型を合わせている前提で成り立つ約束である。
+ */
+extern int aipl_remote_send(const char *hostport, const char *actor,
+                            const char *meth, const char *arg);
+extern int aipl_remote_call(const char *hostport, const char *actor, const char *meth,
+                            const char *arg, long timeout_ms, char *out, int outcap);
+
+static long remote_parse(const char *t)
+{
+    int i = 0, neg = 0;
+    if (!t || !t[0]) return v_str("");
+    if (t[0]=='t'&&t[1]=='r'&&t[2]=='u'&&t[3]=='e'&&t[4]==0) return v_bool(1);
+    if (t[0]=='f'&&t[1]=='a'&&t[2]=='l'&&t[3]=='s'&&t[4]=='e'&&t[5]==0) return v_bool(0);
+    if (t[0]=='e'&&t[1]=='r'&&t[2]=='r'&&t[3]==0) return v_err();
+    if (t[0] == '-') { neg = 1; i = 1; }
+    { long v = 0; int d = 0;
+      for (; t[i]; i++) {
+          if (t[i] < '0' || t[i] > '9') { d = -1; break; }
+          v = v * 10 + (t[i] - '0'); d++;
+      }
+      if (d > 0) return v_int(neg ? -v : v); }
+    /* 文字列は値ヒープへ写す。受信バッファはこのあと上書きされるので、
+       そのまま v_str で指すと後から化ける。 */
+    { int n = 0; while (t[n]) n++;
+      char *r = vheap_alloc(n + 1);
+      if (!r) return v_str("");
+      for (int k = 0; k <= n; k++) r[k] = t[k];
+      return v_str(r); }
+}
+
+/* 引数は 1 個。文字として運ぶので、まず描く。 */
+static const char *remote_arg_text(long a, char *buf, int cap)
+{
+    if (a == v_int(0)) { buf[0] = 0; return buf; }
+    return v_render(a, buf, cap);
+}
+
+static long cc_remote_send_v(long host, long actor, long meth, long arg)
+{
+    char ab[96];
+    const char *h = v_is_str(host)  ? (const char *)host  : "";
+    const char *n = v_is_str(actor) ? (const char *)actor : "";
+    const char *m = v_is_str(meth)  ? (const char *)meth  : "";
+    if (aipl_remote_send(h, n, m, remote_arg_text(arg, ab, sizeof ab)) < 0)
+        emit_str("\ncc: remote: 送れませんでした（宛先の書き方を確かめてください）\n");
+    return v_int(0);
+}
+
+static long cc_remote_call_v(long host, long actor, long meth, long arg, long ms)
+{
+    char ab[96], rb[192];
+    const char *h = v_is_str(host)  ? (const char *)host  : "";
+    const char *n = v_is_str(actor) ? (const char *)actor : "";
+    const char *m = v_is_str(meth)  ? (const char *)meth  : "";
+    int rc = aipl_remote_call(h, n, m, remote_arg_text(arg, ab, sizeof ab),
+                              v_int_of(ms), rb, (int)sizeof rb);
+    if (rc != 0) return v_err();       /* 期限切れ・宛先不正 -> result の失敗 */
+    return remote_parse(rb);
+}
+
+/* 受け側。公開アクターの番号 + メソッド名 + 引数（文字）で呼び、
+ * 結果だけを描いて返す（HTTP の /api/x/ と違い、print 出力は載せない）。 */
+int cc_remote_dispatch(int actor, const char *method, const char *arg,
+                       char *out, int outcap)
+{
+    if (outcap > 0) out[0] = 0;
+    if (!g_res_loaded || !g_dispatch || !g_res_methodid) return -1;
+    long mid = g_res_methodid(v_str(method));
+    int midraw = (int)v_int_of(mid);
+    if (midraw < 0) return -1;
+
+    /* 引数は文字で来る。数字だけなら整数として渡す（正典の例
+       `now remote("rt0","servo1").step(3)` が整数を取るため）。 */
+    long a0 = remote_parse(arg);
+
+    cc_set_deadline();
+    char *save = g_cap; int savecap = g_capcap, savelen = g_caplen;
+    g_cap = 0;                       /* 相手側の print はこの応答に載せない */
+    long res = g_dispatch((long)actor, (long)midraw, a0, v_int(0), v_int(0), v_int(0));
+    cc_pump();
+    g_cap = save; g_capcap = savecap; g_caplen = savelen;
+
+    { char rb[160]; const char *rs = v_render(res, rb, sizeof rb);
+      int k = 0; while (rs[k] && k < outcap - 1) { out[k] = rs[k]; k++; } out[k] = 0; }
+    return 0;
+}
+
 /* Node actor capacity — paired with cc_actor_live_count() (below) as the load
  * metric the mesh load-balancer queries via /api/load to pick the least-loaded
  * Xinu node. */
@@ -1333,6 +1428,8 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_replyto",       (void *)&cc_replyto        },
         { "cc_answer",        (void *)&cc_answer         },
         { "cc_acquire",       (void *)&cc_acquire        },
+        { "cc_remote_send",   (void *)&cc_remote_send_v  },
+        { "cc_remote_call",   (void *)&cc_remote_call_v  },
         { "cc_release",       (void *)&cc_release        },
         { "v_m_sqrt",  (void *)&v_m_sqrt  }, { "v_m_exp",   (void *)&v_m_exp   },
         { "v_m_log",   (void *)&v_m_log   }, { "v_m_log10", (void *)&v_m_log10 },

@@ -55,6 +55,11 @@ void net_responder_set_ip(const unsigned char ip[4])
     for (int i = 0; i < 4; i++) g_my_ip[i] = ip[i];
 }
 
+void net_responder_get_mac(unsigned char out[6])
+{
+    for (int i = 0; i < 6; i++) out[i] = g_my_mac[i];
+}
+
 void net_responder_get_ip(unsigned char out[4])
 {
     for (int i = 0; i < 4; i++) out[i] = g_my_ip[i];

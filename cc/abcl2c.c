@@ -330,7 +330,7 @@ static sel_t SEL[MAXSEL]; static int NSEL;
 static int  SELFIELD[MAXCLASS];        /* __sel の隠しフィールド番号。-1 = 無し */
 
 /* ---- expression AST ----------------------------------------------- */
-enum { N_NIL, N_INT, N_BOOL, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_FUT, N_AWAIT, N_AWAITDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN, N_RT, N_SELFCALL, N_FLT };
+enum { N_NIL, N_INT, N_BOOL, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_FUT, N_AWAIT, N_AWAITDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN, N_RT, N_SELFCALL, N_FLT, N_REMOTE };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
 typedef struct { int k; long num; char s[TOKSTR]; const char *s2; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
 #define MAXNODE 1024
@@ -353,13 +353,29 @@ static int parse_primary(void)
        ここで名前を挙げて断る。読み進まないまま上位が回ることも防げる。 */
     if (T.kind==T_ID) {
         static const char *ni[] = { "reply",
-                                    "timeout","spawn","remote", 0 };
+                                    "timeout","spawn", 0 };
         for (int i=0; ni[i]; i++) if (a2c_streq(T.s, ni[i])) {
             char m[80]; int k=0; const char *pre="not supported on this device: ";
             while(pre[k] && k<(int)sizeof m-1){ m[k]=pre[k]; k++; }
             for(int j=0; ni[i][j] && k<(int)sizeof m-1; j++) m[k++]=ni[i][j];
             m[k]=0; a2c_fail(m); return 0;
         }
+    }
+
+    /* remote("host:port", "actorName") — 他ノードのアクターを指す。
+       これ自体は値ではなく「送信先」なので、send / now の左に置いたときだけ
+       意味を持つ。式の位置に裸で書いても使い道が無いので、そこは断る。 */
+    if (T.kind==T_ID && a2c_streq(T.s,"remote")) {
+        lex_next();
+        if(!is_p("(")) { a2c_fail("remote: expected '('"); return 0; } lex_next();
+        if(T.kind!=T_STR) { a2c_fail("remote: 第1引数は \"host\" か \"host:port\" の文字列"); return 0; }
+        int h=mknode(N_STR); cpid_to(ND[h].s); lex_next();
+        if(!is_p(",")) { a2c_fail("remote: expected ','"); return 0; } lex_next();
+        if(T.kind!=T_STR) { a2c_fail("remote: 第2引数は公開名の文字列"); return 0; }
+        int a=mknode(N_STR); cpid_to(ND[a].s); lex_next();
+        if(!is_p(")")) { a2c_fail("remote: expected ')'"); return 0; } lex_next();
+        int n=mknode(N_REMOTE); ND[n].args[0]=h; ND[n].args[1]=a; ND[n].nargs=2;
+        return n;
     }
 
     /* replyto — いま処理しているメッセージの返信先。丸括弧を取らないので
@@ -670,6 +686,22 @@ static void emit_ident(const char *name)
     op_s("v_"); op_s(name);
 }
 static void emit_node(int i);
+
+/* now remote("host","name").m(a) [timeout ms [else v]]
+   期限は運びかたの側（応答待ち）に渡す。else が無ければ失敗が err のまま
+   返るので result<tau> になる。else があれば cc_value で置き換える ――
+   期限切れの扱いを1か所にまとめるため、専用の分岐は作らない。 */
+static void emit_remote_call(enode_t *e, long ms, int elsenode)
+{
+    int r = e->a;
+    if (e->nargs > 1) { a2c_fail("remote: 引数は 1 個までです"); return; }
+    if (elsenode >= 0) op_s("cc_value(");
+    op_s("cc_remote_call("); emit_node(ND[r].args[0]); op_s(", ");
+    emit_node(ND[r].args[1]); op_s(", v_str(\""); op_s(MNAME[e->mid]); op_s("\"), ");
+    if (e->nargs) emit_node(e->args[0]); else op_s("v_int(0)");
+    op_s(", v_int("); op_n(ms); op_s("))");
+    if (elsenode >= 0) { op_s(", "); emit_node(elsenode); op_c(')'); }
+}
 static void emit_args_filled(int *args,int nargs)
 { for(int k=0;k<4;k++){ op_s(", "); if(k<nargs) emit_node(args[k]); else op_s("v_int(0)"); } }
 static void emit_node(int i)
@@ -710,7 +742,11 @@ static void emit_node(int i)
         break;
     case N_PRINT: op_s("v_print("); if(e->nargs) emit_node(e->args[0]); else op_s("v_int(0)"); op_c(')'); break;
     case N_AICALL: op_s("v_ai_call("); if(e->nargs) emit_node(e->args[0]); else op_s("v_str(\"\")"); op_c(')'); break;
+    case N_REMOTE:
+        a2c_fail("remote(...) は send / now の送信先の位置でだけ書けます");
+        break;
     case N_NOW:
+        if (ND[e->a].k == N_REMOTE) { emit_remote_call(e, 2000, -1); break; }
         op_s("__now(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid);
         emit_args_filled(e->args,e->nargs); op_c(')'); break;
     case N_WAIT: op_s("cc_wait("); emit_node(e->args[0]); op_c(')'); break;
@@ -734,6 +770,7 @@ static void emit_node(int i)
         op_c(')');
         break;
     case N_NOWDL:
+        if (ND[e->a].k == N_REMOTE) { emit_remote_call(e, e->num, e->b); break; }
         op_s("__dl_call(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid);
         emit_args_filled(e->args,e->nargs);
         op_s(", "); op_n(e->num); op_s(", ");
@@ -776,6 +813,16 @@ static void emit_send(void)
     int args[4],na=0;
     if(is_p("(")){ lex_next(); while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){ if(na<4) args[na++]=parse_expr(); else parse_expr(); if(is_p(","))lex_next(); } if(is_p(")"))lex_next(); }
     if(is_p(";")) lex_next();
+    /* 送信先が remote(...) なら、こちらのメソッド番号は相手に通じない。
+       名前で送り、相手の板が自分の __method_id で解く。 */
+    if (ND[obj].k == N_REMOTE) {
+        if (na > 1) { a2c_fail("remote: 引数は 1 個までです"); return; }
+        op_s("  cc_remote_send("); emit_node(ND[obj].args[0]); op_s(", ");
+        emit_node(ND[obj].args[1]); op_s(", v_str(\""); op_s(MNAME[mid]); op_s("\"), ");
+        if (na) emit_node(args[0]); else op_s("v_int(0)");
+        op_s(");\n");
+        return;
+    }
     op_s("  enqueue(v_int_of("); emit_node(obj); op_s("), "); op_n(mid); emit_args_filled(args,na); op_s(");\n");
     /* トップレベルでは、積んだらその場で配る。Pi 3 はアクターが実プロセスなので
        send した相手が先に走る。Pi 5 は FIFO に積むだけなので、後続の now が

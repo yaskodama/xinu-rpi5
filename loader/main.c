@@ -51,6 +51,7 @@ extern unsigned long dhcp_offer_count(void);
 extern unsigned long dhcp_ack_count(void);
 extern void dhcp_get_ip(unsigned char out[4]);
 extern int  tcp_handle_packet(const unsigned char *frame, int len);
+extern int  aipl_remote_handle(const unsigned char *frame, int len);
 extern void tcp_set_mac(const unsigned char mac[6]);
 extern void tcp_set_ip(const unsigned char ip[4]);
 extern void tcp_listen(unsigned short port);
@@ -198,7 +199,8 @@ static void genet_rx_tick(void)
          * the framebuffer console is slow and printing here is what
          * historically let the ring back up to overflow. */
         if (!dhcp_handle_packet(pkt, len) &&
-            !tcp_handle_packet(pkt, len)) {
+            !tcp_handle_packet(pkt, len) &&
+            !aipl_remote_handle(pkt, len)) {     /* AIPL remote(...) = UDP/9010 */
             net_responder_handle(pkt, len);
         }
         genet_rx_release();
