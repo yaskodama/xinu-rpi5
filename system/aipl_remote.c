@@ -76,8 +76,12 @@ static int peer_lookup(const unsigned char *ip, unsigned char *mac)
    「板が生きている」ことと「電文が通っている」ことは別なので、
    推測でコードを直す前にここを見る。GET /version が出す。 */
 static unsigned long g_n_tx_q, g_n_rx_q, g_n_rx_r, g_n_rx_match, g_n_timeout;
+/* 突き合わせが外れたときに、何と何を比べたのかを残す。
+   数だけでは「番号が違う」のか「待っていなかった」のかが分かれない。 */
+static long g_dbg_seen_id = -1, g_dbg_wait_at_seen = -2;
 void aipl_remote_stats(unsigned long *o)
-{ o[0]=g_n_tx_q; o[1]=g_n_rx_q; o[2]=g_n_rx_r; o[3]=g_n_rx_match; o[4]=g_n_timeout; }
+{ o[0]=g_n_tx_q; o[1]=g_n_rx_q; o[2]=g_n_rx_r; o[3]=g_n_rx_match; o[4]=g_n_timeout;
+  o[5]=(unsigned long)g_dbg_seen_id; o[6]=(unsigned long)g_dbg_wait_at_seen; }
 
 /* ---- 待っている応答（同時に 1 本） --------------------------------------- */
 static volatile int  g_wait_id = -1;          /* 待っている reqid。-1 = 待っていない */
@@ -193,6 +197,7 @@ int aipl_remote_handle(const unsigned char *f, int len)
         int p = 2, id = 0;
         while (buf[p] >= '0' && buf[p] <= '9') { id = id * 10 + (buf[p] - '0'); p++; }
         if (buf[p] == ' ') p++;
+        g_dbg_seen_id = id; g_dbg_wait_at_seen = g_wait_id;
         if (g_wait_id == id) {
             int k = 0;
             while (buf[p] && k < (int)sizeof g_reply - 1) g_reply[k++] = buf[p++];

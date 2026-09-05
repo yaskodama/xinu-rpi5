@@ -119,6 +119,13 @@ extern const char   *tcp_state_str(void);
 static int g_rx_log_left = 2;
 static unsigned long g_rx_tick_count = 0;
 static volatile int  g_rx_busy = 0;     /* reentrancy guard: timer ISR vs wm loop */
+/* 入れ子の汲み取りが後回しにした枠。本ループが次の周で流す。
+   溢れたら落とす ―― TCP は再送するし、ARP/ICMP は次が来る。 */
+#define RX_STASH_MAX 8
+static unsigned char g_stash[RX_STASH_MAX][1600];
+static int g_stash_len[RX_STASH_MAX];
+static volatile int g_stash_n;
+
 static void genet_rx_tick(void)
 {
     /* This drains the RX ring and runs the protocol stack.  It is now
@@ -145,8 +152,33 @@ static void genet_rx_tick(void)
      * spin forever if the hardware keeps PROD ahead of CONS (which is
      * what froze the whole box — display, RX and ping — the instant a
      * TCP client connected).  Leftover frames are picked up next tick. */
+    /* 控えに積んであるものを先に流す（net_rx_pump が入れ子で拾って、
+       remote 以外だったので後回しにした枠）。 */
+    while (g_stash_n > 0) {
+        static unsigned char sb[1600]; int sl;
+        g_stash_n--;
+        sl = g_stash_len[g_stash_n];
+        for (int i = 0; i < sl; i++) sb[i] = g_stash[g_stash_n][i];
+        if (!dhcp_handle_packet(sb, sl) &&
+            !tcp_handle_packet(sb, sl) &&
+            !aipl_remote_handle(sb, sl)) {
+            net_responder_handle(sb, sl);
+        }
+    }
+
     int budget = 64;
     while (budget-- > 0 && (len = genet_rx_poll(&pkt)) > 0) {
+        /* ★ 枠を握ったまま配ってはいけない。/cc の要求はこの配りの中で
+           プログラムを走らせきるので、その間ずっと環の枠を握ることになる。
+           待ち側（remote の応答待ち）が入れ子で汲もうとしても、解放の位置が
+           ずれて環が壊れる。写してから解放し、それから配る。 */
+        {
+            static unsigned char rxcopy[1600];
+            int n = (len < 1600) ? len : 1600;
+            for (int i = 0; i < n; i++) rxcopy[i] = pkt[i];
+            genet_rx_release();
+            pkt = rxcopy; len = n;
+        }
         if (g_rx_log_left > 0) {
             /* Show buffer address + 64-byte hex dump in 16-byte rows.
              * This lets us see if real Ethernet header is hiding past
@@ -203,7 +235,7 @@ static void genet_rx_tick(void)
             !aipl_remote_handle(pkt, len)) {     /* AIPL remote(...) = UDP/9010 */
             net_responder_handle(pkt, len);
         }
-        genet_rx_release();
+        /* genet_rx_release() は配る前に済ませてある（上を見よ） */
     }
 
     { extern void tcp_conn_reap(void);        /* recycle half-open / idle slots */
@@ -254,7 +286,30 @@ static void genet_rx_tick(void)
    詰まるのと同じ理由）。待つ側が自分で回さないと、相手の応答は届いていても
    誰も拾わず、必ず期限切れになる ―― 実機でそうなった。
    g_rx_busy の番人が中にあるので、割り込みと重なっても安全に空振りする。 */
-void net_rx_pump(void) { genet_rx_tick(); }
+void net_rx_pump(void)
+{
+    /* ★ genet_rx_tick() を呼んではいけない。いま我々は「その中」にいる
+       （/cc の要求を配っている最中）ので、g_rx_busy に弾かれて何もしない。
+       それが「応答は板に届いているのに、待ち手が必ず期限切れになる」正体
+       だった（計器: rx_r=1 rx_match=0 wait_at_seen=-1）。
+       ここでは環だけを自分で汲む。取るのは remote の応答だけで、それ以外は
+       控えに積んで本ループに返す ―― いま処理中の要求の中で TCP を再入
+       させないため。 */
+    unsigned char *pkt; int len; int budget = 16;
+    while (budget-- > 0 && (len = genet_rx_poll(&pkt)) > 0) {
+        static unsigned char cp[1600];
+        int n = (len < 1600) ? len : 1600;
+        for (int i = 0; i < n; i++) cp[i] = pkt[i];
+        genet_rx_release();
+        if (!aipl_remote_handle(cp, n)) {
+            if (g_stash_n < RX_STASH_MAX) {
+                for (int i = 0; i < n; i++) g_stash[g_stash_n][i] = cp[i];
+                g_stash_len[g_stash_n] = n;
+                g_stash_n++;
+            }
+        }
+    }
+}
 
 
 /* timer_tick_hook — called from the 100 Hz timer IRQ (overrides the weak
