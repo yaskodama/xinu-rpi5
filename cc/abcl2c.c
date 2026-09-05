@@ -48,7 +48,7 @@ enum { T_EOF, T_ID, T_NUM, T_STR, T_PUNCT };
    途中から再開して壊れた（"expected expression" になる）。長さを増やし、
    それでも溢れるときは名前をつけて断る。 */
 #define TOKSTR 160
-typedef struct { int kind; char s[TOKSTR]; long num; } tok_t;
+typedef struct { int kind; char s[TOKSTR]; long num; int isflt; long fbits; } tok_t;
 
 static const char *L;          /* scan cursor (just past current token)   */
 static const char *Ts;         /* start of current token in the source    */
@@ -67,10 +67,24 @@ static void lex_next(void)
         if (L[0]=='/' && L[1]=='*') { L+=2; while (*L && !(L[0]=='*'&&L[1]=='/')) L++; if (*L) L+=2; continue; }
         break;
     }
-    Ts = L; T.kind = T_EOF; T.s[0] = 0; T.num = 0;
+    Ts = L; T.kind = T_EOF; T.s[0] = 0; T.num = 0; T.isflt = 0; T.fbits = 0;
     if (!*L) return;
     if (al(*L)) { int n=0; while (an(*L)&&n<TOKSTR-1) T.s[n++]=*L++; T.s[n]=0; T.kind=T_ID; return; }
-    if (dg(*L)) { long v=0; while (dg(*L)) v=v*10+(*L++-'0'); if (*L=='.'){L++;while(dg(*L))L++;} T.kind=T_NUM; T.num=v; return; }
+    if (dg(*L)) {
+        /* 小数部を黙って捨てていた（1.5 が 1 になっていた）。
+           浮動小数は値ランタイムの v_floatlit(ビット列) へ渡すので、
+           ここで IEEE-754 の 64 ビット表現まで作る。 */
+        long v=0; while (dg(*L)) v=v*10+(*L++-'0');
+        T.kind=T_NUM; T.num=v; T.isflt=0;
+        if (*L=='.') {
+            L++;
+            double d=(double)v, scale=0.1;
+            while (dg(*L)) { d += (double)(*L-'0')*scale; scale*=0.1; L++; }
+            union { double d; long i; } u; u.d=d;
+            T.isflt=1; T.fbits=u.i;
+        }
+        return;
+    }
     if (*L=='"') {
         L++; int n=0, over=0;
         /* 溢れても閉じ引用符までは必ず読み進める。ここで止まると、この先の
@@ -188,7 +202,21 @@ static int parse_structure(const char *src)
         if(!is_p("{")) return a2c_fail("class: expected '{'");
         lex_next();
         while(!is_p("}") && T.kind!=T_EOF && !a2c_err[0]) {
-            if (is_kw("var")) {
+            if (is_kw("float")) {                 /* float g = 1.5; */
+                lex_next(); if(T.kind!=T_ID) return a2c_fail("float field: expected name");
+                if(c->nfield>=MAXFIELD) return a2c_fail("too many fields");
+                cpid(c->field[c->nfield]); lex_next();
+                long fb = 0;
+                if(is_p("=")){ lex_next();
+                    int neg=0; if(is_p("-")){ neg=1; lex_next(); }
+                    if(T.kind!=T_NUM) return a2c_fail("float field: expected a number");
+                    if(T.isflt) fb = neg ? (T.fbits ^ (1L<<63)) : T.fbits;
+                    else { union { double d; long i; } u; u.d = (double)(neg ? -T.num : T.num); fb = u.i; }
+                    lex_next(); }
+                c->finit[c->nfield]=fb; c->finit_bool[c->nfield]=2;   /* 2 = 浮動小数 */
+                c->nfield++; if(c->nfield>MAXF) MAXF=c->nfield;
+                if(is_p(";")) lex_next(); else return a2c_fail("float field: expected ';'");
+            } else if (is_kw("var")) {
                 lex_next(); if(T.kind!=T_ID) return a2c_fail("field: expected name");
                 if(c->nfield>=MAXFIELD) return a2c_fail("too many fields");
                 cpid(c->field[c->nfield]); long init=0; int isb=0; lex_next();
@@ -286,9 +314,9 @@ static sel_t SEL[MAXSEL]; static int NSEL;
 static int  SELFIELD[MAXCLASS];        /* __sel の隠しフィールド番号。-1 = 無し */
 
 /* ---- expression AST ----------------------------------------------- */
-enum { N_NIL, N_INT, N_BOOL, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_FUT, N_AWAIT, N_AWAITDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN };
+enum { N_NIL, N_INT, N_BOOL, N_STR, N_ID, N_NEW, N_NOW, N_NOWDL, N_FUT, N_AWAIT, N_AWAITDL, N_PRINT, N_AICALL, N_WEB, N_WAIT, N_BIN, N_UN, N_RT, N_SELFCALL, N_FLT };
 enum { O_ADD,O_SUB,O_MUL,O_DIV,O_LT,O_LE,O_GT,O_GE,O_EQ,O_NE,O_AND,O_OR,O_NOT,O_NEG };
-typedef struct { int k; long num; char s[TOKSTR]; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
+typedef struct { int k; long num; char s[TOKSTR]; const char *s2; int op; int a,b; int ci,mid; int args[4]; int nargs; } enode_t;
 #define MAXNODE 1024
 static enode_t ND[MAXNODE]; static int NND;
 static int mknode(int k){ if(NND>=MAXNODE) { a2c_fail("expression too large"); return 0; } int i=NND++; ND[i].k=k; ND[i].nargs=0; return i; }
@@ -318,7 +346,10 @@ static int parse_primary(void)
         }
     }
 
-    if (T.kind==T_NUM) { int n=mknode(N_INT); ND[n].num=T.num; lex_next(); return n; }
+    if (T.kind==T_NUM) {
+        if (T.isflt) { int n=mknode(N_FLT); ND[n].num=T.fbits; lex_next(); return n; }
+        int n=mknode(N_INT); ND[n].num=T.num; lex_next(); return n;
+    }
     if (T.kind==T_STR) { int n=mknode(N_STR); cpid_to(ND[n].s); lex_next(); return n; }
     /* 真偽値リテラル。このバックエンドは bool を int で持つので 1 / 0 に写す。
        以前はキーワードでなかったため識別子として素通しし、未定義の v_true を
@@ -402,6 +433,23 @@ static int parse_primary(void)
                サーバに載る。web_expose の第2引数はトップレベルの var 名で、
                板はアクター番号で持つので、ここで名前を解決して番号を渡す。 */
             int isweb   = (a2c_streq(nm,"web_listen") || a2c_streq(nm,"web_expose"));
+            /* 配列。値ランタイムは元からリストを持っている（v_list_*）ので、
+               前段が名前を結線するだけでよい。正典の名前へ写す。 */
+            const char *rtfn = 0;
+            if      (a2c_streq(nm,"array_empty")) rtfn = "v_list_new";
+            else if (a2c_streq(nm,"array_push"))  rtfn = "v_list_push";
+            else if (a2c_streq(nm,"array_get"))   rtfn = "v_list_get";
+            else if (a2c_streq(nm,"array_set"))   rtfn = "v_list_set";
+            else if (a2c_streq(nm,"array_len"))   rtfn = "v_list_len";
+            else if (a2c_streq(nm,"array_zeros")) rtfn = "v_list_zeros";
+            if (rtfn) {
+                int n=mknode(N_RT); ND[n].s2 = rtfn; lex_next();
+                while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){
+                    if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr();
+                    if(is_p(","))lex_next(); }
+                if(is_p(")"))lex_next();
+                return n;
+            }
             if (isweb) {
                 int n=mknode(N_WEB); ND[n].num = a2c_streq(nm,"web_expose"); lex_next();
                 while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){
@@ -428,6 +476,20 @@ static int parse_primary(void)
                 if(is_p(")"))lex_next();
                 if(ND[n].nargs != 1) { a2c_fail("wait: expected (milliseconds)"); return 0; }
                 return n;
+            }
+            /* 自分のクラスのメソッドなら、その場で呼ぶ（正典の `call g();` と
+               裸の `g();` の両方がここへ来る）。dispatch を通さず直接呼べる。 */
+            if (!isprint && !isai && CC >= 0) {
+                for (int k=0; k<CLS[CC].nmethod; k++) {
+                    if (a2c_streq(CLS[CC].method[k].name, nm)) {
+                        int n=mknode(N_SELFCALL); ND[n].mid = k; lex_next();
+                        while(!is_p(")")&&T.kind!=T_EOF&&!a2c_err[0]){
+                            if(ND[n].nargs<4) ND[n].args[ND[n].nargs++]=parse_expr(); else parse_expr();
+                            if(is_p(","))lex_next(); }
+                        if(is_p(")"))lex_next();
+                        return n;
+                    }
+                }
             }
             if (!isprint && !isai) {
                 char m[96]; int k=0;
@@ -578,6 +640,8 @@ static void emit_node(int i)
     case N_INT: op_s("v_int("); op_n(e->num); op_c(')'); break;
     /* 真偽値は専用の値にする。印字で true / false に戻すため（正典どおり）。 */
     case N_BOOL: op_s("v_bool("); op_n(e->num); op_c(')'); break;
+    /* 浮動小数は IEEE-754 の 64 ビット表現を渡す（値ランタイムの v_floatlit）。 */
+    case N_FLT: op_s("v_floatlit("); op_n(e->num); op_c(')'); break;
     case N_STR: op_s("v_str(\""); op_s(e->s); op_s("\")"); break;
     case N_ID:  emit_ident(e->s); break;
     case N_NEW: {
@@ -593,6 +657,13 @@ static void emit_node(int i)
             emit_args_filled(e->args, e->nargs); op_s("))");
         } else { op_s("v_int(g_spawn("); op_n(e->ci); op_s("))"); }
         break; }
+    /* 配列: 値ランタイムのリストへそのまま写す */
+    case N_RT: op_s(e->s2); op_c('('); for(int i=0;i<e->nargs;i++){ if(i) op_s(", "); emit_node(e->args[i]); } op_c(')'); break;
+    /* 自分のクラスのメソッドを直接呼ぶ */
+    case N_SELFCALL:
+        op_s("m_"); op_s(CLS[CC].name); op_c('_'); op_s(CLS[CC].method[e->mid].name);
+        op_s("(self"); emit_args_filled(e->args, e->nargs); op_c(')');
+        break;
     case N_PRINT: op_s("v_print("); if(e->nargs) emit_node(e->args[0]); else op_s("v_int(0)"); op_c(')'); break;
     case N_AICALL: op_s("v_ai_call("); if(e->nargs) emit_node(e->args[0]); else op_s("v_str(\"\")"); op_c(')'); break;
     case N_NOW: op_s("dispatch(v_int_of("); emit_node(e->a); op_s("), "); op_n(e->mid); emit_args_filled(e->args,e->nargs); op_c(')'); break;
@@ -645,6 +716,9 @@ static void emit_block(void)             /* T must be '{' */
 static void emit_send(void)
 {
     lex_next();                          /* past 'send' */
+    /* `send!` は「検査を緩めた送信」。この装置は静的検査をしないので、
+       配送の意味は `send` と同じ。字句では '!' が別トークンで来るので飛ばす。 */
+    if (is_p("!")) lex_next();
     int obj=parse_primary();
     if(!is_p(".")){ a2c_fail("send: expected .method"); return; } lex_next();
     if(T.kind!=T_ID){ a2c_fail("send: expected method"); return; }
@@ -688,6 +762,9 @@ static void emit_stmt(void)
         return;
     }
     if (is_kw("send")) { emit_send(); return; }
+    /* `call g(args);` — 正典では自分のメソッドを呼ぶ文。裸の `g(args);` と同じ意味
+       なので、キーワードを読み飛ばして式として扱う。 */
+    if (is_kw("call")) lex_next();
     /* reply(e) — この装置では戻り値そのもの。`now o.m()` は dispatch の
        返り値を受けるので return と同じ。後ろに文が続くと意味がずれるので断る。 */
     if (is_kw("reply")) {
@@ -758,7 +835,8 @@ static void emit_program(void)
     for (int ci=0; ci<NCLS; ci++) {
         op_s("  if (cls == "); op_n(ci); op_s(") {\n");
         for (int f=0; f<CLS[ci].nfield; f++){ op_s("    g_obj[id].f["); op_n(f);
-            op_s(CLS[ci].finit_bool[f] ? "] = v_bool(" : "] = v_int(");
+            op_s(CLS[ci].finit_bool[f] == 2 ? "] = v_floatlit("
+               : CLS[ci].finit_bool[f]      ? "] = v_bool(" : "] = v_int(");
             op_n(CLS[ci].finit[f]); op_s(");\n"); }
         op_s("  }\n");
     }

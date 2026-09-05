@@ -151,6 +151,11 @@ obj/pi5 obj/pi4 obj/qemu:
 PI5_FP_CFLAGS  := $(filter-out -mgeneral-regs-only,$(PI5_CFLAGS))
 PI4_FP_CFLAGS  := $(filter-out -mgeneral-regs-only,$(PI4_CFLAGS))
 QEMU_FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(QEMU_CFLAGS))
+# abcl2c.c は浮動小数リテラルを IEEE-754 のビット列に直すので、cc.o と同じく
+# FP を有効にしてビルドする（整数専用だと double が使えない）。
+obj/pi5/abcl2c.o:  abcl2c.c | obj/pi5  ; $(CC) $(PI5_FP_CFLAGS)  -c $< -o $@
+obj/pi4/abcl2c.o:  abcl2c.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
+obj/qemu/abcl2c.o: abcl2c.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
 obj/pi5/cc.o:  cc.c | obj/pi5  ; $(CC) $(PI5_FP_CFLAGS)  -c $< -o $@
 obj/pi4/cc.o:  cc.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
 obj/qemu/cc.o: cc.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
