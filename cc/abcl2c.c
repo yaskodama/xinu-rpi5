@@ -745,8 +745,15 @@ static void emit_program(void)
          "  return r;\n}\n");
     /* アクタを作れなかったら黙って -1 を返さず、はっきり言う。
        黙ると「なぜか動かない」になり、実機では領域外参照まで進む。 */
+    /* 作った id の範囲を覚える。__sel_sweep がここだけを見るため
+       （以前は g_obj の添字 0..1023 を舐めていた。実在しない添字まで触るのは
+       この一箇所だけで、ベアメタルでは何が起きるか分からない）。 */
+    op_s("int g_idlo; int g_idhi;\n");
     op_s("int g_spawn(int cls) {\n  int id; id = cc_actor_new();\n"
-         "  if (id < 0) { v_print(v_str(\"cc: アクタを作れませんでした（資源不足）\")); return -1; }\n");
+         "  if (id < 0) { v_print(v_str(\"cc: アクタを作れませんでした（資源不足）\")); return -1; }\n"
+         "  if (g_nobj == 0) { g_idlo = id; g_idhi = id; }\n"
+         "  if (id < g_idlo) { g_idlo = id; }\n"
+         "  if (id > g_idhi) { g_idhi = id; }\n");
     op_s("  g_nobj = g_nobj + 1;\n  g_obj[id].cls = cls;\n");
     for (int ci=0; ci<NCLS; ci++) {
         op_s("  if (cls == "); op_n(ci); op_s(") {\n");
@@ -815,7 +822,7 @@ static void emit_program(void)
             }
             op_s("  return v_int(0);\n}\n\n");
         }
-        op_s("int __sel_sweep() {\n  int i;\n  i = 0;\n  while (i < 1024) {\n");
+        op_s("int __sel_sweep() {\n  int i;\n  i = g_idlo;\n  while (i <= g_idhi) {\n");
         for (int i=0;i<NSEL;i++) {
             if (!SEL[i].tbody) continue;
             sel_t *sp = &SEL[i];
