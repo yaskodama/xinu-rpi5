@@ -197,6 +197,9 @@ kexec /microsd/KERNEL~1.IMG # カード上のフル OS へ
 | `/microsd/write/<NAME>` (POST) | microSD へ永続書き込み（§5）|
 | `/usb/...` | USB の列挙・診断（§10）|
 | `/api/actors`, `/send?to=&m=` | アクタ／AIPL ゲートウェイ |
+| `/cc` (POST) | **AIPL または C を投げて、その場でコンパイル・実行**（§8.1）|
+| `/api/x/<path>?method=&args=` | `web_expose` で公開したアクタを叩く（§8.1）|
+| `/smp-bench?n=<N>` | 4 コアの素数カウント・ベンチ |
 
 ```sh
 curl 'http://192.168.3.101/run?cmd=ls%20/microsd'
@@ -206,6 +209,49 @@ curl 'http://192.168.3.101/run?cmd=wifi%20status'
 
 **補足**：URL 中の空白は `%20` もしくは `+` でエンコードする。出力バッファには上限が
 あるため、長い結果は分割される。
+
+### 8.1 AIPL を投げて動かす（`POST /cc`）
+
+**AIPL のソースをそのまま投げられる。** 本文の最初の語（空白とコメントを読み飛ばして）
+が `class` なら機内の前段 `abcl2c` が C に直し、そうでなければ C として扱う。
+どちらも機内の C コンパイラが AArch64 の機械語に JIT して実行し、
+**プログラムの出力がそのまま応答に返る**。
+
+```sh
+curl --data-binary @g1_hello.aipl http://192.168.3.101/cc
+  hello, AIPL
+  tick 1
+  tick 2
+  => 0
+```
+
+- **正典ガイド 10 本がそのまま動く**（`select`・`timeout` つき `wait`・`ai_call`・
+  真偽値の `true`/`false` 表示まで一致）。詳細は AIPL ユーザーズガイド第39章。
+- **前のプログラムは置き換わる。** 公開ルート（`web_expose`）もプログラムと寿命を共にする。
+- **連続で投げるときは 3 秒ほど空ける。** 詰めると HTTP が返らなくなることがある
+  （板は生きている）。
+- 暴走は時間で打ち切られる。`wait(ms)` は使えるが、1 回の実行で眠れる合計は 10 秒まで。
+
+外部公開したアクタには、あとから HTTP で届く。
+
+```sh
+curl --data-binary @g5_web.aipl http://192.168.3.101/cc
+curl 'http://192.168.3.101/api/x/echo?method=say&args=hi'
+  => echo: hi
+```
+
+### 8.2 機内の小型言語モデル（`ai_call`）
+
+カーネルに小型モデル（Karpathy `stories260K`）を焼き込んであり、
+AIPL から `ai_call(prompt)` で呼べる。**機外へは一切出ない。**
+
+```sh
+curl --data-binary @sage.aipl http://192.168.3.101/cc
+  , there was a little girl named Lily. She loved to play outside in the p
+```
+
+1 回およそ **0.42 秒**。Pi 3・Pi 4・Mac の参照実装と**同じ生成文**になる。
+シェルからは `llm <prompt>` でも呼べる（§7）。
 
 ----------------------------------------------------------------------
 

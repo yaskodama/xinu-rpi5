@@ -202,6 +202,9 @@ or similar.
 | `/microsd/write/<NAME>` (POST) | persistent write to microSD (§5) |
 | `/usb/...` | USB enumeration and diagnostics (§10) |
 | `/api/actors`, `/send?to=&m=` | actor / AIPL gateway |
+| `/cc` (POST) | **post AIPL or C; compile and run it on the spot** (§8.1) |
+| `/api/x/<path>?method=&args=` | reach an actor published with `web_expose` (§8.1) |
+| `/smp-bench?n=<N>` | four-core prime-count benchmark |
 
 ```sh
 curl 'http://192.168.3.101/run?cmd=ls%20/microsd'
@@ -211,6 +214,54 @@ curl 'http://192.168.3.101/run?cmd=wifi%20status'
 
 **Note**: encode spaces in the URL as `%20` or `+`. The output buffer is
 bounded, so long results are split.
+
+### 8.1 Posting AIPL to run it (`POST /cc`)
+
+**You can post AIPL source directly.** If the first word of the body (after
+skipping whitespace and comments) is `class`, the on-board front end `abcl2c`
+lowers it to C; otherwise the body is treated as C. Either way the in-kernel C
+compiler JITs it to AArch64 and runs it, and **the program's output comes back
+in the reply**.
+
+```sh
+curl --data-binary @g1_hello.aipl http://192.168.3.101/cc
+  hello, AIPL
+  tick 1
+  tick 2
+  => 0
+```
+
+- **All ten canonical guide samples run as written** — including `select`,
+  `wait` with a deadline, `ai_call`, and printing booleans as `true`/`false`.
+  See chapter 39 of the AIPL user's guide.
+- **A new program replaces the previous one.** Published routes (`web_expose`)
+  live and die with the program.
+- **Leave about 3 s between posts.** Back-to-back requests can leave HTTP
+  unanswered (the board itself stays alive).
+- Runaway code is cut off on a wall clock. `wait(ms)` works, but the total
+  sleep in one run is capped at 10 s.
+
+An actor published to the outside is reachable over HTTP afterwards.
+
+```sh
+curl --data-binary @g5_web.aipl http://192.168.3.101/cc
+curl 'http://192.168.3.101/api/x/echo?method=say&args=hi'
+  => echo: hi
+```
+
+### 8.2 The on-board language model (`ai_call`)
+
+A small model (Karpathy's `stories260K`) is baked into the kernel and callable
+from AIPL as `ai_call(prompt)`. **Nothing leaves the board.**
+
+```sh
+curl --data-binary @sage.aipl http://192.168.3.101/cc
+  , there was a little girl named Lily. She loved to play outside in the p
+```
+
+About **0.42 s** per call, and it produces **the same text** as the Pi 3, the
+Pi 4 and the Mac reference implementation. The shell command `llm <prompt>`
+calls it too (§7).
 
 ----------------------------------------------------------------------
 
