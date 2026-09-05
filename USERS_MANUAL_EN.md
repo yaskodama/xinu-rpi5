@@ -294,6 +294,12 @@ Q <reqid> <actor> <method> <arg...>
 R <reqid> <value>
 ```
 
+
+**Registering the callee.** The actor a `remote(...)` call names must be
+**resident** on the board. On the Pi 4, post it with `POST /cc?resident=1`
+(a plain `POST /cc` runs and is done, so nothing is left for an outside caller
+to reach and the reply is `err`). On the Pi 5 a plain `POST /cc` is enough.
+
 - What travels is the method **name**, not its number: numbers differ per board,
   so the receiving board resolves the name with its own `__method_id`.
 - One argument. A string of digits arrives as an integer on the other side
