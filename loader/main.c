@@ -12,6 +12,7 @@
 // has time to read it before resetting the board.
 
 #include "uart.h"
+#include <critical.h>   /* irq_save / irq_restore（環の取り出しを割り込みと分ける） */
 #include "shell.h"
 #include "memory.h"
 #include "proc.h"
@@ -121,6 +122,15 @@ static unsigned long g_rx_tick_count = 0;
 static volatile int  g_rx_busy = 0;     /* reentrancy guard: timer ISR vs wm loop */
 /* 入れ子の汲み取りが後回しにした枠。本ループが次の周で流す。
    溢れたら落とす ―― TCP は再送するし、ARP/ICMP は次が来る。 */
+/* remote の応答を待っているあいだだけ開ける窓。
+   ★ /cc のプログラムは genet_rx_tick() の「中」で走りきる。その間 g_rx_busy が
+     立っているので 100Hz の割り込みが環を汲めず、応答は溜まったまま実行終了後に
+     処理される（計器: retx=14 rx_r=15 rx_match=0 pump_frames=1）。
+     待っているあいだだけ g_rx_busy を降ろして割り込みに汲ませる。ただし
+     いま TCP の要求を処理している最中なので、この窓では remote 以外は
+     配らず控えに積む ―― TCP を再入させないため。 */
+static volatile int g_rx_remote_only;
+
 #define RX_STASH_MAX 8
 static unsigned char g_stash[RX_STASH_MAX][1600];
 static int g_stash_len[RX_STASH_MAX];
@@ -175,10 +185,15 @@ static void genet_rx_tick(void)
         {
             static unsigned char rxcopy[1600];
             int n = (len < 1600) ? len : 1600;
+            unsigned long d = irq_save();
             for (int i = 0; i < n; i++) rxcopy[i] = pkt[i];
             genet_rx_release();
+            irq_restore(d);
             pkt = rxcopy; len = n;
         }
+        /* 注: poll と release の間で割り込みに割られると二重に取り出す。
+           窓を開けているあいだは割り込み側も汲むので、そこは下の
+           net_rx_pump / この取り出しの両方で irq_save して分けてある。 */
         if (g_rx_log_left > 0) {
             /* Show buffer address + 64-byte hex dump in 16-byte rows.
              * This lets us see if real Ethernet header is hiding past
@@ -230,7 +245,17 @@ static void genet_rx_tick(void)
          * IMPORTANT: keep this loop free of per-packet uart_puts() —
          * the framebuffer console is slow and printing here is what
          * historically let the ring back up to overflow. */
-        if (!dhcp_handle_packet(pkt, len) &&
+        if (g_rx_remote_only) {
+            /* remote の応答待ちの窓。ここで TCP を配ると、いま処理中の要求の
+               中で TCP を再入することになる。remote だけ取り、他は控えへ。 */
+            if (!aipl_remote_handle(pkt, len)) {
+                if (g_stash_n < RX_STASH_MAX) {
+                    for (int i = 0; i < len; i++) g_stash[g_stash_n][i] = pkt[i];
+                    g_stash_len[g_stash_n] = len;
+                    g_stash_n++;
+                }
+            }
+        } else if (!dhcp_handle_packet(pkt, len) &&
             !tcp_handle_packet(pkt, len) &&
             !aipl_remote_handle(pkt, len)) {     /* AIPL remote(...) = UDP/9010 */
             net_responder_handle(pkt, len);
@@ -291,6 +316,13 @@ static void genet_rx_tick(void)
 static unsigned long g_pump_calls, g_pump_frames;
 void net_rx_pump_stats(unsigned long *o) { o[0]=g_pump_calls; o[1]=g_pump_frames; }
 
+void net_rx_remote_window(int on)
+{
+    g_rx_remote_only = on ? 1 : 0;
+    if (on) g_rx_busy = 0;                /* 割り込みに汲ませる */
+    else    g_rx_busy = 1;                /* 外側の genet_rx_tick に戻す */
+}
+
 void net_rx_pump(void)
 {
     g_pump_calls++;
@@ -302,12 +334,17 @@ void net_rx_pump(void)
        控えに積んで本ループに返す ―― いま処理中の要求の中で TCP を再入
        させないため。 */
     unsigned char *pkt; int len; int budget = 16;
-    while (budget-- > 0 && (len = genet_rx_poll(&pkt)) > 0) {
-        g_pump_frames++;
+    for (;;) {
         static unsigned char cp[1600];
-        int n = (len < 1600) ? len : 1600;
+        int n;
+        unsigned long d = irq_save();     /* poll と release の間で割られない */
+        len = genet_rx_poll(&pkt);
+        if (len <= 0 || budget-- <= 0) { irq_restore(d); break; }
+        g_pump_frames++;
+        n = (len < 1600) ? len : 1600;
         for (int i = 0; i < n; i++) cp[i] = pkt[i];
         genet_rx_release();
+        irq_restore(d);
         if (!aipl_remote_handle(cp, n)) {
             if (g_stash_n < RX_STASH_MAX) {
                 for (int i = 0; i < n; i++) g_stash[g_stash_n][i] = cp[i];
