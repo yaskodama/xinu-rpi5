@@ -563,7 +563,11 @@ static unsigned long  g_lastact[ACT_MAX];      /* cc_now() of last dispatch */
 static char           g_clsname[ACT_MAX][16];  /* class name snapshot (for the window) */
 static unsigned long  g_gc_runs, g_gc_killed;  /* lifetime GC tallies */
 
-struct cc_msg { long to, mid, a0, a1, a2, a3; };
+/* from を持つのは `sender` のため。正典の `send sender.m();` は「いま処理して
+   いるメッセージを送ってきたアクター」へ送る。以前は前段が `v_sender` という
+   識別子をそのまま出しており、C の段で `cc: undefined variable` になっていた
+   ―― 翻訳は通るのに動かない、という一番たちの悪い形だった。 */
+struct cc_msg { long to, mid, a0, a1, a2, a3, from; };
 static struct cc_msg g_mq[MQ_MAX];
 static int g_qh, g_qt;
 
@@ -610,6 +614,12 @@ static long cc_actor_suicide(long self_v)
     if (id >= 0 && id < ACT_MAX) g_alive[id] = 0;
     return v_int(0);
 }
+/* いま走っているアクター（送り主）と、いま処理しているメッセージの送り主。
+   トップレベルは -1（正典でも sender は「誰か」を指さない）。 */
+static long g_cur_actor = -1;
+static long g_sender    = -1;
+static long cc_sender(void) { return v_int(g_sender); }
+
 static void cc_enqueue(long to, long mid, long a0, long a1, long a2, long a3)
 {
     int t = (int)to;
@@ -618,6 +628,7 @@ static void cc_enqueue(long to, long mid, long a0, long a1, long a2, long a3)
     if (nx == g_qh) return;                      /* mailbox full: drop */
     g_mq[g_qt].to=to; g_mq[g_qt].mid=mid;
     g_mq[g_qt].a0=a0; g_mq[g_qt].a1=a1; g_mq[g_qt].a2=a2; g_mq[g_qt].a3=a3;
+    g_mq[g_qt].from = g_cur_actor;               /* 送り主を控える */
     g_qt = nx;
 }
 static void cc_pump(void)
@@ -628,7 +639,13 @@ static void cc_pump(void)
         int t = (int)m.to;
         if (g_dispatch && t >= 0 && t < ACT_MAX && g_alive[t]) {
             g_lastact[t] = cc_now();
+            /* このメッセージを処理しているあいだ、sender は送り主、
+               「いま走っているアクター」は受け手である。入れ子で dispatch を
+               呼ぶ経路（now）があるので、必ず退避して戻す。 */
+            long sv_s = g_sender, sv_c = g_cur_actor;
+            g_sender = m.from; g_cur_actor = m.to;
             g_dispatch(m.to, m.mid, m.a0, m.a1, m.a2, m.a3);
+            g_sender = sv_s; g_cur_actor = sv_c;
         }
     }
 }
@@ -751,17 +768,25 @@ static void cc_res_report(void)
 static int g_rstack[16];
 static int g_rsp = 0;
 
+static long g_sstack[16][2];
+static int  g_ssp = 0;
+
 static long cc_now_push(void)
 {
     int slot = rslot_alloc();
     if (g_rsp < 16) g_rstack[g_rsp++] = g_rcur;
     g_rcur = slot;
+    /* 同期呼び出しでも、呼ばれた側から見た sender は呼び出し元である。
+       宛先はここでは分からないので、いま走っているアクターだけを控える。 */
+    if (g_ssp < 16) { g_sstack[g_ssp][0] = g_sender; g_sstack[g_ssp][1] = g_cur_actor; g_ssp++; }
+    g_sender = g_cur_actor;
     return v_int(0);
 }
 static long cc_now_pop(long r)
 {
     int slot = g_rcur;
     g_rcur = (g_rsp > 0) ? g_rstack[--g_rsp] : -1;
+    if (g_ssp > 0) { g_ssp--; g_sender = g_sstack[g_ssp][0]; g_cur_actor = g_sstack[g_ssp][1]; }
     if (slot < 0) return r;
     if (!g_rslot[slot].taken) { rslot_free(slot); return r; }  /* 従来どおり */
 
@@ -990,6 +1015,19 @@ static long v_m_neg  (long a) { if (v_is_int(a)) return v_int(-v_int_of(a));
  * 観測はこの二つだけ。value(r, 既定) は失敗のとき既定を返す。 */
 static long cc_is_ok(long r)          { return v_bool(!v_is_err(r)); }
 static long cc_value(long r, long dflt) { return v_is_err(r) ? dflt : r; }
+/* timed_out(r) — result の失敗かどうか。is_ok の裏返しだが、正典では
+   これも観測子として名前がある。 */
+static long cc_timed_out(long r) { return v_bool(v_is_err(r)); }
+/* typeof(x) — 実行時の型を文字列で返す。綴りは正典に合わせる。 */
+static long cc_typeof(long w)
+{
+    if (v_is_bool(w))  return v_str("bool");
+    if (v_is_err(w))   return v_str("unit");   /* 失敗した result は値を持たない */
+    if (v_is_float(w)) return v_str("float");
+    if (v_is_list(w))  return v_str("array");
+    if (v_is_str(w))   return v_str("string");
+    return v_str("int");
+}
 
 /* ---- future / await ------------------------------------------------------
  * `var f = future o.m(x); ... var v = await f;`
@@ -1444,6 +1482,9 @@ unsigned long cc_resolve_extern(const char *name)
         { "v_m_round", (void *)&v_m_round }, { "v_m_abs",   (void *)&v_m_abs   },
         { "v_m_neg",   (void *)&v_m_neg   },
         { "cc_value",         (void *)&cc_value          },
+        { "cc_timed_out",     (void *)&cc_timed_out      },
+        { "cc_typeof",        (void *)&cc_typeof         },
+        { "cc_sender",        (void *)&cc_sender         },
         { "v_err",            (void *)&v_err             },
         { "cc_sel_arg",       (void *)&cc_sel_arg        },
         { "cc_actor_count",   (void *)&cc_actor_count    },

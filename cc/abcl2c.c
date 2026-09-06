@@ -378,6 +378,12 @@ static int parse_primary(void)
         return n;
     }
 
+    /* sender — いま処理しているメッセージの送り主。丸括弧を取らない。
+       ★ 以前はここを素通ししていたので `v_sender` という識別子が出て、
+         翻訳は通るのに C の段で `cc: undefined variable` になっていた。 */
+    if (T.kind==T_ID && a2c_streq(T.s,"sender")) {
+        int n=mknode(N_RT); ND[n].s2="cc_sender"; ND[n].nargs=0; lex_next(); return n;
+    }
     /* replyto — いま処理しているメッセージの返信先。丸括弧を取らないので
        他の組込みとは別に扱う。 */
     if (T.kind==T_ID && a2c_streq(T.s,"replyto")) {
@@ -498,6 +504,9 @@ static int parse_primary(void)
             else if (a2c_streq(nm,"neg"))   rtfn = "v_m_neg";
             if      (a2c_streq(nm,"is_ok")) rtfn = "cc_is_ok";
             else if (a2c_streq(nm,"value")) rtfn = "cc_value";
+            /* result の第三の観測子と、実行時の型 */
+            else if (a2c_streq(nm,"timed_out")) rtfn = "cc_timed_out";
+            else if (a2c_streq(nm,"typeof"))    rtfn = "cc_typeof";
             /* 返信先の一級性と資源の順序（正典 第3段） */
             else if (a2c_streq(nm,"answer"))  rtfn = "cc_answer";
             else if (a2c_streq(nm,"acquire")) rtfn = "cc_acquire";
