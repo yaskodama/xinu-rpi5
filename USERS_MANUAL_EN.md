@@ -252,12 +252,22 @@ curl 'http://192.168.3.101/api/x/echo?method=say&args=hi'
 
 #### How much of AIPL runs here
 
-The canonical language is split into 25 features, each checked on this board
-(only programs that pass the canonical checker `tc` are posted). **All 25 run, `spawn` included.**
+Checked against the **sources** of the canonical language — the keywords in
+`src/lexer.mll`, the builtin table in `src/typing_env.ml`, and the effect table
+in the user's guide. Only programs that pass the canonical checker `tc` are posted.
+
+> This used to say "25 of 25". That 25 was a split **made up here**, not read off
+> the sources; counting again turned up `sender`, `timed_out`, `typeof` and
+> `float` field declarations, all missing. Count from the sources.
 
 | Feature | Runs | Notes |
 |---|---|---|
 | `class` / `method` / `var` / fields | yes | |
+| `float x = 1.5;` (a field declaration) | yes | `float` is a reserved word, distinct from `var` |
+| `sender` | yes | who sent the message being handled; `send sender.m();` |
+| `timed_out(r)` | yes | the third observer of a `result` (with `is_ok` / `value`) |
+| `typeof(x)` | yes | `int` / `float` / `bool` / `string` / `array` / `unit` |
+| `neg(x)` | yes | canonically both `int -> int` and `float -> float` |
 | `new` / `init` / `send` / `send!` | yes | `new` always calls `init` |
 | `now` / `future` / `await` / deadlines | yes | |
 | `select` / `case` / `timeout` | yes | interception spliced at the top of the awaited method |

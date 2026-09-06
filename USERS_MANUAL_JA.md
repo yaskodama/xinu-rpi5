@@ -243,12 +243,22 @@ curl 'http://192.168.3.101/api/x/echo?method=say&args=hi'
 
 #### AIPL のどこまでが動くか
 
-正典 AIPL の機能を 25 に分けて、この装置で確かめてある（正典の型検査器 `tc` を
-通したものだけを投げている）。**25／25 動く（`spawn` を含め、すべて）。**
+正典 AIPL の\*\*出典\*\*（`src/lexer.mll` のキーワード、`src/typing_env.ml` の
+組込み一覧、ユーザーズガイドの効果表）と突き合わせて、この装置で確かめてある。
+投げているのは正典の型検査器 `tc` を通したものだけ。
+
+> 以前ここには「25 機能中 25」と書いていたが、その 25 は\*\*こちらで切った区切り\*\*で、
+> 出典に当たったものではなかった。数え直したところ `sender` / `timed_out` /
+> `typeof` / `float` のフィールド宣言が落ちていた。数は出典から数えること。
 
 | 機能 | 可否 | 備考 |
 |---|---|---|
 | `class` / `method` / `var` / フィールド | ○ | |
+| `float x = 1.5;`（フィールド宣言） | ○ | 正典では `float` は予約語で `var` とは別 |
+| `sender` | ○ | いま処理しているメッセージの送り主。`send sender.m();` |
+| `timed_out(r)` | ○ | `result` の第三の観測子（`is_ok` / `value` と対） |
+| `typeof(x)` | ○ | `int` / `float` / `bool` / `string` / `array` / `unit` |
+| `neg(x)` | ○ | 正典では `int -> int` と `float -> float` の両方 |
 | `new` / `init` / `send` / `send!` | ○ | `new` は `init` を必ず呼ぶ |
 | `now` / `future` / `await` / 期限 | ○ | |
 | `select` / `case` / `timeout` | ○ | 相手のメソッド先頭に横取りを差し込む |
