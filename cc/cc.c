@@ -400,6 +400,10 @@ static const char *v_render(long w, char *buf, int cap)
         double d = v_to_float(w);
         int i = 0;
         if (d < 0) { buf[i++] = '-'; d = -d; }
+        /* ★ 小数 6 桁で丸める。切り捨てのままだと exp(1) が 2.718281 になり、
+           正典の参照実装（%.6f は四捨五入）と 1 桁ずれる。桁上がりは整数部へ
+           繰り上がるので、足してから ip を取ること。 */
+        d += 0.0000005;
         long ip = (long)d;
         char t[24]; int n = 0; unsigned long u = (unsigned long)ip;
         if (u == 0) t[n++] = '0';
