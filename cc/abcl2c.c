@@ -486,6 +486,10 @@ static int parse_primary(void)
             else if (a2c_streq(nm,"array_set"))   rtfn = "v_list_set";
             else if (a2c_streq(nm,"array_len"))   rtfn = "v_list_len";
             else if (a2c_streq(nm,"array_zeros")) rtfn = "v_list_zeros";
+            /* メッシュの三つ。宛先を書かずに撒くので、引数に住所は出てこない。 */
+            else if (a2c_streq(nm,"neighbors")) rtfn = "cc_mesh_neighbors";
+            else if (a2c_streq(nm,"broadcast")) rtfn = "cc_mesh_broadcast";
+            else if (a2c_streq(nm,"gather"))    rtfn = "cc_mesh_gather";
             /* 数学組込み（正典 Core.Math）。ランタイムに実装がある。 */
             else if (a2c_streq(nm,"sqrt"))  rtfn = "v_m_sqrt";
             else if (a2c_streq(nm,"exp"))   rtfn = "v_m_exp";
