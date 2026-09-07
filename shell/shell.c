@@ -1538,6 +1538,22 @@ static void puts_ip(const unsigned char *ip)
 static int cmd_wifi(int argc, char **argv)
 {
     if (argc < 2 || str_eq(argv[1], "status")) {
+        /* ★ まずファームウェアに「いまどのセルに居るか」を聞く。局所変数だけを
+           見ていると、ad-hoc で IP を代入しただけの状態を「接続済み」と表示して
+           しまう（実際そうなっていて、合流の切り分けを誤らせた）。 */
+        { unsigned char bss[6];
+          extern int wifi_live_bssid(unsigned char *);
+          if (wifi_live_bssid(bss)) {
+              uart_puts("wifi: BSSID ");
+              for (int i = 0; i < 6; i++) {
+                  const char *h = "0123456789abcdef";
+                  if (i) uart_putc(':');
+                  uart_putc(h[(bss[i] >> 4) & 15]); uart_putc(h[bss[i] & 15]);
+              }
+              uart_puts("  (firmware)\n");
+          } else {
+              uart_puts("wifi: BSSID none -- radio is in no cell\n");
+          } }
         if (wifi_connected()) {
             unsigned char ip[4]; wifi_ipaddr(ip);
             uart_puts("wifi: connected  ssid=\""); uart_puts(wifi_ssid());
