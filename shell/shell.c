@@ -1554,6 +1554,9 @@ static int cmd_wifi(int argc, char **argv)
           } else {
               uart_puts("wifi: BSSID none -- radio is in no cell\n");
           } }
+        { extern int wifi_http_on_wifi;
+          uart_puts(wifi_http_on_wifi ? "wifi: HTTP サーバは WiFi 側 (10.0.0.x:80)\n"
+                                      : "wifi: HTTP サーバは有線側のまま\n"); }
         if (wifi_connected()) {
             unsigned char ip[4]; wifi_ipaddr(ip);
             uart_puts("wifi: connected  ssid=\""); uart_puts(wifi_ssid());
@@ -1642,9 +1645,18 @@ static int cmd_wifi(int argc, char **argv)
         extern int wifi_adhoc(const char *ssid, int channel, int n);
         extern void shell_flush_screen(void);
         int ch = 6, node = 1; const char *p;
-        if (argc < 3) { uart_puts("usage: wifi adhoc <ssid> [ch] [node]\n"); return 1; }
+        if (argc < 3) { uart_puts("usage: wifi adhoc <ssid> [ch] [node] [wifihttp]\n"); return 1; }
         if (argc >= 4) { ch = 0;   for (p = argv[3]; *p>='0'&&*p<='9'; p++) ch   = ch*10   + (*p-'0'); }
         if (argc >= 5) { node = 0; for (p = argv[4]; *p>='0'&&*p<='9'; p++) node = node*10 + (*p-'0'); }
+        /* ★ 既定で HTTP を有線に残す。keep_eth=0 のままだと wifi_adhoc() が
+           TCP サーバを WiFi 側（10.0.0.n:80）へ張り替えるので、有線から見ると
+           「HTTP が死んだ」ように見える ―― 実際は引っ越しただけである。
+           制御面は測定の命綱なので、黙って動かさない。WiFi 側で公開したいときだけ
+           第5引数に wifihttp を付ける。 */
+        { extern int wifi_adhoc_keep_eth;
+          wifi_adhoc_keep_eth = (argc >= 6 && str_eq(argv[5], "wifihttp")) ? 0 : 1;
+          uart_puts(wifi_adhoc_keep_eth ? "wifi: HTTP は有線に残す\n"
+                                        : "wifi: HTTP を WiFi 側へ移す（有線からは見えなくなる）\n"); }
         uart_puts("wifi: joining ad-hoc cell (IBSS) — please wait...\n");
         shell_flush_screen();
         if (wifi_adhoc(argv[2], ch, node) != 0) { uart_puts("wifi: adhoc FAILED\n"); shell_flush_screen(); return 1; }

@@ -1749,8 +1749,13 @@ int wifi_eth_tx(const unsigned char *eth, int len) { return wifi_data_tx(eth, le
 /* Bind the TCP/HTTP server to our current WLAN identity and start listening on
  * port 80.  Called once DHCP (or the ad-hoc static IP) has given us an address.
  * Idempotent — safe to call again on re-association. */
+/* 1 = TCP/HTTP サーバが WiFi 側に張り替えられている（有線からは見えなくなる）。
+   これを表示できないと「HTTP が死んだ」と誤診する ―― 実際は引っ越しただけ。 */
+int wifi_http_on_wifi = 0;
+
 static void wifi_bind_tcp_server(void)
 {
+    wifi_http_on_wifi = 1;
     tcp_set_tx(wifi_eth_tx);
     tcp_set_mac(wifi_mac);
     tcp_set_ip(wifi_ip);
@@ -3091,6 +3096,8 @@ int wifi_adhoc(const char *ssid, int channel, int n)
 const char *wifi_trace(void) { return "wifi: not built (no WIFI_SDIO_BASE)"; }
 int  wifi_trace_len(void) { return 0; }
 int  wifi_probe(void) { return -1; }
+int  wifi_adhoc_keep_eth = 1;
+int  wifi_http_on_wifi = 0;
 int  wifi_probe_stage(int k) { (void)k; return -1; }
 void wifi_net_poll(void) { }
 /* M14 MANET — stubs (no radio on this build) */
