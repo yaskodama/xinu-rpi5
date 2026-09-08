@@ -44,7 +44,22 @@ struct procent {
 };
 
 extern struct procent proctab[NPROC];
+
+#ifdef SMP_SYMMETRIC
+/* 対称 SMP: 「現在のプロセス」はコアごとに違う。currpid はその別名にする
+   （呼び出し側の書き換えを避けるため、代入もできる左辺値のまま）。 */
+#include "smp.h"
+extern int smpsched_curr[SMP_NCORES];
+#define currpid (smpsched_curr[smp_core_id()])
+/* ready キューの操作（呼び出し側がスケジューラ・ロックを保持していること） */
+struct procent *proc_ready_pop_locked(void);
+void            proc_ready_push_locked(struct procent *p);
+/* ready にせずに作る（範囲などを設定してから proc_ready() で投入する用） */
+int  proc_create_static_susp(proc_entry_t entry, void *stk, unsigned long stksize,
+                             const char *name);
+#else
 extern int            currpid;
+#endif
 
 void proc_init(void);
 int  proc_create(proc_entry_t entry, unsigned long stksize, const char *name);

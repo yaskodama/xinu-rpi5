@@ -18,6 +18,9 @@
 #include "vfs.h"
 #include "wm.h"
 #include "wifi.h"
+#ifdef SMP_SYMMETRIC
+#include "smp.h"        /* SMP_NCORES（/smpsched の per-core 集計に使う） */
+#endif
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
@@ -2078,6 +2081,47 @@ static int http_build(const char *req, char *out, int max)
         bl = s_putdec(body, bl, usN ? (long)((us1 * 100UL) / usN) : 0);
         bl = s_put(body, bl, "\n");
         bl = s_put(body, bl, "agree = "); bl = s_put(body, bl, (r1 == rN) ? "yes\n" : "NO\n");
+#ifdef SMP_SYMMETRIC
+    } else if (path_eq(req, "/smpsched")) {
+        /* 対称 SMP スケジューラで N-Queens を走らせる（比較実験の第2方式）。
+         *   curl 'http://192.168.3.101/smpsched?n=13&tasks=8'
+         * tasks はプロセス数。列数より多くはできない。各コアが共有 ready
+         * キューから自分で取るので、静的分割と違い偏りが走行中に均される。 */
+        ctype = "text/plain";
+        extern long smpsched_nqueens(int, int, unsigned long *, int *);
+        int nn = q_int(req, "n", 13);
+        int nt = q_int(req, "tasks", 8);
+        unsigned long ms = 0;
+        int ran[SMP_NCORES];
+        long sol = smpsched_nqueens(nn, nt, &ms, ran);
+        bl = s_put(body, bl, "smpsched n=");     bl = s_putdec(body, bl, (long)nn);
+        bl = s_put(body, bl, " tasks=");         bl = s_putdec(body, bl, (long)nt);
+        bl = s_put(body, bl, " solutions=");     bl = s_putdec(body, bl, sol);
+        bl = s_put(body, bl, " ms=");            bl = s_putdec(body, bl, (long)ms);
+        bl = s_put(body, bl, " ran_per_core=");
+        for (int i = 0; i < SMP_NCORES; i++) {
+            if (i) bl = s_put(body, bl, "/");
+            bl = s_putdec(body, bl, (long)ran[i]);
+        }
+        bl = s_put(body, bl, "\n");
+    } else if (path_eq(req, "/smplock")) {
+        /* スピンロックの実機自己診断。4 コアが per 回ずつ共有カウンタを ++ し、
+         * 期待値と一致するかを見る。一致しなければロックが壊れている
+         * （= この板では LDAXR/STXR が非キャッシュ可能領域で効いていない）。 */
+        ctype = "text/plain";
+        extern long spin_selftest(int);
+        extern const char *spin_impl_name(void);
+        extern int  smp_cores_online(void);
+        int per = q_int(req, "n", 20000);
+        long got = spin_selftest(per);
+        long want = (long)per * (long)smp_cores_online();
+        bl = s_put(body, bl, "spinlock impl=");  bl = s_put(body, bl, spin_impl_name());
+        bl = s_put(body, bl, " per_core=");      bl = s_putdec(body, bl, (long)per);
+        bl = s_put(body, bl, " cores=");         bl = s_putdec(body, bl, (long)smp_cores_online());
+        bl = s_put(body, bl, " expected=");      bl = s_putdec(body, bl, want);
+        bl = s_put(body, bl, " got=");           bl = s_putdec(body, bl, got);
+        bl = s_put(body, bl, (got == want) ? "  OK\n" : "  ** BROKEN **\n");
+#endif
     } else if (path_eq(req, "/nqpart")) {
         /* Distributed N-Queens partial: count solutions for first-queen columns
          * [c0,c1) at board size n, using all cores.  A Mac orchestrator hands

@@ -92,7 +92,17 @@ COMMON  = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
 # bcm2712 dtb: soc ranges 0x0->0x10_00000000, gic child 0x7fff9000);
 # GIC_GROUP1 because Pi 5 hands off in NON-secure EL1 under BL31, so the
 # timer PPI must be group 1 or the NS CPU interface never sees it.
+# 対称 SMP 版（feat/smp-symmetric ブランチ）。SMP_SYM=0 で従来のワーカ型に戻せる
+# ので、同じ木から両方を焼いて比較できる:  make pi5 SMP_SYM=0
+SMP_SYM ?= 1
+ifeq ($(SMP_SYM),1)
+SMP_SYM_FLAG = -DSMP_SYMMETRIC
+else
+SMP_SYM_FLAG =
+endif
+
 PI5_CFLAGS  = $(COMMON) -mcpu=cortex-a76 \
+              $(SMP_SYM_FLAG) \
               -DUART0_BASE=0x107D001000UL \
               -DUART_NO_REINIT \
               -DMBOX_BASE=0x107C013880UL \

@@ -15,7 +15,29 @@
 #include "critical.h"
 
 struct procent proctab[NPROC];
+
+#ifdef SMP_SYMMETRIC
+/* 対称 SMP: ready キューは 4 コアの共有物なのでロックで守る。
+   ctxsw を跨いでロックを保持し、**再開した側が離す**（受け渡し方式）。
+   こうしないと「ready に戻したが SP をまだ書いていないプロセス」を
+   他コアが拾ってしまう。 */
+#include "smpsched.h"
+#include "spinlock.h"
+extern struct spinlock proc_sched_lock;
+#define SCHED_LOCK()    spin_lock(&proc_sched_lock)
+#define SCHED_UNLOCK()  spin_unlock(&proc_sched_lock)
+#define IDLE_PID()      (smp_core_id() == 0 ? NULLPROC : SMPIDLE_PID(smp_core_id()))
+#define IS_IDLE(pid)    ((pid) == NULLPROC || (pid) >= SMPIDLE_BASE)
+extern void proc_entry_trampoline_smp(void);
+#define ENTRY_TRAMPOLINE proc_entry_trampoline_smp
+#else
 int            currpid;
+#define SCHED_LOCK()    ((void)0)
+#define SCHED_UNLOCK()  ((void)0)
+#define IDLE_PID()      NULLPROC
+#define IS_IDLE(pid)    ((pid) == NULLPROC)
+#define ENTRY_TRAMPOLINE proc_entry_trampoline
+#endif
 extern void proc_entry_trampoline(void);   /* ctxsw.S: msr daifclr #2; br x19 */
 
 /* Preemption (timer-driven).  OFF by default: the cooperative AIPL/actor
@@ -76,6 +98,12 @@ static struct procent *ready_pop(void)
     return best;
 }
 
+#ifdef SMP_SYMMETRIC
+/* smpsched.c から使う（どちらもロック保持が前提） */
+struct procent *proc_ready_pop_locked(void)          { return ready_pop(); }
+void            proc_ready_push_locked(struct procent *p) { ready_push(p); }
+#endif
+
 void proc_init(void)
 {
     int i;
@@ -96,7 +124,11 @@ void proc_init(void)
     copy_name(p->name, "null/shell");
 
     ready_head = ready_tail = 0;
+#ifdef SMP_SYMMETRIC
+    smpsched_init();          /* コアごとの現在プロセスと idle を用意する */
+#else
     currpid    = NULLPROC;
+#endif
 }
 
 static int alloc_slot(void)
@@ -141,7 +173,7 @@ int proc_create(proc_entry_t entry, unsigned long stksize, const char *name)
     unsigned long *sp_top = (unsigned long *)((unsigned char *)stk + stksize);
     unsigned long *sp     = sp_top - 12;
     sp[0]  = 0;                          /* x29 (FP)            */
-    sp[1]  = (unsigned long)proc_entry_trampoline;  /* x30 -> trampoline */
+    sp[1]  = (unsigned long)ENTRY_TRAMPOLINE;  /* x30 -> trampoline */
     sp[2]  = 0; sp[3]  = 0;              /* x27, x28            */
     sp[4]  = 0; sp[5]  = 0;              /* x25, x26            */
     sp[6]  = 0; sp[7]  = 0;              /* x23, x24            */
@@ -149,7 +181,7 @@ int proc_create(proc_entry_t entry, unsigned long stksize, const char *name)
     sp[10] = (unsigned long)entry; sp[11] = 0;  /* x19 -> entry (trampoline br) */              /* x19, x20            */
     p->sp = (void *)sp;
 
-    ready_push(p);
+    SCHED_LOCK(); ready_push(p); SCHED_UNLOCK();
     return pid;
 }
 
@@ -159,8 +191,8 @@ int proc_create(proc_entry_t entry, unsigned long stksize, const char *name)
  * the `cc`/`make` shell commands run (they are dispatched from the USB-keyboard
  * pump and the HTTP /run handler, both inside genet_rx_tick).  Handing in a
  * static stack keeps process creation heap-free and therefore safe there. */
-int proc_create_static(proc_entry_t entry, void *stk, unsigned long stksize,
-                       const char *name)
+static int create_static_common(proc_entry_t entry, void *stk, unsigned long stksize,
+                                const char *name, int do_ready)
 {
     int pid = alloc_slot();
     if (pid < 0) return -1;
@@ -179,7 +211,7 @@ int proc_create_static(proc_entry_t entry, void *stk, unsigned long stksize,
     sp_top = (unsigned long *)((unsigned long)sp_top & ~15UL);   /* 16-byte align */
     unsigned long *sp     = sp_top - 12;
     sp[0]  = 0;                          /* x29 (FP)            */
-    sp[1]  = (unsigned long)proc_entry_trampoline;  /* x30 -> trampoline */
+    sp[1]  = (unsigned long)ENTRY_TRAMPOLINE;  /* x30 -> trampoline */
     sp[2]  = 0; sp[3]  = 0;
     sp[4]  = 0; sp[5]  = 0;
     sp[6]  = 0; sp[7]  = 0;
@@ -187,16 +219,35 @@ int proc_create_static(proc_entry_t entry, void *stk, unsigned long stksize,
     sp[10] = (unsigned long)entry; sp[11] = 0;  /* x19 -> entry (trampoline br) */
     p->sp = (void *)sp;
 
-    ready_push(p);
+    if (do_ready) { SCHED_LOCK(); ready_push(p); SCHED_UNLOCK(); }
+    else          { p->state = PR_WAIT; }
     return pid;
 }
+
+int proc_create_static(proc_entry_t entry, void *stk, unsigned long stksize,
+                       const char *name)
+{
+    return create_static_common(entry, stk, stksize, name, 1);
+}
+
+#ifdef SMP_SYMMETRIC
+/* ready にせずに作る。範囲などを設定してから proc_ready() で投入する。 */
+int proc_create_static_susp(proc_entry_t entry, void *stk, unsigned long stksize,
+                            const char *name)
+{
+    return create_static_common(entry, stk, stksize, name, 0);
+}
+#endif
 
 void proc_ready(int pid)
 {
     if (pid <= 0 || pid >= NPROC) return;
     struct procent *p = &proctab[pid];
+    SCHED_LOCK();
     p->state = PR_READY;
     ready_push(p);
+    SCHED_UNLOCK();
+    __asm__ volatile("dsb sy\n\tsev" ::: "memory");   /* 待っている核を起こす */
 }
 
 /* Pick the next ready process and ctxsw into it.  Returns once we
@@ -206,16 +257,17 @@ void proc_ready(int pid)
 void proc_resched(void)
 {
     unsigned long d = irq_save();
+    SCHED_LOCK();
     struct procent *newp = ready_pop();
-    if (newp == 0) { irq_restore(d); return; }
+    if (newp == 0) { SCHED_UNLOCK(); irq_restore(d); return; }
 
     int new_pid       = (int)(newp - proctab);
     struct procent *oldp = &proctab[currpid];
     int old_pid       = currpid;
 
-    /* If the current proc is still runnable (and isn't the null
-     * proc — which never goes on the ready list), park it. */
-    if (oldp->state == PR_CURR && old_pid != NULLPROC) {
+    /* If the current proc is still runnable (and isn't an idle proc —
+     * those never go on the ready list), park it. */
+    if (oldp->state == PR_CURR && !IS_IDLE(old_pid)) {
         oldp->state = PR_READY;
         ready_push(oldp);
     }
@@ -224,7 +276,9 @@ void proc_resched(void)
     currpid     = new_pid;
 
     ctxsw(&oldp->sp, newp->sp);
-    /* Returns here when somebody ctxsw()'s back to us. */
+    /* Returns here when somebody ctxsw()'s back to us —— ロックは相手が
+       握ったまま渡してくるので、こちらで離す。 */
+    SCHED_UNLOCK();
     irq_restore(d);
 }
 
@@ -232,13 +286,15 @@ void proc_resched(void)
 void proc_block(void)
 {
     unsigned long d = irq_save();
+    SCHED_LOCK();
     struct procent *oldp = &proctab[currpid];
     oldp->state = PR_WAIT;
     struct procent *newp = ready_pop();
-    if (newp == 0) newp = &proctab[NULLPROC];
+    if (newp == 0) newp = &proctab[IDLE_PID()];
     newp->state = PR_CURR;
     currpid = (int)(newp - proctab);
     ctxsw(&oldp->sp, newp->sp);
+    SCHED_UNLOCK();
     irq_restore(d);
 }
 
@@ -257,11 +313,13 @@ void proc_sleep_us(unsigned long us)
     oldp->wake_at_us = proc_now_us() + us;
     oldp->state = PR_SLEEP;
     timer_arm_before_us(us);
+    SCHED_LOCK();
     struct procent *newp = ready_pop();
-    if (newp == 0) newp = &proctab[NULLPROC];
+    if (newp == 0) newp = &proctab[IDLE_PID()];
     newp->state = PR_CURR;
     currpid = (int)(newp - proctab);
     ctxsw(&oldp->sp, newp->sp);
+    SCHED_UNLOCK();
     irq_restore(d);
 }
 
@@ -271,6 +329,7 @@ void proc_timer_tick(void)
 {
     unsigned long now = proc_now_us();
     int woke = 0, i;
+    SCHED_LOCK();
     for (i = 0; i < NPROC; i++) {
         if (proctab[i].state == PR_SLEEP && now >= proctab[i].wake_at_us) {
             proctab[i].state = PR_READY;
@@ -278,6 +337,7 @@ void proc_timer_tick(void)
             woke = 1;
         }
     }
+    SCHED_UNLOCK();
     if (woke) g_resched_pending = 1;
 }
 
@@ -304,7 +364,7 @@ void proc_preempt(void)
     if (!g_preempt_on || !g_resched_pending) return;
     if (g_actor_pump) return;   /* actors run cooperatively */
     g_resched_pending = 0;
-    if (currpid != NULLPROC) proc_resched();
+    if (!IS_IDLE(currpid)) proc_resched();
 }
 
 void proc_yield(void)
@@ -326,10 +386,12 @@ int proc_is_free(int pid)
 void proc_exit(void)
 {
     int me = currpid;
+    unsigned long d = irq_save(); (void)d;
+    SCHED_LOCK();
     proctab[me].state = PR_FREE;
 
     struct procent *newp = ready_pop();
-    if (newp == 0) newp = &proctab[NULLPROC];
+    if (newp == 0) newp = &proctab[IDLE_PID()];
 
     newp->state = PR_CURR;
     currpid     = (int)(newp - proctab);

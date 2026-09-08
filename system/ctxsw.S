@@ -54,3 +54,15 @@ proc_entry_trampoline:
     msr     daifclr, #2                // clear I: enable IRQs
     br      x19                        // jump to the real entry (never returns)
     .size proc_entry_trampoline, .-proc_entry_trampoline
+
+// proc_entry_trampoline_smp — 対称 SMP 版の入口。
+// 切り替え元はスケジューラ・ロックを握ったまま ctxsw してくるので、
+// 実体へ飛ぶ前にここで離す（x19 は callee-saved なので C 呼び出しで壊れない）。
+    .global  proc_entry_trampoline_smp
+    .type    proc_entry_trampoline_smp, %function
+    .balign  16
+proc_entry_trampoline_smp:
+    msr     daifclr, #2
+    bl      smpsched_after_switch
+    br      x19
+    .size proc_entry_trampoline_smp, .-proc_entry_trampoline_smp

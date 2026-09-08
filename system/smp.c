@@ -197,6 +197,33 @@ static void smp_worker_loop(int core)
     }
 }
 
+#ifdef SMP_SYMMETRIC
+/* 対称版でも「郵便箱の仕事が来ていたら一度だけ実行する」口を残す。
+ * これがあると、同じカーネルの同じ起動で
+ *   ワーカ郵便箱方式（/nqpart, /bench）と 対称スケジューラ方式（/smpsched）
+ * の両方を走らせられる ―― 焼き直しも再起動も挟まないので、
+ * 温度・過渡・環境という交絡なしに A/B が取れる。 */
+int smp_worker_poll_once(int core)
+{
+    static int last[SMP_NCORES];
+    static int inited;
+    if (!inited) { for (int c = 0; c < SMP_NCORES; c++) { MB_INVAL(&smp_job_seq[c]); last[c] = smp_job_seq[c]; } inited = 1; }
+    MB_INVAL(&smp_job_seq[core]);
+    if (smp_job_seq[core] == last[core]) return 0;      /* 仕事なし */
+    last[core] = smp_job_seq[core];
+    MB_INVAL(&smp_job_fn[core]); MB_INVAL(&smp_job_lo[core]); MB_INVAL(&smp_job_hi[core]);
+    smp_range_fn fn = smp_job_fn[core];
+    long r = fn ? fn(smp_job_lo[core], smp_job_hi[core], core) : 0;
+    smp_job_res[core] = r;
+    MB_CLEAN(&smp_job_res[core]);
+    dsb();
+    smp_job_done[core] = last[core];
+    MB_CLEAN(&smp_job_done[core]);
+    dsb_sev();
+    return 1;
+}
+#endif
+
 /* C entry for a freshly-started secondary core (called from boot.S at EL1 with
  * its stack already set).  Match core 0's MMU/cache config for fair timing,
  * install the shared exception vectors, announce online, then idle. */
@@ -210,7 +237,14 @@ void smp_secondary_entry(int core)
     smp_online[core] = 1;
     MB_CLEAN(&smp_online[core]);             /* flush so core 0 sees us under C=1 */
     dsb_sev();                              /* tell core 0 we are up */
+#ifdef SMP_SYMMETRIC
+    /* 対称 SMP: 郵便箱を待つのではなく、共有 ready キューから自分で取る。
+       郵便箱経路（smp_parallel_sum）は比較のため残してあるが、この版では
+       二次コアはスケジューラ側に居るので使わないこと。 */
+    { extern void smpsched_core_loop(int); smpsched_core_loop(core); }
+#else
     smp_worker_loop(core);                  /* never returns */
+#endif
 }
 
 void smp_init(void)
