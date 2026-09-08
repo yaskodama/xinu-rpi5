@@ -270,8 +270,13 @@ long smp_parallel_sum(smp_range_fn fn, long n, int ncores)
     /* Post chunks 1..ncores-1 to the worker cores (skip offline ones — those
      * chunks are computed by core 0 below). */
     for (int c = 1; c < ncores; c++) {
-        long lo = (long)c * chunk;
-        long hi = (c == ncores - 1) ? n : lo + chunk;
+        /* ★ 剰余を「最後のコア」に丸投げしない。chunk = n/ncores の整数除算で
+           余りを c==ncores-1 に全部載せると、n がコア数で割り切れないとき
+           その 1 コアだけが余りを抱え、makespan が跳ねる（実測: 4 コアに 3 列を
+           渡すと 1 コアが 3 列を直列処理し、4 列を渡したときより遅かった）。
+           lo = c*n/nc, hi = (c+1)*n/nc なら余りは各コアへ 1 つずつ散る。 */
+        long lo = ((long)c * n) / ncores;
+        long hi = ((long)(c + 1) * n) / ncores;
         if (!smp_online[c]) { total += fn(lo, hi, 0); continue; }
         smp_job_fn[c] = fn;
         smp_job_lo[c] = lo;
@@ -293,8 +298,13 @@ long smp_parallel_sum(smp_range_fn fn, long n, int ncores)
         MB_INVAL(&smp_job_done[c]);
         while (smp_job_done[c] != smp_job_seq[c]) {
             if (++spins >= SMP_WAIT_LIMIT) {   /* worker stuck — do it here */
-                long lo = (long)c * chunk;
-                long hi = (c == ncores - 1) ? n : lo + chunk;
+                /* ★ 剰余を「最後のコア」に丸投げしない。chunk = n/ncores の整数除算で
+                   余りを c==ncores-1 に全部載せると、n がコア数で割り切れないとき
+                   その 1 コアだけが余りを抱え、makespan が跳ねる（実測: 4 コアに 3 列を
+                   渡すと 1 コアが 3 列を直列処理し、4 列を渡したときより遅かった）。
+                   lo = c*n/nc, hi = (c+1)*n/nc なら余りは各コアへ 1 つずつ散る。 */
+                long lo = ((long)c * n) / ncores;
+                long hi = ((long)(c + 1) * n) / ncores;
                 smp_job_res[c] = fn(lo, hi, 0);
                 break;
             }
