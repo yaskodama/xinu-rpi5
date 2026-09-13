@@ -1780,6 +1780,8 @@ void wifi_off(void)
 /* Desktop WiFi indicator accessors (M10). */
 const char *wifi_ssid(void) { return wifi_cur_ssid; }
 void wifi_ipaddr(u8 *o) { int i; for (i = 0; i < 4; i++) o[i] = wifi_ip[i]; }
+void wifi_netmask(u8 *o) { int i; for (i = 0; i < 4; i++) o[i] = wifi_mask[i]; }
+void wifi_macaddr(u8 *o) { int i; for (i = 0; i < 6; i++) o[i] = wifi_mac[i]; }
 static int dhcp_build(u8 *out, const u8 *mac, u32 xid, const u8 *reqip, const u8 *srvid)
 {
     u8 *e = out, *ip, *udp, *bootp, *opt; int dhcplen, udplen, iplen, i;
@@ -1908,6 +1910,10 @@ static void wifi_handle_frame(u8 *fr, int len, int doff)
     int elen = len - (doff + bdc), et, i;
     if (elen < 14) return;
     et = (e[12] << 8) | e[13];
+    /* 機内ブラウザがメッシュ上の板のページを取りに行くときの応答（ARP 応答・
+       自分の一時ポート宛の TCP）。ARP は学習だけして 0 を返すので下の応答器にも渡る。 */
+    { extern int browser_handle(const unsigned char *frame, int len);
+      if (browser_handle(e, elen)) return; }
     if (et == 0x0806 && elen >= 42) {                /* ARP */
         u8 *a = e + 14;
         int op = (a[6] << 8) | a[7];
@@ -2640,6 +2646,15 @@ static void mn_bcast(const u8 *p, int n)
 
 /* 受信した src ノードを「発見済み近隣」に記録（重複は無視）。どの MANET パケット
  * を受けても呼ぶので、HELLO でなくても発見できる。 */
+/* 近隣表の読み出し（機内ブラウザの xinu://mesh が一覧にする）。戻り値は件数。 */
+int wifi_mesh_peers(unsigned char *out, int cap)
+{
+    int n = g_mn_peersn < cap ? g_mn_peersn : cap;
+    for (int i = 0; i < n; i++) out[i] = g_mn_peers[i];
+    return n;
+}
+int wifi_mesh_self(void) { return g_mn_node ? g_mn_node : wifi_ip[3]; }
+
 static void mn_peer_seen(u8 src)
 {
     int i;

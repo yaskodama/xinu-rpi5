@@ -20,6 +20,29 @@
 extern int  genet_tx_frame(const unsigned char *frame, int length);
 extern void net_responder_get_mac(unsigned char out[6]);
 extern void net_responder_get_ip(unsigned char out[4]);
+/* ---- 無線（メッシュ）側。宛先が WiFi の副網なら、こちらの口で出す ----
+ * 有線は airilab.app などの外向き、無線はメッシュ上の他の Xinu 板（10.0.0.n）。
+ * 送信口と自分の IP/MAC を宛先ごとに選ぶ。受信は wifi_handle_frame が
+ * browser_handle を先に呼ぶので、待ち方は有線と同じ。 */
+extern int  wifi_connected(void);
+extern int  wifi_eth_tx(const unsigned char *eth, int len);
+extern void wifi_ipaddr(unsigned char *o);
+extern void wifi_netmask(unsigned char *o);
+extern void wifi_macaddr(unsigned char *o);
+extern void wifi_net_poll(void);
+static int  br_via_wifi = 0;                 /* いまの宛先を無線で出すか（br_route_mac が決める） */
+static int  br_wifi_has(const unsigned char *dip)   /* dip は WiFi の副網か */
+{
+    if (!wifi_connected()) return 0;
+    unsigned char ip[4], m[4]; wifi_ipaddr(ip); wifi_netmask(m);
+    if (!(ip[0] | ip[1] | ip[2] | ip[3])) return 0;
+    if (!(m[0] | m[1] | m[2] | m[3])) { m[0] = m[1] = m[2] = 255; m[3] = 0; }
+    for (int i = 0; i < 4; i++) if ((unsigned char)(ip[i] & m[i]) != (unsigned char)(dip[i] & m[i])) return 0;
+    return 1;
+}
+static void br_src_mac(unsigned char *o) { if (br_via_wifi) wifi_macaddr(o); else net_responder_get_mac(o); }
+static void br_src_ip(unsigned char *o)  { if (br_via_wifi) wifi_ipaddr(o);  else net_responder_get_ip(o); }
+static int  br_link_tx(const unsigned char *f, int n) { return br_via_wifi ? wifi_eth_tx(f, n) : genet_tx_frame(f, n); }
 extern void dhcp_get_router(unsigned char out[4]);
 extern void dhcp_get_netmask(unsigned char out[4]);
 extern void dhcp_get_dns(unsigned char out[4]);
@@ -38,7 +61,7 @@ static unsigned long br_now_us(void);
 static void br_wait_us(unsigned long us)
 {
     unsigned long t0 = br_now_us();
-    do { net_rx_pump(); } while ((long)(br_now_us() - t0) < (long)us);
+    do { net_rx_pump(); if (br_via_wifi) wifi_net_poll(); } while ((long)(br_now_us() - t0) < (long)us);
 }
 
 static unsigned long br_now_us(void)
@@ -105,7 +128,7 @@ static int br_arp_lookup(const unsigned char *ip, unsigned char *mac)
 static void br_arp_request(const unsigned char *tip)
 {
     unsigned char smac[6], sip[4];
-    net_responder_get_mac(smac); net_responder_get_ip(sip);
+    br_src_mac(smac); br_src_ip(sip);
     for (int i = 0; i < 60; i++) br_tx[i] = 0;
     for (int i = 0; i < 6; i++) br_tx[i] = 0xFF;            /* 宛先 = 同報 */
     for (int i = 0; i < 6; i++) br_tx[6+i] = smac[i];
@@ -117,7 +140,7 @@ static void br_arp_request(const unsigned char *tip)
     for (int i = 0; i < 6; i++) br_tx[22+i] = smac[i];
     for (int i = 0; i < 4; i++) br_tx[28+i] = sip[i];
     for (int i = 0; i < 4; i++) br_tx[38+i] = tip[i];
-    genet_tx_frame((const unsigned char *)br_tx, 60);
+    br_link_tx((const unsigned char *)br_tx, 60);
 }
 
 /* 相手の MAC を引く。要求は落ちうるので再送する（UDP と同じ作法）。 */
@@ -186,6 +209,8 @@ void browser_set_dns(const unsigned char *d) { for(int i=0;i<4;i++) br_cfg_dns[i
 static int br_route_mac(const unsigned char *dip, unsigned char *mac)
 {
     unsigned char sip[4], mask[4], gw[4];
+    if (br_wifi_has(dip)) { br_via_wifi = 1; return br_arp_resolve(dip, mac, 2000); }   /* メッシュ上の板：無線で直接 */
+    br_via_wifi = 0;
     net_responder_get_ip(sip); br_get_mask(mask); br_get_gw(gw);
     int onlink = 1;
     for (int i = 0; i < 4; i++)
@@ -202,7 +227,7 @@ static int br_ip_send(const unsigned char *dmac, const unsigned char *dip,
     unsigned char smac[6], sip[4];
     int iptot = 20 + plen, framelen = 14 + iptot;
     if (plen < 0 || framelen > BR_TXMAX) return -1;
-    net_responder_get_mac(smac); net_responder_get_ip(sip);
+    br_src_mac(smac); br_src_ip(sip);
     for (int i = 0; i < 6; i++) br_tx[i]     = dmac[i];
     for (int i = 0; i < 6; i++) br_tx[6 + i] = smac[i];
     br_tx[12] = 0x08; br_tx[13] = 0x00;
@@ -220,7 +245,7 @@ static int br_ip_send(const unsigned char *dmac, const unsigned char *dip,
     { volatile unsigned char *q = br_tx + 34;
       for (int i = 0; i < plen; i++) q[i] = pl[i]; }
     if (framelen < 60) { for (int i = framelen; i < 60; i++) br_tx[i] = 0; framelen = 60; }
-    return genet_tx_frame((const unsigned char *)br_tx, framelen);
+    return br_link_tx((const unsigned char *)br_tx, framelen);
 }
 
 /* 擬似ヘッダ込みのチェックサム（UDP/TCP 共通）。 */
@@ -294,7 +319,7 @@ static struct {
 
 static int br_tcp_send(unsigned char flags, const unsigned char *data, int dlen)
 {
-    unsigned char sip[4]; net_responder_get_ip(sip);
+    unsigned char sip[4]; br_src_ip(sip);
     unsigned char seg[1500]; int hl = (flags == 0x02) ? 24 : 20;   /* SYN には MSS 選択肢を付ける */
     if (dlen < 0 || dlen > 1400) return -1;
     for (int i = 0; i < hl; i++) seg[i] = 0;
@@ -756,6 +781,14 @@ static const char *br_home      = "http://airilab.app/";
 static const char *br_home_dict = "http://airilab.app/js/i18n.js";
 int browser_fetch_en(const char *page_url, const char *dict_url);
 static int  br_have_en = 0;           /* 英語版を一度でも出せたか */
+int browser_parse_ip(const char *s, unsigned char *out);
+static int br_wifi_has_url(const char *url)           /* URL のホストが WiFi の副網の IP か */
+{
+    const char *p = url; if (b_eqn(p, "http://", 7)) p += 7;
+    char h[64]; int i = 0; while (p[i] && p[i] != '/' && i < 63) { h[i] = p[i]; i++; } h[i] = 0;
+    unsigned char ip[4];
+    return browser_parse_ip(h, ip) && br_wifi_has(ip);
+}
 static int br_fetch_home(void)
 {
     const char *u = br_have_en ? br_cur_url : br_home;   /* 辿った先にいるなら、そのページを更新する */
@@ -811,6 +844,7 @@ void browser_click(void *selfv, int lx, int ly)
     struct wshape { int x, y, width, height; };
     struct wshape *w = (struct wshape *)selfv;
     int top = 22 + 6 + 26;                                     /* 題名帯＋URL/注記の 2 行 */
+    if (ly >= 22 && ly < top) { b_cpy(br_pending_url, "xinu://mesh", sizeof br_pending_url); return; }   /* URL 行をクリック → メッシュ一覧 */
     if (ly >= top && lx >= 8 && lx < w->width - 12) {
         const char *href = 0;
         int k = html_link_at(lx - 8, ly - top + br_scroll_px, &href);
@@ -915,9 +949,50 @@ void browser_poll_pending(void)
 
 /* ページを取り、外部 CSS（<link rel=stylesheet>）も取り、控えて、いまの言語で表示する。
  * 辞書（i18n.js）は一度取れば使い回す。戻り値は本文の文字数（<=0 は失敗）。 */
+/* 組み込みページ xinu://mesh ―― メッシュ（無線）で見えている板を一覧し、各板の
+ * ページ（GET / = 各 Xinu の HTTP 玄関）へのリンクを並べる。通信せずに作る。 */
+extern int wifi_mesh_peers(unsigned char *out, int cap);
+extern int wifi_mesh_self(void);
+static int br_builtin_mesh(char *out, int cap)
+{
+    int o = 0;
+    #define PUT(s) do { const char *q_ = (s); while (*q_ && o < cap - 1) out[o++] = *q_++; } while (0)
+    #define PUTN(v) do { int v_ = (v); char nb_[12]; int k_ = 0; if (v_ == 0) nb_[k_++] = '0'; while (v_ > 0 && k_ < 11) { nb_[k_++] = (char)('0' + v_ % 10); v_ /= 10; } while (k_ > 0 && o < cap - 1) out[o++] = nb_[--k_]; } while (0)
+    PUT("<html><body><h1>Xinu mesh</h1>");
+    if (!wifi_connected()) {
+        PUT("<p>WiFi (IBSS) is not joined. Run <code>wifi adhoc &lt;ssid&gt; &lt;ch&gt; &lt;node&gt;</code> or <code>/wifi-adhoc</code> first.</p>");
+    } else {
+        unsigned char ip[4]; wifi_ipaddr(ip);
+        PUT("<p>This board: node "); PUTN(wifi_mesh_self()); PUT(" ("); PUTN(ip[0]); PUT("."); PUTN(ip[1]); PUT("."); PUTN(ip[2]); PUT("."); PUTN(ip[3]); PUT(")</p>");
+        unsigned char peers[32]; int n = wifi_mesh_peers(peers, 32);
+        if (n == 0) PUT("<p>No neighbours heard yet (HELLO every 2 s).</p>");
+        else {
+            PUT("<h2>Neighbours</h2><ul>");
+            for (int i = 0; i < n; i++) {
+                PUT("<li><a href=\"http://"); PUTN(ip[0]); PUT("."); PUTN(ip[1]); PUT("."); PUTN(ip[2]); PUT("."); PUTN(peers[i]);
+                PUT("/\">node "); PUTN(peers[i]); PUT(" - http://"); PUTN(ip[0]); PUT("."); PUTN(ip[1]); PUT("."); PUTN(ip[2]); PUT("."); PUTN(peers[i]); PUT("/</a></li>");
+            }
+            PUT("</ul>");
+        }
+    }
+    PUT("<hr><p><a href=\"http://airilab.app/\">Home: airilab.app</a></p></body></html>");
+    #undef PUT
+    #undef PUTN
+    out[o] = 0; return o;
+}
+
 int browser_fetch_en(const char *page_url, const char *dict_url)
 {
-    if (br_dict_len <= 0) {                          /* 辞書は初回だけ（表示はしない） */
+    if (b_eqn(page_url, "xinu://", 7)) {              /* 組み込みページ（通信しない） */
+        br_page_html_len = br_builtin_mesh(br_page_html, sizeof br_page_html);
+        b_cpy(br_cur_url, page_url, sizeof br_cur_url);
+        html_set_css("", 0); br_css_url[0] = 0;
+        br_present(br_page_html, br_page_html_len);
+        b_cpy(br_url, page_url, sizeof br_url);
+        b_cpy(br_note, "ok (mesh)", sizeof br_note);
+        br_status = br_text_len; return br_text_len;
+    }
+    if (br_dict_len <= 0 && !br_wifi_has_url(page_url)) {   /* 辞書は初回だけ（表示はしない）。メッシュの板には要らない */
         int r = browser_fetch_raw(dict_url);
         if (r <= 0) { b_cpy(br_note, "i18n.js を取得できません", sizeof br_note); return -20; }
         br_dict_len = br_body_len < BR_DICTCAP-1 ? br_body_len : BR_DICTCAP-1;
@@ -926,9 +1001,22 @@ int browser_fetch_en(const char *page_url, const char *dict_url)
     }
     int r = browser_fetch_raw(page_url);             /* 本体 */
     if (r <= 0) return r;                            /* note は fetch が書いている */
-    { int n = br_body_len < (int)sizeof br_page_html - 1 ? br_body_len : (int)sizeof br_page_html - 1;
-      for (int i = 0; i < n; i++) br_page_html[i] = br_body[i];
-      br_page_html[n] = 0; br_page_html_len = n; }
+    { /* text/plain（Xinu 板の GET / など）は <pre> で包んで行を保つ */
+      int plain = 0;
+      { const char *k = "content-type:"; int kl = b_len(k); int hl = (int)(br_body - br_page);
+        for (int i = 0; i + kl + 10 < hl; i++)
+            if (b_eqn(br_page + i, k, kl)) { int q = i + kl; while (q < hl && br_page[q] == ' ') q++;
+                                              plain = b_eqn(br_page + q, "text/plain", 10); break; } }
+      int o = 0, cap = (int)sizeof br_page_html - 1;
+      if (plain) { const char *w = "<html><body><pre>"; for (int i = 0; w[i] && o < cap; i++) br_page_html[o++] = w[i]; }
+      for (int i = 0; i < br_body_len && o < cap; i++) {
+          char c = br_body[i];
+          if (plain && c == '<') { if (o + 4 <= cap) { br_page_html[o++]='&'; br_page_html[o++]='l'; br_page_html[o++]='t'; br_page_html[o++]=';'; } continue; }
+          if (plain && c == '&') { if (o + 5 <= cap) { br_page_html[o++]='&'; br_page_html[o++]='a'; br_page_html[o++]='m'; br_page_html[o++]='p'; br_page_html[o++]=';'; } continue; }
+          br_page_html[o++] = c;
+      }
+      if (plain) { const char *w = "</pre></body></html>"; for (int i = 0; w[i] && o < cap; i++) br_page_html[o++] = w[i]; }
+      br_page_html[o] = 0; br_page_html_len = o; }
     b_cpy(br_cur_url, page_url, sizeof br_cur_url);
     /* 外部 CSS。URL が前回と同じなら取り直さない。取れなくても本文は出す（CSS 無しで） */
     { static char href[256], cssurl[256];
