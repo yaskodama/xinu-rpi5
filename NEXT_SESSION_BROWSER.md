@@ -6,7 +6,7 @@
 |---|---|---|
 | Pi 5 | **`build Sep 13 2026 16:04:04`**（md5 `2fe9fc3f…`）X-Xinu-Board＋メッシュ経路＋xinu://mesh。実機で起動・英語版・xinu://mesh（未参加表示）・airilab.app の記録に板名が付くことを確認 | 同じ |
 | Pi 4 | **`build Sep 13 2026 16:19:56`**（md5 `95e4a0f4…`）ブラウザ移植（`~/projects/xinu-rpi4` 41dd2fd）。実機で起動 10 秒後に airilab.app が窓に出ること・airilab.app の記録に「Pi4 build …」が付くことを確認。控え `kernel8.img.bak-pre-browser-d54ed4b7` | 同じ |
-| Pi 3 | `build Sep 8 2026 15:37:15`（ブラウザ無し。9/13 に焼き直し） | **`build Sep 13 2026 16:46:01`**（md5 `c95e2030…`, 2.45 MB）**未焼き**。ブラウザ移植（`~/projects/xinu-rpi3` ae3bf8a）。SD `XINU` の `kernel.img` |
+| Pi 3 | `build Sep 8 2026 15:37:15`（ブラウザ無し。9/13 に焼き直し） | **`build Sep 13 2026 17:14:58`**（md5 `9dc1cd0c…`）**実機確認済み**: 起動 10 秒後に英語版、60 秒更新が 3 回連続成功、日本語切替、airilab.app の記録に「Pi3 build …」。16:56:09 では起動時の取得は通ったが 60 秒更新で read が止まり、/browse の 4 KB 応答が届かなかった（両方直した: icount を見て読む・15 秒で諦める、/browse は off=/limit= で分割）。控え `kernel.img.bak-pre-browser-93ec63c6`。ブラウザ移植（`~/projects/xinu-rpi3` ae3bf8a）。SD `XINU` の `kernel.img` |
 
 焼き方は **USB / SD の物理交換のみ**。Pi 5 は USB `XINU5`、Pi 4 は SD `bootfs` の
 `kernel8.img`、Pi 3 は SD `XINU` の `kernel.img`（＝`compile/xinu.boot`）。
