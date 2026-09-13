@@ -136,6 +136,16 @@
 - html.c / jpfont.c は三板で同一（正典 xinu-rpi5）。ARM32（long=32bit）でも問題ない範囲。
 - 実機で見るもの: `curl :8080/browse` が `ok (en)` になるか、画面の窓、airilab.app の記録に「Pi3 build …」。
 
+### メッシュ接続の実測（2026-09-13 17:23〜）
+- 三板を IBSS `MANET` ch6 に参加させた: Pi5 `/wifi-adhoc?ssid=MANET&ch=6&n=3`、Pi4 `…&n=1`、Pi3 `/shell?cmd=wifi adhoc MANET 6 2`
+  （Pi3 は数分かかるので curl は背景で）。BSSID f2:77:8b:b9:d1:19 で三板が同じセル。Pi4 から `wifi ping 10.0.0.3/2` が 4/4。
+  Pi5 の `xinu://mesh` に node 1・2 が並んだ（HELLO の近隣表）。**有線の HTTP はそのまま**（制御面は動いていない）。
+- **しかし Pi5 から `http://10.0.0.1/` は SYN 無応答**: サーバは有線の IP 宛しか受けず、受けても返事を有線へ出していた。
+  → 両板の tcp_server に接続ごとの `via`（来た口）を持たせ、無線から来た接続は無線の IP/MAC で無線へ返す
+  （`tcp_handle_packet_via`。Pi4 の wifi.c は TCP をサーバに渡してすらいなかったので足した）。ブラウザは `:port` も読む。
+  **Pi5 build 17:28:38（md5 `e49bcccf…`）、Pi4 build 17:29:38（md5 `6715c052…`）— いずれも未焼き。**
+- Pi3 のページ（10.0.0.2:8080）は Pi3 の無線が Xinu の網装置でないので開けない（変わらず）。
+
 ## 最初にやること
 
 ```bash
