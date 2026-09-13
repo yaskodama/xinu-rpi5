@@ -706,6 +706,13 @@ static int browser_fetch_raw(const char *url)      /* 取るだけ（表示し�
     if (r == -5 || r == -3) { br_st_retry++; r = browser_fetch1(url); }   /* 切れた／繋がらない → 一度だけやり直す */
     return r;
 }
+/* 取るだけで本文を返す（system/update.c が manifest と像を取るのに使う）。 */
+int browser_fetch_body(const char *url, const char **body, int *len)
+{
+    int r = browser_fetch_raw(url);
+    if (r <= 0) return r;
+    *body = br_body; *len = br_body_len; return r;
+}
 int browser_fetch(const char *url)                 /* 取って、そのまま表示する */
 {
     int r = browser_fetch_raw(url);
@@ -845,6 +852,12 @@ void browser_scroll(int d)           /* d は px。可視域に合わせて丸�
  *   それ以外  → 上半分で一画面戻り、下半分で一画面進む（キー入力は Shell が取るため） */
 static char br_pending_url[256];          /* 巡回で取りに行く URL（空なら無し） */
 static int  br_pending_lang = -1;         /* 巡回で切り替える言語（-1 なら無し） */
+/* 外（HTTP や右クリックの品書き）からの要求。保留にして wm の巡回で取る。 */
+void browser_request_url(const char *url)
+{
+    b_cpy(br_pending_url, url, sizeof br_pending_url);
+    b_cpy(br_note, "queued", sizeof br_note);
+}
 void browser_click(void *selfv, int lx, int ly)
 {
     struct wshape { int x, y, width, height; };
@@ -1067,6 +1080,18 @@ static int br_builtin_mesh(char *out, int cap)
 
 int browser_fetch_en(const char *page_url, const char *dict_url)
 {
+    if (b_eqn(page_url, "xinu://update", 13)) {       /* カーネル更新（確認／更新）→ 結果のページ */
+        extern int update_check(void); extern int update_install(void); extern int update_page(char *, int);
+        int q = 0; for (int i = 0; page_url[i]; i++) if (page_url[i] == '?') { q = i; break; }
+        if (q && b_eqn(page_url + q, "?check=1", 8)) update_check();
+        else if (q && b_eqn(page_url + q, "?install=1", 10)) update_install();   /* 成功すれば戻らない（再起動） */
+        br_page_html_len = update_page(br_page_html, sizeof br_page_html);
+        b_cpy(br_cur_url, "xinu://update", sizeof br_cur_url);
+        html_set_css("", 0); br_css_url[0] = 0;
+        br_present(br_page_html, br_page_html_len);
+        b_cpy(br_url, "xinu://update", sizeof br_url); b_cpy(br_note, "ok (update)", sizeof br_note);
+        br_status = br_text_len; return br_text_len;
+    }
     if (b_eqn(page_url, "xinu://", 7)) {              /* 組み込みページ（通信しない） */
         br_page_html_len = br_builtin_mesh(br_page_html, sizeof br_page_html);
         b_cpy(br_cur_url, page_url, sizeof br_cur_url);

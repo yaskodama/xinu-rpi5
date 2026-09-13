@@ -1270,7 +1270,14 @@ static int cmd_procdemo(int argc, char **argv)
     return 0;
 }
 
+void board_reboot(void);                       /* 自己更新（system/update.c）からも呼ぶ */
 static int cmd_reboot(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    board_reboot();
+    return 0;
+}
+void board_reboot(void)
 {
     /* Reset the SoC via the BCM2712 PM watchdog ("brcm,bcm2712-pm") at CPU PA
      * 0x10_7D200000 — the same bcm2835-layout PM block (PM_RSTC 0x1c, PM_RSTS
@@ -1279,7 +1286,6 @@ static int cmd_reboot(int argc, char **argv)
     volatile unsigned int *PM = (volatile unsigned int *)0x107D200000UL;
     const unsigned int PW = 0x5a000000u;          /* PM_PASSWORD */
     volatile unsigned long d; unsigned int v;
-    (void)argc; (void)argv;
     uart_puts("reboot: BCM2712 PM watchdog -> full reset...\n");
     v = (PM[0x20/4] & 0xfffffaaau) | PW;           /* PM_RSTS -> boot partition 0 */
     PM[0x20/4] = v;

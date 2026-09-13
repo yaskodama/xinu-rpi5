@@ -1017,6 +1017,22 @@ static int http_build(const char *req, char *out, int max)
         return p;
     }
 
+    if (path_eq(req, "/update")) {
+        /* カーネル自己更新: ?check=1 で GitHub の最新と比べる、?install=1 で取って書いて再起動。
+           どちらも保留にして wm の巡回で行う（数十秒かかる）。応答は今の状態。 */
+        extern void browser_request_url(const char *);
+        extern const char *update_state(void); extern int update_result(void);
+        extern const char *kernel_build_id(void);
+        if (q_int(req, "check", 0) == 1) browser_request_url("xinu://update?check=1");
+        else if (q_int(req, "install", 0) == 1) browser_request_url("xinu://update?install=1");
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "running= "); p = s_put(out, p, kernel_build_id());
+        p = s_put(out, p, "\nresult= "); p = s_putdec(out, p, update_result());
+        p = s_put(out, p, "  state= "); p = s_put(out, p, update_state()); p = s_put(out, p, "\n");
+        return p;
+    }
+
     if (path_eq(req, "/browse")) {
         /* 機内ブラウザ。?url= を付ければその URL を読みに行き、無ければ直近の本文を返す。
          * ?raw=1 で HTML のまま（ヘッダ込み）。この板は表示装置が無いので、

@@ -285,3 +285,86 @@ int fat32_walk_dir(fat32_t *fs, unsigned int cluster, int depth,
     }
     return 0;
 }
+
+/* ---- 複数クラスタのファイル書き（カーネル像の更新用） ---------------------
+ * ルートの 8.3 名 `name` を作る／上書きする。既にあれば旧チェーンを解放して
+ * 同じディレクトリ枠を使う。FAT の空きを頭から順に取り、書きながら繋ぐ。
+ * 途中で失敗したら -1（チェーンは途中まで繋がっているが EOC で閉じている）。
+ * xinu-rpi4 の fat32_write_file_full と同じ役目。 */
+static int fat_scan_free_from(fat32_t *fs, unsigned int from)
+{
+    unsigned long total = (unsigned long)fs->sectors_per_fat * (SD_BLOCK_SIZE / 4);
+    for (unsigned int c = (from < 2 ? 2 : from); c < total; c++)
+        if ((fat32_next_cluster(fs, c) & 0x0FFFFFFFu) == 0) return (int)c;
+    return 0;
+}
+int fat32_write_file_full(fat32_t *fs, const char *name, const void *data, unsigned int len)
+{
+    unsigned int cbytes = (unsigned int)fs->sectors_per_cluster * SD_BLOCK_SIZE;
+    unsigned char raw[11]; name_to_8_3(name, raw);
+    const unsigned char *src = (const unsigned char *)data;
+
+    /* 既存の項目を探す（ルートのチェーンを辿る） */
+    unsigned long ent_sec = 0; unsigned int ent_off = 0, old_first = 0; int exists = 0;
+    { unsigned int cur = fs->root_cluster; int safety = 1024;
+      while (cur >= 2 && cur < 0x0FFFFFF8u && safety-- > 0 && !exists) {
+          unsigned long dbase = cluster_to_lba(fs, cur);
+          for (unsigned int s = 0; s < fs->sectors_per_cluster && !exists; s++) {
+              if (fs->rd(dbase + s, scratch) != 0) return -1;
+              for (unsigned int off = 0; off + 32 <= SD_BLOCK_SIZE; off += 32) {
+                  unsigned char *e = &scratch[off];
+                  if (e[11] == 0x0F) continue;
+                  int m = 1; for (int i = 0; i < 11; i++) if (e[i] != raw[i]) { m = 0; break; }
+                  if (m) { exists = 1; ent_sec = dbase + s; ent_off = off;
+                           old_first = ((unsigned int)e[21] << 24) | ((unsigned int)e[20] << 16) | ((unsigned int)e[27] << 8) | e[26]; break; }
+              }
+          }
+          cur = fat32_next_cluster(fs, cur);
+      } }
+    if (exists && old_first >= 2) {                     /* 旧チェーンを解放 */
+        unsigned int c = old_first; int safety = 1 << 20;
+        while (c >= 2 && c < 0x0FFFFFF8u && safety-- > 0) { unsigned int nx = fat32_next_cluster(fs, c); fat_set_entry(fs, c, 0); c = nx; }
+    }
+    /* 取りながら書いて繋ぐ */
+    unsigned int first = 0, prev = 0, cursor = 2, done = 0;
+    do {
+        int c = fat_scan_free_from(fs, cursor);
+        if (c < 2) return -1;
+        cursor = (unsigned int)c + 1;
+        if (fat_set_entry(fs, (unsigned int)c, 0x0FFFFFFFu) != 0) return -1;   /* まず EOC */
+        if (prev) { if (fat_set_entry(fs, prev, (unsigned int)c) != 0) return -1; }
+        else first = (unsigned int)c;
+        unsigned long base = cluster_to_lba(fs, (unsigned int)c);
+        for (unsigned int s = 0; s < fs->sectors_per_cluster; s++) {
+            for (int i = 0; i < SD_BLOCK_SIZE; i++) { scratch[i] = (done < len) ? src[done] : 0; if (done < len) done++; }
+            if (fs->wr(base + s, scratch) != 0) return -1;
+            if (done >= len) break;
+        }
+        prev = (unsigned int)c;
+    } while (done < len);
+    (void)cbytes;
+    /* ディレクトリ項目（既存の枠か、空き枠） */
+    if (!exists) {
+        unsigned int cur = fs->root_cluster; int safety = 1024, found = 0;
+        while (cur >= 2 && cur < 0x0FFFFFF8u && safety-- > 0 && !found) {
+            unsigned long dbase = cluster_to_lba(fs, cur);
+            for (unsigned int s = 0; s < fs->sectors_per_cluster && !found; s++) {
+                if (fs->rd(dbase + s, scratch) != 0) return -1;
+                for (unsigned int off = 0; off + 32 <= SD_BLOCK_SIZE; off += 32) {
+                    unsigned char *e = &scratch[off];
+                    if (e[0] == 0x00 || e[0] == 0xE5) { ent_sec = dbase + s; ent_off = off; found = 1; break; }
+                }
+            }
+            cur = fat32_next_cluster(fs, cur);
+        }
+        if (!found) return -1;
+    }
+    if (fs->rd(ent_sec, scratch) != 0) return -1;
+    { unsigned char *e = &scratch[ent_off];
+      if (!exists) { for (int i = 0; i < 32; i++) e[i] = 0; for (int i = 0; i < 11; i++) e[i] = raw[i]; e[11] = 0x20; }
+      e[20] = (first >> 16) & 0xFF; e[21] = (first >> 24) & 0xFF;
+      e[26] = first & 0xFF;         e[27] = (first >> 8) & 0xFF;
+      e[28] = len & 0xFF; e[29] = (len >> 8) & 0xFF; e[30] = (len >> 16) & 0xFF; e[31] = (len >> 24) & 0xFF; }
+    if (fs->wr(ent_sec, scratch) != 0) return -1;
+    return 0;
+}

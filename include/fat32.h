@@ -78,6 +78,7 @@ int fat32_read_file(fat32_t *fs, unsigned int first_cluster,
 /* Write a small file (<= one cluster) named `name` (8.3) into the directory
  * whose first cluster is `dir_cluster`, allocating one free cluster and adding/
  * overwriting the directory entry.  Returns 0 on success, -1 on error. */
+int fat32_write_file_full(fat32_t *fs, const char *name, const void *data, unsigned int len);
 int fat32_write_file(fat32_t *fs, unsigned int dir_cluster, const char *name,
                      const void *buf, unsigned long len);
 

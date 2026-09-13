@@ -564,7 +564,7 @@ static int g_menu_x, g_menu_y;
 #define MENU_W       128
 #define MENU_ITEM_H  18
 #define MENU_PAD     3
-static const char *g_menu_items[] = { "Shell", "BASIC", "AVM files", "MAKINA", "Text size" };
+static const char *g_menu_items[] = { "Shell", "BASIC", "AVM files", "MAKINA", "Text size", "Check update" };
 #define MENU_N ((int)(sizeof(g_menu_items) / sizeof(g_menu_items[0])))
 
 /* Painted by wm_run() after all windows (see wm_set_overlay), so it floats on
@@ -684,6 +684,9 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
                             fw->font_scale = (fw->font_scale >= 2) ? 1 : 2;
                             wm_request_full_redraw();
                         }
+                    } else if (it == 5) {                   /* "Check update" -> GitHub の最新と比べる */
+                        extern void browser_request_url(const char *);
+                        browser_request_url("xinu://update?check=1");   /* wm の巡回で確認し、窓に結果を出す */
                     }
                 }
                 g_menu_vis = 0;
@@ -1831,6 +1834,10 @@ void kernel_main(void)
     g_net_pid = proc_create(net_proc_main, 65536, "net");
     proc_set_preempt(1);
 
+    /* ---- カーネル自己更新の板固有部（system/update.c の hook） ---- */
+    /* Pi 5 の起動媒体は USB（XINU5）だが、USB 記憶装置への書き込みは無い。
+       SD が挿してあれば（ファームは SD を先に見る）そこへ書く。無ければ理由を返す。 */
+    (void)0;
     /* 起動時に機内ブラウザを走らせる。DHCP と ARP が落ち着くまで少し待つ ――
      * 待たずに引くと、ゲートウェイの MAC が未学習で経路が作れない。
      * 専用プロセスにするのは、ここで数秒ブロックすると起動が止まるため。 */
@@ -2179,4 +2186,26 @@ void kernel_main(void)
 
     /* Hand off to the bare-metal REPL (never returns). */
     shell_main();
+}
+
+
+/* ===== カーネル自己更新の板固有部（system/update.c が呼ぶ） ================ */
+const char *update_board_name(void) { return "pi5"; }
+int update_write_kernel(const unsigned char *img, unsigned int len, char *why, int cap)
+{
+    extern int sd_init(void);
+    extern int fat32_mount(fat32_t *fs);
+    extern int fat32_write_file_full(fat32_t *fs, const char *name, const void *data, unsigned int len);
+    static fat32_t fs;
+    const char *m = 0;
+    if (sd_init() != 0) m = "no SD card (Pi 5 boots from USB; put the boot files on an SD card to enable self-update)";
+    else if (fat32_mount(&fs) != 0) m = "SD is not FAT32";
+    else if (fat32_write_file_full(&fs, "kernel_2712.img", img, len) != 0) m = "FAT32 write failed";
+    if (m) { int i = 0; while (m[i] && i < cap - 1) { why[i] = m[i]; i++; } why[i] = 0; return -1; }
+    return 0;
+}
+void update_reboot(void)
+{
+    extern void board_reboot(void);
+    board_reboot();
 }
