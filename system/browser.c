@@ -342,6 +342,7 @@ static int br_tcp_send(unsigned char flags, const unsigned char *data, int dlen)
 /* 計器: 受信した段・順序外の段・順序外の FIN・途中で切れた本文（/browse の net= に出す）。
    「本文が途中で切れる」がどこで起きているかを、推測でなく数で見るため。 */
 static long br_st_seg, br_st_ooo, br_st_finooo, br_st_trunc, br_st_retry;
+static long br_st_px_req, br_st_px_hit, br_st_px_fetch;   /* 代理: 要求／控えから返した／取りに行った */
 static long br_st_dup, br_st_fut;     /* ooo の内訳: 既に受けた段の再送（=こちらの ACK が届いていない）／先の段（=手前の段が欠けた） */
 static unsigned long br_st_gem_rre, br_st_gem_ovr, br_st_gem_frames;   /* GEM 統計の累計 */
 
@@ -589,6 +590,7 @@ int browser_netinfo(char *d, int cap)
     PS(" seg="); PL(br_st_seg); PS(" ooo="); PL(br_st_ooo); PS(" finooo="); PL(br_st_finooo);
     PS(" trunc="); PL(br_st_trunc); PS(" retry="); PL(br_st_retry);
     PS(" dup="); PL(br_st_dup); PS(" fut="); PL(br_st_fut);
+    PS(" px="); PL(br_st_px_req); PS("/"); PL(br_st_px_hit); PS("/"); PL(br_st_px_fetch);
     { extern void rp1eth_rx_stats(unsigned int *, unsigned int *, unsigned int *);
       unsigned int fr, rre, ovr; rp1eth_rx_stats(&fr, &rre, &ovr);
       br_st_gem_frames += fr; br_st_gem_rre += rre; br_st_gem_ovr += ovr; }
@@ -917,6 +919,83 @@ void browser_draw_window(void *selfv, unsigned int frame)
  *   「核0 は idle だから何もしない」と同じ構造である。
  *   したがって basicwin_poll_pending / wifi_adhoc_poll_pending と同じく、
  *   wm の巡回から呼ぶ。取得中は画面が数秒止まるが、それらと同じ割り切りである。 */
+
+/* ===== メッシュ上の板のための HTTP 代理（ゲートウェイ役） =================
+ * 無線しか持たない（あるいは有線が無い）板が、この板を経由して外（airilab.app）を
+ * 読むための口。UDP/9020 に「G <off> <url>」が来たら、
+ *   ・控えに同じ url があれば   「D <off> <total> <len> <content-type>\n」＋その位置からの本文（≦1200 B）
+ *   ・無ければ                    「W」（取りに行くので待て）と返し、wm の巡回で有線から取って控える
+ *   ・取れなければ                「E <理由>」
+ * 一問一答（停止待ち）なので、相手は落ちた分を聞き直せばよい。受信の文脈では通信の
+ * 完了を待たず、控えを返すだけ。 */
+#define BR_PROXY_PORT 9020
+#define BR_PROXY_CHUNK 1200
+static char br_px_url[256];             /* 控えの url */
+static char br_px_body[65536];
+static int  br_px_len = -1;             /* -1 = 控え無し */
+static char br_px_ctype[64];
+static char br_px_err[96];
+static char br_px_want[256];            /* 取りに行く url（wm の巡回が消費） */
+extern void wifi_udp_send(const unsigned char *dmac, const unsigned char *dip, int sport, int dport, const unsigned char *p, int plen);
+
+void browser_proxy_request(const unsigned char *src_mac, const unsigned char *src_ip, int sport,
+                           const unsigned char *pl, int plen)
+{
+    static unsigned char rep[1500];
+    if (plen < 4 || pl[0] != 'G' || pl[1] != ' ') return;
+    br_st_px_req++;
+    int p = 2, off = 0;
+    while (p < plen && pl[p] >= '0' && pl[p] <= '9') off = off * 10 + (pl[p++] - '0');
+    while (p < plen && pl[p] == ' ') p++;
+    char url[256]; int ul = 0;
+    while (p < plen && pl[p] > ' ' && ul < 255) url[ul++] = (char)pl[p++];
+    url[ul] = 0;
+    if (ul == 0) return;
+    int o = 0;
+    if (br_px_len >= 0 && b_eqn(url, br_px_url, ul + 1)) {
+        br_st_px_hit++;
+        int n = br_px_len - off; if (n < 0) n = 0; if (n > BR_PROXY_CHUNK) n = BR_PROXY_CHUNK;
+        const char *h = "D "; for (int i = 0; h[i]; i++) rep[o++] = (unsigned char)h[i];
+        { char nb[16]; int k;
+          #define PUTNUM(v_) do { long v = (v_); k = 0; if (v == 0) nb[k++] = '0'; while (v > 0) { nb[k++] = (char)('0' + v % 10); v /= 10; } while (k > 0) rep[o++] = (unsigned char)nb[--k]; rep[o++] = ' '; } while (0)
+          PUTNUM(off); PUTNUM(br_px_len); PUTNUM(n);
+          #undef PUTNUM
+        }
+        for (int i = 0; br_px_ctype[i] && o < 200; i++) rep[o++] = (unsigned char)br_px_ctype[i];
+        rep[o++] = '\n';
+        for (int i = 0; i < n; i++) rep[o++] = (unsigned char)br_px_body[off + i];
+    } else if (br_px_err[0] && b_eqn(url, br_px_want, ul + 1) == 0 && b_eqn(url, br_px_url, ul + 1)) {
+        rep[o++] = 'E'; rep[o++] = ' '; for (int i = 0; br_px_err[i] && o < 200; i++) rep[o++] = (unsigned char)br_px_err[i];
+    } else {
+        if (!br_px_want[0]) { b_cpy(br_px_want, url, sizeof br_px_want); br_px_err[0] = 0; }
+        rep[o++] = 'W';
+    }
+    wifi_udp_send(src_mac, src_ip, BR_PROXY_PORT, sport, rep, o);
+}
+
+/* wm の巡回から：頼まれた url を有線で取って控える */
+static void br_proxy_poll(void)
+{
+    if (!br_px_want[0]) return;
+    static char u[256]; b_cpy(u, br_px_want, sizeof u);
+    br_st_px_fetch++;
+    int r = browser_fetch_raw(u);
+    b_cpy(br_px_url, u, sizeof br_px_url);
+    if (r > 0) {
+        int n = br_body_len < (int)sizeof br_px_body ? br_body_len : (int)sizeof br_px_body;
+        for (int i = 0; i < n; i++) br_px_body[i] = br_body[i];
+        br_px_len = n; br_px_err[0] = 0;
+        /* content-type をヘッダから */
+        b_cpy(br_px_ctype, "text/html", sizeof br_px_ctype);
+        { const char *k = "content-type:"; int kl = b_len(k); int hl = (int)(br_body - br_page);
+          for (int i = 0; i + kl < hl; i++)
+              if (b_eqn(br_page + i, k, kl)) { int q = i + kl; while (q < hl && br_page[q] == ' ') q++;
+                  int c = 0; while (q < hl && br_page[q] != '\r' && br_page[q] != '\n' && br_page[q] != ';' && c < 60) br_px_ctype[c++] = br_page[q++];
+                  br_px_ctype[c] = 0; break; } }
+    } else { br_px_len = -1; b_cpy(br_px_err, br_note, sizeof br_px_err); }
+    br_px_want[0] = 0;
+}
+
 void browser_poll_pending(void)
 {
     static long ticks = 0;
@@ -929,6 +1008,7 @@ void browser_poll_pending(void)
         if (br_status > 0) first_done = 1;    /* 通ったら以後は定期更新へ */
         return;                                /* 失敗したらまた 10 秒後に試す */
     }
+    br_proxy_poll();                                            /* メッシュの板から頼まれた url を取る */
     if (br_pending_lang >= 0) { browser_set_lang(br_pending_lang); br_pending_lang = -1; }
     if (br_pending_url[0]) {                                    /* クリックで辿る */
         static char u[256]; b_cpy(u, br_pending_url, sizeof u); br_pending_url[0] = 0;

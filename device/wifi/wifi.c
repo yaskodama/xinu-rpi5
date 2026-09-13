@@ -1936,6 +1936,14 @@ static void wifi_handle_frame(u8 *fr, int len, int doff)
         u8 *ip = e + 14;
         int ihl = (ip[0] & 0x0F) * 4;
         if (aodv_ip_in(e, elen)) return;             /* AODV control / relay */
+        if (ip[9] == 17) {                              /* HTTP 代理（メッシュの板が外を読む口）UDP/9020 */
+            u8 *udp = ip + ihl; int dport = (udp[2] << 8) | udp[3], sport = (udp[0] << 8) | udp[1];
+            int ul = ((udp[4] << 8) | udp[5]) - 8;
+            if (dport == 9020 && ul > 0 && 14 + ihl + 8 + ul <= elen && wifi_ip_eq(ip + 16)) {
+                extern void browser_proxy_request(const unsigned char *, const unsigned char *, int, const unsigned char *, int);
+                browser_proxy_request(e + 6, ip + 12, sport, udp + 8, ul); return;
+            }
+        }
         if (manet_ip_in(e, elen)) return;            /* M14 MANET app (UDP/5000) */
         if (ip[9] == 1 && wifi_ip_eq(ip + 16)) {     /* ICMP to us */
             u8 *ic = ip + ihl;
@@ -2405,6 +2413,9 @@ static void wifi_udp_tx(const u8 *nh, const u8 *dip, int sport, int dport, const
     for (i=0;i<plen;i++) udp[8+i]=p[i];
     wifi_data_tx(tx, framelen);
 }
+/* 外（browser.c の代理）から UDP を出す口。 */
+void wifi_udp_send(const unsigned char *dmac, const unsigned char *dip, int sport, int dport, const unsigned char *p, int plen)
+{ wifi_udp_tx(dmac, dip, sport, dport, p, plen); }
 
 /* ================================================================== *
  *  M13 — minimal AODV multi-hop routing (RFC 3561 core)             *
