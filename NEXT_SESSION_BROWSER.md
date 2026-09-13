@@ -157,6 +157,21 @@
 - 試し方: 三板をメッシュに参加 → Pi3 で `/browse?via=mesh&url=http://airilab.app/` → `note= ok (via mesh)`、
   Pi5 の `/browse` の `net=` に `px=要求/控え/取得` が増える。
 
+### カーネルの自己更新（2026-09-13 18:00、三板とも未焼き）
+- **GitHub `yaskodama/xinu-kernels`**（`~/projects/xinu-kernels`）: `pi5/kernel_2712.img` `pi4/kernel8.img` `pi3/kernel.img` と
+  `manifest.json`（build・size・md5・fnv64）。**`./publish.sh [pi5|pi4|pi3]`** で手元の compile/ から写して push。
+- **airilab.app v20** が中継（板は TLS を話せない）: `http://airilab.app/api/xinu/manifest`、`…/api/xinu/kernel?board=&off=&len=`。
+- 板: `system/update.c`（Pi3 は `apps/update.c`、同じ中身）。右クリック **「Check update」** → `xinu://update?check=1` を
+  ブラウザの保留に入れ、wm の巡回（Pi3 はブラウザのスレッド）で manifest を取り、`kernel_build_id()` と比べて窓に出す。
+  「update available」なら窓の `[ Download and reboot ]` か `GET /update?install=1` → 32 KB ずつ RAM（3 MB）に集め、
+  fnv64 と大きさで照合 → 起動媒体の FAT に書く → 再起動。`GET /update` で状態、`?check=1` `?install=1`。
+- 板ごとの書き込み: Pi4 = microSD `kernel8.img`（fat32_write_file_full、CMD24 は sdwtest で実証済み）、
+  Pi3 = SD `kernel.img`（fat_write_root）、**Pi5 = USB 起動なので書けない**（SD が挿してあれば `kernel_2712.img` を書く。
+  ファームは SD を先に見るので、起動ファイル一式を SD に置けば以後は自己更新できる）。
+- **最初の自己更新対応カーネルは手で焼く**: Pi5 17:58:18（`787c90d0…`）、Pi4 17:59:04（`397fb5d3…`）、Pi3 17:59:59（`5c976f07…`）
+  ＝ manifest と同じ。焼いた直後は `/update?check=1` → `up to date`。次の版からは publish.sh → 板で「Check update」。
+- 未検証: 実機での書き込みと再起動（Pi4 → Pi3 の順に試す。失敗しても RAM に集めて照合するまでは無害）。
+
 ## 最初にやること
 
 ```bash
