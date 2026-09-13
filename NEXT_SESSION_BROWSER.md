@@ -6,7 +6,7 @@
 |---|---|---|
 | Pi 5 | **`build Sep 13 2026 16:04:04`**（md5 `2fe9fc3f…`）X-Xinu-Board＋メッシュ経路＋xinu://mesh。実機で起動・英語版・xinu://mesh（未参加表示）・airilab.app の記録に板名が付くことを確認 | 同じ |
 | Pi 4 | **`build Sep 13 2026 16:19:56`**（md5 `95e4a0f4…`）ブラウザ移植（`~/projects/xinu-rpi4` 41dd2fd）。実機で起動 10 秒後に airilab.app が窓に出ること・airilab.app の記録に「Pi4 build …」が付くことを確認。控え `kernel8.img.bak-pre-browser-d54ed4b7` | 同じ |
-| Pi 3 | 06:33 ビルド（`xinu.boot`） | 同じ（変更なし） |
+| Pi 3 | `build Sep 8 2026 15:37:15`（ブラウザ無し。9/13 に焼き直し） | **`build Sep 13 2026 16:46:01`**（md5 `c95e2030…`, 2.45 MB）**未焼き**。ブラウザ移植（`~/projects/xinu-rpi3` ae3bf8a）。SD `XINU` の `kernel.img` |
 
 焼き方は **USB / SD の物理交換のみ**。Pi 5 は USB `XINU5`、Pi 4 は SD `bootfs` の
 `kernel8.img`、Pi 3 は SD `XINU` の `kernel.img`（＝`compile/xinu.boot`）。
@@ -126,6 +126,15 @@
   `/browse?url=` は保留→wm の巡回（`browser_request_url`）、GENET の統計は 0、板名 Pi4。
 - main.c: `genet_rx_tick` の連鎖の先頭に `browser_handle`、`net_yield_tick` に `browser_poll_pending`、窓は (300,30) 700x600。
 - 未検証は実機のみ。Pi 4 の `/fb` は `?info` と 1200 B の塊（Pi 5 の fbgrab.py はそのまま使えない）。
+
+### Pi 3 への移植（2026-09-13、`~/projects/xinu-rpi3` arm-rpi3-port ae3bf8a、未検証は実機のみ）
+- **作りが違う**: Pi 3 は Embedded Xinu なので、自前の ARP/DNS/TCP ではなく **Xinu の TCP 装置（TCP_ACTIVE）と UDP 装置**で取る
+  （`apps/browser.c`、`abcl_xinu_net.c` の net_connect と同じ流儀）。専用スレッド `browser_main`（sleep(10000) → 取得 → 60 秒ごと）。
+- gwm は毎フレーム描き直さない → 内容が変わったら `gwm_request_repaint()`（g_need_full）。描画は `g_force_redraw || br_dirty` の時だけ。
+  クリックは `wm_drag_tick` で `window_at_point()==&browser_win` のとき `browser_click()`。
+- `GET /browse` は webactor.c（url は保留→スレッド）。Pi 3 の無線は Xinu の網装置ではないので `xinu://mesh` は一覧のみ。
+- html.c / jpfont.c は三板で同一（正典 xinu-rpi5）。ARM32（long=32bit）でも問題ない範囲。
+- 実機で見るもの: `curl :8080/browse` が `ok (en)` になるか、画面の窓、airilab.app の記録に「Pi3 build …」。
 
 ## 最初にやること
 
