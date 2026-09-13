@@ -267,6 +267,15 @@ int rp1eth_tx_frame(const unsigned char *f, int len)
     return ok ? 0 : -1;
 }
 
+/* GEM の統計レジスタ（読むと 0 に戻る）。0x158 受信フレーム数、0x1A0 受信資源エラー
+ * （記述子が無くて落とした）、0x1A4 受信オーバーラン。
+ * 「本文が途中で切れる」が板の受信で落ちているのか、外で落ちているのかを見るため。 */
+void rp1eth_rx_stats(unsigned int *frames, unsigned int *resource_err, unsigned int *overrun)
+{
+    E(GEM_NCR) |= (1u << 7);            /* WESTAT: 統計レジスタへの書き込みを許す（読み出しは常に可） */
+    *frames = E(0x158); *resource_err = E(0x1A0); *overrun = E(0x1A4);
+}
+
 static void rp1eth_rx_rearm(void)   /* hand the whole RX ring back to HW */
 {
     for (int i = 0; i < RXN; i++) {

@@ -20,6 +20,7 @@
 #include "wifi.h"
 #ifdef SMP_SYMMETRIC
 #include "smp.h"        /* SMP_NCORES（/smpsched の per-core 集計に使う） */
+#include "smpsched.h"   /* smpsched_on（いまどちらの方式で走っているか） */
 #endif
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
@@ -395,6 +396,29 @@ static void tree_visit(int depth, vfs_node_t *n, void *c)
 
 /* Locate "key=" in NUL-terminated `req` and copy its value (up to the
  * next '&', ' ' or end) into out[0..max-1].  Returns 1 if found. */
+/* %XX と '+' を戻す。q_param は生のまま返すので、式や URL を渡すときに要る。 */
+static void url_decode(char *s)
+{
+    int r = 0, w = 0;
+    while (s[r]) {
+        char c = s[r];
+        if (c == '+') { s[w++] = ' '; r++; }
+        else if (c == '%' && s[r+1] && s[r+2]) {
+            int hi = s[r+1], lo = s[r+2], v = 0, ok = 1;
+            for (int k = 0; k < 2; k++) {
+                int d = k ? lo : hi, x;
+                if (d>='0'&&d<='9') x = d-'0';
+                else if (d>='a'&&d<='f') x = d-'a'+10;
+                else if (d>='A'&&d<='F') x = d-'A'+10;
+                else { ok = 0; break; }
+                v = v*16 + x;
+            }
+            if (ok) { s[w++] = (char)v; r += 3; } else { s[w++] = c; r++; }
+        } else { s[w++] = c; r++; }
+    }
+    s[w] = 0;
+}
+
 static int q_param(const char *req, const char *key, char *out, int max)
 {
     for (const char *p = req; *p; p++) {
@@ -955,6 +979,147 @@ static int http_build(const char *req, char *out, int max)
         return p;
     }
 
+    if (path_eq(req, "/js")) {
+        /* 機内 JS 処理系の単体確認。?src= に式や文を渡すと評価して返す。
+           DOM はまだ無い（次の段階）。ここでは処理系だけを確かめる。 */
+        extern void js_reset(void); extern int js_run(const char *, int);
+        extern const char *js_error(void), *js_output(void); extern int js_failed(void);
+        extern void js_output_clear(void);
+        static char srcbuf[2048];
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        if (!q_param(req, "src", srcbuf, sizeof srcbuf)) {
+            p = s_put(out, p, "usage: /js?src=<JavaScript>\n"); return p; }
+        url_decode(srcbuf);
+        { int n = 0; while (srcbuf[n]) n++;
+          js_reset(); js_output_clear();
+          int r = js_run(srcbuf, n);
+          extern const char *js_strbase(void);
+          p = s_put(out, p, "src= "); p = s_put(out, p, srcbuf);
+          p = s_put(out, p, "\nout= "); p = s_put(out, p, js_output());
+          p = s_put(out, p, "\nvalue= "); p = s_put(out, p, js_strbase() + r);
+          { extern int js_usage(char *, int); char ub[160]; js_usage(ub, sizeof ub);
+            p = s_put(out, p, "\nusage= "); p = s_put(out, p, ub); }
+          if (js_failed()) { p = s_put(out, p, "\nerror= "); p = s_put(out, p, js_error());
+              { extern int js_error_pos(void), js_error_snippet(char *, int);
+                char sn[128]; js_error_snippet(sn, sizeof sn);
+                p = s_put(out, p, "\npos= "); p = s_putdec(out, p, js_error_pos());
+                p = s_put(out, p, "\nnear= "); p = s_put(out, p, sn); } }
+          p = s_put(out, p, "\n"); }
+        return p;
+    }
+
+    if (path_eq(req, "/browse")) {
+        /* 機内ブラウザ。?url= を付ければその URL を読みに行き、無ければ直近の本文を返す。
+         * ?raw=1 で HTML のまま（ヘッダ込み）。この板は表示装置が無いので、
+         * 実質ここが画面である。 */
+        extern int  browser_fetch(const char *url);
+        extern const char *browser_url(void), *browser_text(void), *browser_note(void);
+        extern const char *browser_raw(void);
+        extern int  browser_text_len(void), browser_status(void), browser_raw_len(void);
+        static char urlbuf[256];
+        { extern int browser_parse_ip(const char *, unsigned char *);
+          extern void browser_set_gw(const unsigned char *), browser_set_dns(const unsigned char *);
+          char t[32]; unsigned char a[4];
+          if (q_param(req, "gw",  t, sizeof t) && browser_parse_ip(t, a)) browser_set_gw(a);
+          if (q_param(req, "dns", t, sizeof t) && browser_parse_ip(t, a)) browser_set_dns(a); }
+        if (q_int(req, "js", 0) == 1) {
+            /* 機内 JS 処理系でサイトの JS を実行して組み立てる（本物の実行）。 */
+            extern int browser_fetch_js(const char *, const char *);
+            static char pu2[256];
+            if (!q_param(req, "url", pu2, sizeof pu2))
+                { const char *d = "http://airilab.app/"; int i=0; while(d[i]&&i<255){pu2[i]=d[i];i++;} pu2[i]=0; }
+            else url_decode(pu2);
+            browser_fetch_js(pu2, "http://airilab.app/js/i18n.js");
+        } else if (q_int(req, "en", 0) == 1) {
+            /* 英語版。airilab.app は英語を HTML に持たず JS で差し替えるので、
+               同じ置換を板の側で行う（下の browser_fetch_en を見よ）。 */
+            extern int browser_fetch_en(const char *, const char *);
+            static char pu[256];
+            if (!q_param(req, "url", pu, sizeof pu)) 
+                { const char *d = "http://airilab.app/"; int i=0; while(d[i]&&i<255){pu[i]=d[i];i++;} pu[i]=0; }
+            browser_fetch_en(pu, "http://airilab.app/js/i18n.js");
+        } else if (q_param(req, "url", urlbuf, sizeof urlbuf)) {
+            /* 指定 URL を、外部 CSS と辞書込みで開く（窓のリンクを辿るのと同じ経路） */
+            extern int browser_fetch_en(const char *, const char *);
+            url_decode(urlbuf); browser_fetch_en(urlbuf, "http://airilab.app/js/i18n.js"); }
+        { char lb[8];                                 /* ?lang=ja|en で言語を切り替える（控えから組み直す） */
+          extern void browser_set_lang(int);
+          if (q_param(req, "lang", lb, sizeof lb)) browser_set_lang(lb[0] == 'j' || lb[0] == 'J'); }
+        int raw = q_int(req, "raw", 0);
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "url= ");    p = s_put(out, p, browser_url());
+        p = s_put(out, p, "\nstatus= "); p = s_putdec(out, p, browser_status());
+        p = s_put(out, p, "  note= ");   p = s_put(out, p, browser_note());
+        p = s_put(out, p, "\nbytes= ");  p = s_putdec(out, p, browser_raw_len());
+        p = s_put(out, p, "  text= ");   p = s_putdec(out, p, browser_text_len());
+        { extern int browser_netinfo(char *, int);
+          char nb[320]; browser_netinfo(nb, sizeof nb);
+          p = s_put(out, p, "\nnet= "); p = s_put(out, p, nb); }
+        p = s_put(out, p, "\n----\n");
+        { const char *b = raw ? browser_raw() : browser_text();
+          int n = raw ? browser_raw_len() : browser_text_len();
+          int cap = max - p - 8;                  /* out はポインタ。長さは max で受け取っている */
+          if (n > cap) n = cap;
+          for (int i = 0; i < n; i++) out[p++] = b[i]; }
+        p = s_put(out, p, "\n");
+        return p;
+    }
+
+    if (path_eq(req, "/spdiag")) {
+        /* 対称SMP型の並列配布の内部状態。?fix=0|1 でスタック世代の入切。 */
+        extern void smpsched_set_genfix(int);
+        extern int  smpsched_get_genfix(void), smpsched_busy(void);
+        extern long smpsched_hang(void), smpsched_maxwait(void), smpsched_reuse(void);
+        extern long smpsched_calls(void), smpsched_units_total(void);
+        int f = q_int(req, "fix", -1);
+        if (f >= 0) smpsched_set_genfix(f);
+        { extern void smpsched_set_noinline(int); extern int smpsched_get_noinline(void);
+          int ni = q_int(req, "noinline", -1);
+          if (ni >= 0) smpsched_set_noinline(ni); }
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "spdiag genfix="); p = s_putdec(out, p, smpsched_get_genfix());
+        { extern int smpsched_get_noinline(void);
+          p = s_put(out, p, " noinline="); p = s_putdec(out, p, smpsched_get_noinline()); }
+        p = s_put(out, p, " busy=");        p = s_putdec(out, p, smpsched_busy());
+        p = s_put(out, p, " calls=");       p = s_putdec(out, p, smpsched_calls());
+        p = s_put(out, p, " units=");       p = s_putdec(out, p, smpsched_units_total());
+        p = s_put(out, p, " hang=");        p = s_putdec(out, p, smpsched_hang());
+        p = s_put(out, p, " maxwait_us=");  p = s_putdec(out, p, smpsched_maxwait());
+        p = s_put(out, p, " reuse=");       p = s_putdec(out, p, smpsched_reuse());
+        { extern long smpsched_inline_us(void), smpsched_wait_us(void),
+                      smpsched_pp_inline(void), smpsched_poll_inline(void);
+          p = s_put(out, p, " inline_us="); p = s_putdec(out, p, smpsched_inline_us());
+          p = s_put(out, p, " wait_us=");   p = s_putdec(out, p, smpsched_wait_us());
+          p = s_put(out, p, " pp_inline="); p = s_putdec(out, p, smpsched_pp_inline());
+          p = s_put(out, p, " poll_inline=");p = s_putdec(out, p, smpsched_poll_inline()); }
+        p = s_put(out, p, "\n");
+        return p;
+    }
+
+    if (path_eq(req, "/avm-run")) {
+        /* 指定ミリ秒のあいだ AIPL の VM を回す。HDMI 無しの板では他に駆動源が無い。
+         *   GET /avm-run?ms=2000  -> 2 秒ぶん回して tick 回数を返す
+         * 測定窓が明示的なので、/avm-par の us/msgs と一対一で対応する。 */
+        extern long avm_pump(long ms);
+        int ms = q_int(req, "ms", 1000);
+        long ticks = avm_pump(ms);
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "avm-run ms="); p = s_putdec(out, p, ms);
+        p = s_put(out, p, " ticks=");     p = s_putdec(out, p, ticks);
+        { extern long avm_get_pump_rounds(void);
+          p = s_put(out, p, " rounds=");  p = s_putdec(out, p, avm_get_pump_rounds()); }
+        p = s_put(out, p, "\n");
+        return p;
+    }
+
     if (path_eq(req, "/avm-par")) {
         /* Toggle/inspect the multi-core actor scheduler at runtime (no reflash).
          *   GET /avm-par           -> report state + diag counters
@@ -971,6 +1136,33 @@ static int http_build(const char *req, char *out, int max)
         p = s_put(out, p, " cores_online="); p = s_putdec(out, p, smp_cores_online());
         p = s_put(out, p, " nbatch=");       p = s_putdec(out, p, avm_get_par_nbatch());
         p = s_put(out, p, " lastbn=");       p = s_putdec(out, p, avm_get_par_lastbn());
+        /* ★ 方式ごとの実効コストを見るための計器。
+         *   us  = 並列配布に費やした総時間、msgs = そのあいだに配ったメッセージ数
+         *   → us/msgs が「1 メッセージあたりの配布コスト」。方式の比較はここで決まる。 */
+        { extern long avm_get_par_us(void), avm_get_par_msgs(void);
+          extern void avm_par_reset_stats(void);
+          if (q_int(req, "reset", 0) == 1) avm_par_reset_stats();
+          long us = avm_get_par_us(), ms = avm_get_par_msgs();
+          p = s_put(out, p, " us=");    p = s_putdec(out, p, us);
+          p = s_put(out, p, " msgs=");  p = s_putdec(out, p, ms);
+          p = s_put(out, p, " us_per_msg_x100=");
+          p = s_putdec(out, p, ms ? (us * 100) / ms : 0);
+          { extern long avm_get_core_hits(int);      /* コア別に実行したメッセージ数 */
+            p = s_put(out, p, " core_hits=");
+            for (int c = 0; c < 4; c++) { if (c) p = s_put(out, p, "/");
+                p = s_putdec(out, p, avm_get_core_hits(c)); } }
+          /* 検算: 標本は各ラウンドの合計を照合し、正なら色2・誤なら色4 の線を引く。
+             ok>0 かつ ng=0 でなければ、その測定値は信用してはいけない。 */
+          { extern long avm_get_line_ok(void), avm_get_line_ng(void);
+            p = s_put(out, p, " ok=");  p = s_putdec(out, p, avm_get_line_ok());
+            p = s_put(out, p, " ng=");  p = s_putdec(out, p, avm_get_line_ng()); } }
+#ifdef SMP_SYMMETRIC
+        { extern volatile int smpsched_on;
+          p = s_put(out, p, " path=");
+          p = s_put(out, p, smpsched_on ? "symmetric" : "workers"); }
+#else
+        p = s_put(out, p, " path=workers");
+#endif
         p = s_put(out, p, "\n");
         return p;
     }
@@ -2016,6 +2208,8 @@ static int http_build(const char *req, char *out, int max)
         bl = s_putdec(body, bl, msN ? (long)((ms1 * 100UL) / msN) : 0);
         bl = s_put(body, bl, "  (e.g. 385 = 3.85x)\n");
     } else if (path_eq(req, "/bench")) {
+        /* ★ 再入よけ: 長い実行の最中に同じ要求が再送されると二重に走り、
+         * 直列と並列の突き合わせ(agree)まで壊れる。1 本ずつに直列化する。 */
         /* Unified SMP benchmark: kind=nqueens|dining|primes.  Reports the SAME
          * 1-core vs N-core wall times + speedup fields as /smp-bench so the Mesh
          * Control Center tabulates them uniformly.
@@ -2065,6 +2259,12 @@ static int http_build(const char *req, char *out, int max)
         /* Timed with now_us() (generic-timer microseconds), NOT now_ms():
          * fill is sub-millisecond.  Serial then parallel back-to-back so the
          * ratio is robust to clock changes — same discipline as Pi 3/Pi 4. */
+        static volatile int bench_busy;
+        if (bench_busy) {
+            bl = s_put(body, bl, "busy (another bench is running)\n");
+            goto bench_done;
+        }
+        bench_busy = 1;
         unsigned long t0 = now_us();
         long r1 = smp_parallel_sum(fn, units, 1);
         unsigned long us1 = now_us() - t0;
@@ -2081,6 +2281,8 @@ static int http_build(const char *req, char *out, int max)
         bl = s_putdec(body, bl, usN ? (long)((us1 * 100UL) / usN) : 0);
         bl = s_put(body, bl, "\n");
         bl = s_put(body, bl, "agree = "); bl = s_put(body, bl, (r1 == rN) ? "yes\n" : "NO\n");
+        bench_busy = 0;
+      bench_done: ;
 #ifdef SMP_SYMMETRIC
     } else if (path_eq(req, "/smpsched")) {
         /* 対称 SMP スケジューラで N-Queens を走らせる（比較実験の第2方式）。
@@ -2091,9 +2293,12 @@ static int http_build(const char *req, char *out, int max)
         extern long smpsched_nqueens(int, int, unsigned long *, int *);
         int nn = q_int(req, "n", 13);
         int nt = q_int(req, "tasks", 8);
+        { extern volatile int smpsched_mode; smpsched_mode = q_int(req, "mode", 1); }
+        { extern void smpsched_set_verify(int); smpsched_set_verify(q_int(req, "verify", 0)); }
         unsigned long ms = 0;
         int ran[SMP_NCORES];
         long sol = smpsched_nqueens(nn, nt, &ms, ran);
+        if (sol < 0) { bl = s_put(body, bl, "busy (another smpsched run is in flight)\n"); goto smpsched_done; }
         bl = s_put(body, bl, "smpsched n=");     bl = s_putdec(body, bl, (long)nn);
         bl = s_put(body, bl, " tasks=");         bl = s_putdec(body, bl, (long)nt);
         bl = s_put(body, bl, " solutions=");     bl = s_putdec(body, bl, sol);
@@ -2103,6 +2308,70 @@ static int http_build(const char *req, char *out, int max)
             if (i) bl = s_put(body, bl, "/");
             bl = s_putdec(body, bl, (long)ran[i]);
         }
+        { extern volatile int smpsched_mode;
+          extern long smpsched_loops(int); extern long smpsched_picks(int);
+          bl = s_put(body, bl, " mode="); bl = s_putdec(body, bl, (long)smpsched_mode);
+          bl = s_put(body, bl, " loops=");
+          for (int i = 0; i < SMP_NCORES; i++) { if (i) bl = s_put(body, bl, "/");
+              bl = s_putdec(body, bl, smpsched_loops(i)); }
+          extern long smpsched_double(void);
+          bl = s_put(body, bl, " dbl="); bl = s_putdec(body, bl, smpsched_double());
+          bl = s_put(body, bl, " picks=");
+          for (int i = 0; i < SMP_NCORES; i++) { if (i) bl = s_put(body, bl, "/");
+              bl = s_putdec(body, bl, smpsched_picks(i)); } }
+        /* 内訳: 各タスクの pid・駆動側が設定した範囲・タスクが実際に読んだ範囲・結果。
+         * 設定と「読んだ範囲」が食い違えば、タスクが別の pid の欄を見ている。 */
+        { extern int smpsched_nslots(void), smpsched_slot_pid(int), smpsched_slot_lo(int),
+                     smpsched_slot_hi(int), smpsched_slot_seenlo(int), smpsched_slot_seenhi(int),
+                     smpsched_inline_lo(void), smpsched_inline_hi(void);
+          extern long smpsched_slot_res(int), smpsched_inline_res(void);
+          bl = s_put(body, bl, "\n slots=");
+          for (int i = 0; i < smpsched_nslots(); i++) {
+              if (i) bl = s_put(body, bl, " ");
+              bl = s_put(body, bl, "p");   bl = s_putdec(body, bl, (long)smpsched_slot_pid(i));
+              bl = s_put(body, bl, ":set"); bl = s_putdec(body, bl, (long)smpsched_slot_lo(i));
+              bl = s_put(body, bl, "-");    bl = s_putdec(body, bl, (long)smpsched_slot_hi(i));
+              bl = s_put(body, bl, ":saw"); bl = s_putdec(body, bl, (long)smpsched_slot_seenlo(i));
+              bl = s_put(body, bl, "-");    bl = s_putdec(body, bl, (long)smpsched_slot_seenhi(i));
+              bl = s_put(body, bl, "="),    bl = s_putdec(body, bl, smpsched_slot_res(i));
+          }
+          { extern int smpsched_mismatch(void); extern long smpsched_res2(int);
+            extern int smpsched_slot_endpid(int);
+            bl = s_put(body, bl, " mism="); bl = s_putdec(body, bl, (long)smpsched_mismatch());
+            bl = s_put(body, bl, " res2=");
+            for (int i = 0; i < smpsched_nslots(); i++) { if (i) bl = s_put(body, bl, "/");
+                bl = s_putdec(body, bl, smpsched_res2(i)); }
+            bl = s_put(body, bl, " endpid=");
+            for (int i = 0; i < smpsched_nslots(); i++) { if (i) bl = s_put(body, bl, "/");
+                bl = s_putdec(body, bl, (long)smpsched_slot_endpid(i)); } }
+          bl = s_put(body, bl, " stkuse=");
+          { extern int smpsched_stkuse(int);
+            for (int i = 0; i < smpsched_nslots(); i++) {
+                if (i) bl = s_put(body, bl, "/");
+                bl = s_putdec(body, bl, (long)smpsched_stkuse(i)); } }
+          bl = s_put(body, bl, " inline="); bl = s_putdec(body, bl, (long)smpsched_inline_lo());
+          bl = s_put(body, bl, "-");        bl = s_putdec(body, bl, (long)smpsched_inline_hi());
+          bl = s_put(body, bl, "=");        bl = s_putdec(body, bl, smpsched_inline_res()); }
+        bl = s_put(body, bl, "\n");
+      smpsched_done: ;
+    } else if (path_eq(req, "/smpmode")) {
+        /* 対称スケジューラへ切り替える（起動時は必ず OFF）。
+         *   curl 'http://192.168.3.101/smpmode'         いまの方式を見る
+         *   curl 'http://192.168.3.101/smpmode?on=1'    二次コアを共有 ready キューへ
+         * ★ 切り替える前に /smplock でロックの自己診断を通すこと。ロックが
+         *   壊っていれば対称スケジューラは必ず止まる。戻すには電源再投入。 */
+        ctype = "text/plain";
+        extern void smpsched_enable(void);
+        if (q_int(req, "on", 0) == 1 && !smpsched_on) smpsched_enable();
+        bl = s_put(body, bl, "smpmode = ");
+        bl = s_put(body, bl, smpsched_on ? "symmetric (shared ready queue)\n"
+                                         : "workers (mailbox, static split)\n");
+        bl = s_put(body, bl, "spinlock = "); { extern const char *spin_impl_name();
+        bl = s_put(body, bl, spin_impl_name()); } bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "cores_online = "); bl = s_putdec(body, bl, (long)smp_cores_online());
+        { extern long smpsched_poll_calls(void), smpsched_poll_hits(void);
+          bl = s_put(body, bl, " poll_calls="); bl = s_putdec(body, bl, smpsched_poll_calls());
+          bl = s_put(body, bl, " poll_hits=");  bl = s_putdec(body, bl, smpsched_poll_hits()); }
         bl = s_put(body, bl, "\n");
     } else if (path_eq(req, "/smplock")) {
         /* スピンロックの実機自己診断。4 コアが per 回ずつ共有カウンタを ++ し、
@@ -2121,6 +2390,8 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " expected=");      bl = s_putdec(body, bl, want);
         bl = s_put(body, bl, " got=");           bl = s_putdec(body, bl, got);
         bl = s_put(body, bl, (got == want) ? "  OK\n" : "  ** BROKEN **\n");
+        bl = s_put(body, bl, "smpmode = ");
+        bl = s_put(body, bl, smpsched_on ? "symmetric\n" : "workers\n");
 #endif
     } else if (path_eq(req, "/nqpart")) {
         /* Distributed N-Queens partial: count solutions for first-queen columns
@@ -2152,6 +2423,8 @@ static int http_build(const char *req, char *out, int max)
         ctype = "text/plain";
         bl = s_put(body, bl, "xinu-rpi5 (Pi 5) actor HTTP gateway\n"
                              "GET /smp-bench?n=<N>  (4-core prime-count benchmark)\n"
+                             "GET /bench?kind=nqueens|primes|dining|fill&n=&cores=  (workers)\n"
+                             "GET /smpmode[?on=1] | /smplock | /smpsched?n=&tasks=  (symmetric)\n"
                              "GET /api/actors\n"
                              "GET /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n"
                              "POST /cc  (C or AIPL source in body) -> JIT compile & run\n"

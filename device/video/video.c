@@ -541,6 +541,36 @@ void draw_glyph_scaled(int px, int py, char c,
     }
 }
 
+/* 任意の点字形を描く。rows は h 行、各行 (w+7)/8 バイト、上位ビットが左。
+ * transparent=1 なら背景を塗らない（太字の重ね書き用）。座標は仮想デスクトップ。
+ * 16 ドットの日本語フォント（device/video/jpfont.c）と 8x16 の ASCII をブラウザが使う。 */
+void draw_bitmap_glyph(int px, int py, const unsigned char *rows, int w, int h,
+                       unsigned int fg, unsigned int bg, int scale, int transparent)
+{
+    if (!fb_ready) return;
+    if (scale < 1) scale = 1;
+    int bpr = (w + 7) / 8;
+    int sx0 = px - view_x, sy0 = py - view_y;
+    for (int gy = 0; gy < h; gy++) {
+        const unsigned char *r = rows + gy * bpr;
+        for (int sy = 0; sy < scale; sy++) {
+            int rsy = sy0 + gy * scale + sy;
+            if (rsy < 0 || rsy >= (int)fb_height) continue;
+            unsigned int *line = (unsigned int *)(fb_draw + rsy * fb_pitch);
+            for (int gx = 0; gx < w; gx++) {
+                int on = r[gx >> 3] & (0x80 >> (gx & 7));
+                if (!on && transparent) continue;
+                unsigned int col = on ? fg : bg;
+                for (int sxx = 0; sxx < scale; sxx++) {
+                    int rsx = sx0 + gx * scale + sxx;
+                    if (rsx < 0 || rsx >= (int)fb_width) continue;
+                    line[rsx] = col;
+                }
+            }
+        }
+    }
+}
+
 void draw_string_scaled(int px, int py, const char *s,
                         unsigned int fg, unsigned int bg, int scale)
 {

@@ -53,6 +53,8 @@ extern unsigned long dhcp_ack_count(void);
 extern void dhcp_get_ip(unsigned char out[4]);
 extern int  tcp_handle_packet(const unsigned char *frame, int len);
 extern int  aipl_remote_handle(const unsigned char *frame, int len);
+extern int  browser_handle(const unsigned char *frame, int len);   /* 機内ブラウザの受信 */
+
 extern void tcp_set_mac(const unsigned char mac[6]);
 extern void tcp_set_ip(const unsigned char ip[4]);
 extern void tcp_listen(unsigned short port);
@@ -170,6 +172,7 @@ static void genet_rx_tick(void)
         sl = g_stash_len[g_stash_n];
         for (int i = 0; i < sl; i++) sb[i] = g_stash[g_stash_n][i];
         if (!dhcp_handle_packet(sb, sl) &&
+            !browser_handle(sb, sl) &&
             !tcp_handle_packet(sb, sl) &&
             !aipl_remote_handle(sb, sl)) {
             net_responder_handle(sb, sl);
@@ -256,6 +259,7 @@ static void genet_rx_tick(void)
                 }
             }
         } else if (!dhcp_handle_packet(pkt, len) &&
+            !browser_handle(pkt, len) &&
             !tcp_handle_packet(pkt, len) &&
             !aipl_remote_handle(pkt, len)) {     /* AIPL remote(...) = UDP/9010 */
             net_responder_handle(pkt, len);
@@ -345,7 +349,10 @@ void net_rx_pump(void)
         for (int i = 0; i < n; i++) cp[i] = pkt[i];
         genet_rx_release();
         irq_restore(d);
-        if (!aipl_remote_handle(cp, n)) {
+        /* ブラウザの待ち（ARP 応答・DNS 応答・TCP）もここで拾う。
+           browser_handle は ARP を消費せず 0 を返すので、控えにも積まれて
+           本ループの応答器へ渡る（二重処理にならない）。 */
+        if (!browser_handle(cp, n) && !aipl_remote_handle(cp, n)) {
             if (g_stash_n < RX_STASH_MAX) {
                 for (int i = 0; i < n; i++) g_stash[g_stash_n][i] = cp[i];
                 g_stash_len[g_stash_n] = n;
@@ -368,6 +375,29 @@ void net_rx_pump(void)
  * of in interrupt context.  It is the only non-NULL process (prio 1), so nothing
  * preempts it mid-actor: the non-reentrant AIPL runtime stays safe. */
 static int g_net_pid = -1;
+
+/* 起動時のブラウザ。ネットワークが安定するのを待ってから一度読む。 */
+static void browser_boot_proc(void)
+{
+    extern void browser_boot(void);
+    extern int  browser_status(void);
+    extern int  browser_fetch(const char *);
+    extern const char *browser_url(void);
+    extern void proc_sleep_us(unsigned long us);
+    proc_sleep_us(5000000UL);          /* リンク確立を待つ（専用プロセスなので寝てよい） */
+    browser_boot();
+    /* 一度で通らないことがある（ARP も DNS も落ちうる）。通るまで数回試し、
+     * そのあとは定期的に読み直して窓の中身を新しく保つ。
+     * 起動直後に一度きりだと、失敗したまま空の窓が残る。 */
+    for (int i = 0; i < 5 && browser_status() <= 0; i++) {
+        proc_sleep_us(5000000UL);
+        browser_fetch(browser_url());
+    }
+    for (;;) {
+        proc_sleep_us(60000000UL);     /* 60 秒ごとに読み直す */
+        browser_fetch(browser_url());
+    }
+}
 
 static void net_proc_main(void)
 {
@@ -1525,6 +1555,9 @@ static void serial_io_tick(void)
     /* Run a queued /wifi-adhoc mesh-join here (off the request path): WiFi
      * bring-up blocks this loop ~1 min, but the HTTP reply already flushed. */
     { extern void wifi_adhoc_poll_pending(void); wifi_adhoc_poll_pending(); }
+    /* 機内ブラウザの取得も同じ地点から駆動する。専用プロセスでは走らない
+       （wm_run は NULLPROC＝idle なので、先取りが他プロセスへ切り替えない）。 */
+    { extern void browser_poll_pending(void); browser_poll_pending(); }
 
     while (budget-- > 0 && (ch = uart_poll_char()) >= 0) {
         if (!in_cmd) {
@@ -1797,6 +1830,12 @@ void kernel_main(void)
      * process (prio 1), so nothing preempts it mid-actor. */
     g_net_pid = proc_create(net_proc_main, 65536, "net");
     proc_set_preempt(1);
+
+    /* 起動時に機内ブラウザを走らせる。DHCP と ARP が落ち着くまで少し待つ ――
+     * 待たずに引くと、ゲートウェイの MAC が未学習で経路が作れない。
+     * 専用プロセスにするのは、ここで数秒ブロックすると起動が止まるため。 */
+    { int bp = proc_create(browser_boot_proc, 32768, "browser");
+      if (bp > 0) proc_ready(bp); }
     uart_puts("net: draining in net_proc (preemptive), ISR no longer runs the stack\n");
 
     /* Bring up the other 3 Cortex-A76 cores as compute workers (worker-pool
@@ -2065,6 +2104,28 @@ void kernel_main(void)
             basic_win.content_bg   = 0xFF000810U;
             basic_win.draw_content = basicwin_draw;
             wm_add(&basic_win);
+        }
+
+        /* ブラウザの窓。airilab.app の本文をここに出す。
+         * 表示装置が繋がっている構成でのみ意味を持つ（HDMI 無しなら
+         * kernel_main はこの枝に入らない）。 */
+        {
+            extern void browser_draw_window(void *self, unsigned int frame);
+            static window_t browser_win;
+            browser_win.x = 40;
+            browser_win.y = 200;
+            browser_win.width  = 700;
+            browser_win.height = 620;
+            const char *bt = "Browser (airilab.app)";   /* 機内フォントは ASCII のみ */
+            for (int i = 0; i < WM_TITLE_MAX && bt[i]; i++) browser_win.title[i] = bt[i];
+            browser_win.chrome_color = 0xFF60FFC0U;
+            browser_win.title_bg     = 0xFF105040U;
+            browser_win.title_fg     = 0xFFFFFFFFU;
+            browser_win.content_bg   = 0xFF0A0E14U;
+            browser_win.draw_content = (void (*)(window_t *, unsigned int))browser_draw_window;
+            { extern void browser_click(void *self, int lx, int ly);
+              browser_win.on_click = (void (*)(window_t *, int, int))browser_click; }   /* 上半分=戻る／下半分=進む */
+            wm_add(&browser_win);
         }
 
         wm_set_tick(serial_io_tick);   /* drain net + debug-UART layout/keys */

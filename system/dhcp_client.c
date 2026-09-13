@@ -92,6 +92,8 @@ unsigned char dhcp_state(void) { return g_state; }
 void dhcp_get_ip(unsigned char out[4])      { for (int i = 0; i < 4; i++) out[i] = g_my_ip[i]; }
 void dhcp_get_router(unsigned char out[4])  { for (int i = 0; i < 4; i++) out[i] = g_router_ip[i]; }
 void dhcp_get_netmask(unsigned char out[4]) { for (int i = 0; i < 4; i++) out[i] = g_netmask[i]; }
+/* ブラウザが名前を引くのに要る。DHCP は受け取っていたが、外へ出す口が無かった。 */
+void dhcp_get_dns(unsigned char out[4])     { for (int i = 0; i < 4; i++) out[i] = g_dns_ip[i]; }
 unsigned long dhcp_lease_seconds(void)      { return g_lease_secs; }
 unsigned long dhcp_discover_count(void)     { return g_discover_count; }
 unsigned long dhcp_offer_count(void)        { return g_offer_count; }
