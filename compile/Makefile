@@ -46,7 +46,7 @@ OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 # ----- source discovery -----------------------------------------------
 COMPONENTS = loader mem system shell fs cc llm \
              device/uart device/mbox device/video device/sd device/usb \
-             device/usb/xhci device/gic device/timer device/genet device/wifi \
+             device/usb/xhci device/gic device/timer device/genet device/wifi device/i2c \
              network/arp network/net network/netaddr network/ipv4 network/icmp
 # Step 2 of NET-E: building xinu-raz network/{arp,net,netaddr,ipv4,icmp}
 # on top of the xinu_compat layer.
@@ -118,6 +118,7 @@ PI5_CFLAGS  = $(COMMON) -mcpu=cortex-a76 \
               -DMBOX_BASE=0x107C013880UL \
               -DMBOX_PROBE_BUS \
               -DRP1_ETH_BASE=0x1F00100000UL \
+              -DRP1_I2C1_BASE=0x1F00074000UL \
               -DWIFI_SDIO_BASE=0x1001100000UL \
               -DWIFI_SDIO_CFG_BASE=0x1001100400UL \
               -DSD_BASE=0x1000FFF000UL \

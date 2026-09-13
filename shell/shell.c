@@ -1792,6 +1792,19 @@ static int cmd_wifi_invest(int argc, char **argv)
     return 0;
 }
 
+static int cmd_arm(int argc, char **argv)
+{
+    /* arm pose 90 90 90 90 90 30 1000 | arm read | arm rgb 0 255 0 | ... (system/arm.c) */
+    extern int arm_command(const char *args, char *out, int cap);
+    static char line[256], out[512];
+    int o = 0;
+    for (int i = 1; i < argc; i++) { for (const char *p = argv[i]; *p && o < (int)sizeof line - 2; p++) line[o++] = *p; line[o++] = ' '; }
+    line[o] = 0;
+    arm_command(line, out, sizeof out);
+    uart_puts(out);
+    return 0;
+}
+
 static int cmd_sdtest(int argc, char **argv)
 {
     extern void sd_diag(void);
@@ -1864,6 +1877,7 @@ static const struct centry commandtab[] = {
     { "wifi-invest","wifi diagnostics + maintenance (re-run bring-up, dump trace)", cmd_wifi_invest },
     { "manet",      "MANET app (UDP/5000): status|node|nbr|fire|pull|cfg|reset", cmd_manet },
     { "sdtest",     "SD card controller diagnostics (read LBA 0)", cmd_sdtest },
+    { "arm",        "DOFBOT arm (I2C 0x15): pose a1..a6 [ms] | set id ang [ms] | read | rgb | buzz | torque | ping | ver | scan | stat", cmd_arm },
     { "?",      "alias for help",                          cmd_help   },
     { 0, 0, 0 }
 };

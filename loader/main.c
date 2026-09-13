@@ -1814,6 +1814,9 @@ void kernel_main(void)
         extern int rp1eth_probe(void);
         rp1pcie_init();     /* train the PCIe link to the RP1 first */
         rp1eth_probe();
+        /* DOFBOT: the arm's driver board is I2C slave 0x15 on RP1 i2c1 (GPIO2/3).
+         * Probe-only here (reads IC_COMP_TYPE); refuses itself if the block is unclocked. */
+        { extern int rp1i2c_init(void); rp1i2c_init(); }
         /* USB: NOTHING at boot (an MMIO access to 0x1F002004AD faulted even from
          * the read-only probe).  The whole bring-up is driven over HTTP — GET
          * /usb/probe, /usb/init, /usb/reset, /usb/addr, /usb/desc — so the box
