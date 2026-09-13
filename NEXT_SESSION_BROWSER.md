@@ -1,3 +1,35 @@
+# 次回の再開点 —— 三板の機内ブラウザ・メッシュ・自己更新（最終更新 2026-09-13 22:10）
+
+## 0. いまの状態と次の一手（ここだけ読めば再開できる）
+
+### 三板に載っているもの（全部 GitHub に push 済み・manifest と一致）
+| 板 | IP | ビルド | できること |
+|---|---|---|---|
+| Pi5 | 192.168.3.101:80（`~/projects/xinu-rpi5` feat/smp-symmetric） | **Sep 13 18:08:39** | ブラウザ（起動 10 秒後に airilab.app）／日英切替／リンク／メッシュ上の板のページ／代理（Pi3 のため）／更新の**確認のみ**（USB 起動） |
+| Pi4 | 192.168.3.100:80（`~/projects/xinu-rpi4` feat/smp-4core-and-basic-graphics） | **Sep 13 22:05:12** | 同上＋**自己更新で SD に書ける唯一の板**（二段書き＋読み戻し照合。修正後の実地再試験は未了） |
+| Pi3 | 192.168.3.50:8080（`~/projects/xinu-rpi3` arm-rpi3-port） | **Sep 13 18:08:40** | ブラウザ（Xinu の TCP/UDP 装置）／メッシュ経由の代理で外を読む／更新の**確認のみ**（SD 書き込みは設計上無効）。22:06:08（確認のみと明示）は未焼き |
+
+焼き方は物理交換のみ: Pi5 = USB `XINU5` の `kernel_2712.img`、Pi4 = SD `bootfs` の `kernel8.img`、Pi3 = SD `XINU` の `kernel.img`（`compile/xinu.boot`）。
+**必ず md5 を突き合わせ、`/version` で再起動を確かめる。** 各板の `GET /browse`（Pi3 は `?off=&limit=` で 1200 B ずつ）で整形結果を文字で検算できる。
+
+### 仕組みの入口
+- 板のブラウザ: `system/browser.c`（Pi3 は `apps/browser.c`）＋ `html.c`（HTML/CSS 整形、三板同一、正典 xinu-rpi5）＋ `jpfont.c`（16 ドット JIS）。
+- 板の右クリック品書き: 「Check update」→ `xinu://update?check=1`。`GET /update[?check=1|install=1]`。
+- 公開: `~/projects/xinu-kernels` で `./publish.sh [pi5|pi4|pi3]`（手元の compile/ の像と manifest を push）。
+  airilab.app（Heroku v21）が `http://airilab.app/api/xinu/manifest|kernel?board=` で中継。
+- メッシュ: Pi5 `/wifi-adhoc?ssid=MANET&ch=6&n=3`、Pi4 `…&n=1`、Pi3 `/shell?cmd=wifi adhoc MANET 6 2`（数分、curl は背景で）。
+  各板の HTTP サーバは「来た口」で返す（無線から来れば無線へ）。Pi5/Pi4 は UDP/9020 の代理で Pi3 に外のページを渡す。
+- airilab.app の来訪記録: 管理者で `/members.html` の下（IP・逆引き・板名 `X-Xinu-Board`）。
+
+### 未了・注意
+1. **Pi4 の自己更新の再試験**（修正版 22:05:12 が板で動いている状態で、新版を publish → 「Check update」→ install）。
+   初回の実地試験で SD の FAT を壊し起動不能にした（下の 18:19〜 の節）。**控えの SD を手元に置いて**臨む。
+2. Pi3 のメッシュ経由 airilab.app（代理）は未検証（Pi3 の `/browse?via=mesh&url=http://airilab.app/`、Pi5/Pi4 が代理役）。
+3. 実機マウスでのリンク／[EN]／品書きのクリック座標は未確認。
+4. `?js=1`（JS を本当に実行）は i18n.js で落ちたまま。起動には使っていない。
+
+---
+
 # 次回の再開点 —— 機内ブラウザと JS 処理系（2026-09-10）
 
 ## いま板に載っている版と、手元にある版
