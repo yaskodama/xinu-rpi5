@@ -113,15 +113,21 @@ int update_install(void)
 /* 組み込みページ xinu://update の HTML */
 int update_page(char *out, int cap)
 {
+    /* 結果を一目で: 大きな見出しに OK／更新あり／失敗を色つきで出し、その下に表。日本語は機内フォントで出る。 */
     out[0] = 0;
-    u_cat(out, "<html><body><h1>Kernel update</h1><table>", cap);
-    u_cat(out, "<tr><td>Board</td><td>", cap); u_cat(out, update_board_name(), cap); u_cat(out, "</td></tr>", cap);
-    u_cat(out, "<tr><td>Running</td><td>", cap); u_cat(out, kernel_build_id(), cap); u_cat(out, "</td></tr>", cap);
-    u_cat(out, "<tr><td>Latest (GitHub)</td><td>", cap); u_cat(out, upd_latest[0] ? upd_latest : "?", cap); u_cat(out, "</td></tr>", cap);
-    u_cat(out, "<tr><td>Status</td><td><b>", cap); u_cat(out, upd_state, cap); u_cat(out, "</b></td></tr></table>", cap);
-    if (upd_result == 2) u_cat(out, "<p><a href=\"xinu://update?install=1\">[ Download and reboot ]</a></p>", cap);
-    if (upd_result == 1) u_cat(out, "<p>This board runs the latest kernel.</p>", cap);
-    u_cat(out, "<p><a href=\"xinu://update?check=1\">Check again</a> &middot; <a href=\"http://airilab.app/\">Home</a></p>", cap);
+    u_cat(out, "<html><body><h1>カーネルの更新 (Kernel update)</h1>", cap);
+    if (upd_result == 1)      u_cat(out, "<h2 style=\"color:#7fe07f\">OK &mdash; 最新です (up to date)</h2>", cap);
+    else if (upd_result == 2) u_cat(out, "<h2 style=\"color:#ffd27f\">更新があります (update available)</h2>", cap);
+    else if (upd_result < 0)  u_cat(out, "<h2 style=\"color:#ff8080\">確認できません (check failed)</h2>", cap);
+    else                      u_cat(out, "<h2>未確認 (not checked)</h2>", cap);
+    u_cat(out, "<table>", cap);
+    u_cat(out, "<tr><td>板 (board)</td><td>", cap); u_cat(out, update_board_name(), cap); u_cat(out, "</td></tr>", cap);
+    u_cat(out, "<tr><td>いま動いている版</td><td>", cap); u_cat(out, kernel_build_id(), cap); u_cat(out, "</td></tr>", cap);
+    u_cat(out, "<tr><td>GitHub の最新</td><td>", cap); u_cat(out, upd_latest[0] ? upd_latest : "?", cap); u_cat(out, "</td></tr>", cap);
+    u_cat(out, "<tr><td>状態 (status)</td><td><b>", cap); u_cat(out, upd_state, cap); u_cat(out, "</b></td></tr></table>", cap);
+    if (upd_result == 2) u_cat(out, "<p><a class=\"btn\" href=\"xinu://update?install=1\">ダウンロードして再起動 (Download and reboot)</a></p>", cap);
+    if (upd_result == 1) u_cat(out, "<p>この板は最新のカーネルで動いています。</p>", cap);
+    u_cat(out, "<p><a href=\"xinu://update?check=1\">もう一度確認 (Check again)</a> &middot; <a href=\"http://airilab.app/\">Home</a></p>", cap);
     u_cat(out, "<hr><p><small>manifest: http://airilab.app/api/xinu/manifest (GitHub yaskodama/xinu-kernels)</small></p></body></html>", cap);
     return u_len(out);
 }
