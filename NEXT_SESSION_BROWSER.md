@@ -5,7 +5,7 @@
 | 板 | 実機で動いている版 | 手元でビルド済み（**未焼き**） |
 |---|---|---|
 | Pi 5 | **`build Sep 13 2026 16:04:04`**（md5 `2fe9fc3f…`）X-Xinu-Board＋メッシュ経路＋xinu://mesh。実機で起動・英語版・xinu://mesh（未参加表示）・airilab.app の記録に板名が付くことを確認 | 同じ |
-| Pi 4 | `build Sep 10 2026 06:29:46` | 同じ（変更なし） |
+| Pi 4 | **`build Sep 13 2026 16:19:56`**（md5 `95e4a0f4…`）ブラウザ移植（`~/projects/xinu-rpi4` 41dd2fd）。実機で起動 10 秒後に airilab.app が窓に出ること・airilab.app の記録に「Pi4 build …」が付くことを確認。控え `kernel8.img.bak-pre-browser-d54ed4b7` | 同じ |
 | Pi 3 | 06:33 ビルド（`xinu.boot`） | 同じ（変更なし） |
 
 焼き方は **USB / SD の物理交換のみ**。Pi 5 は USB `XINU5`、Pi 4 は SD `bootfs` の
@@ -119,6 +119,13 @@
 - **多段中継は通らない**（ARP が直接届く近隣だけ）。外（airilab.app）はメッシュからは無理（ゲートウェイ無し）。
 - 実機の試し方: Pi5 で `wifi adhoc <ssid> <ch> <node>`（HTTP は有線に残る）→ 他の板も参加 → `/browse?url=xinu://mesh` →
   `/browse?url=http://10.0.0.<n>/`。`net=` の `seg=` が増えれば無線で取れている。
+
+### Pi 4 への移植（2026-09-13、`~/projects/xinu-rpi4` feat/smp-4core-and-basic-graphics 41dd2fd）
+- html.c / jpfont.c / js.c / tools は Pi 5 と同一ファイル。**正典は xinu-rpi5**。直したら両方に写す。
+- browser.c の違い: 待ちは `proc_yield()`（Pi 4 は先取り OFF、net プロセスが IRQ で起きて汲む。自分で汲むと二重）、
+  `/browse?url=` は保留→wm の巡回（`browser_request_url`）、GENET の統計は 0、板名 Pi4。
+- main.c: `genet_rx_tick` の連鎖の先頭に `browser_handle`、`net_yield_tick` に `browser_poll_pending`、窓は (300,30) 700x600。
+- 未検証は実機のみ。Pi 4 の `/fb` は `?info` と 1200 B の塊（Pi 5 の fbgrab.py はそのまま使えない）。
 
 ## 最初にやること
 
