@@ -451,6 +451,7 @@ int browser_handle(const unsigned char *f, int len)
 }
 
 /* ===== HTTP GET ========================================================= */
+static int br_port = 80;             /* 直近の URL の :port（無ければ 80） */
 static int br_http_get(const unsigned char *ip, const char *host, const char *path, int ms)
 {
     unsigned char mac[6];
@@ -459,7 +460,7 @@ static int br_http_get(const unsigned char *ip, const char *host, const char *pa
     br_page_len = 0; br_page[0] = 0;
     for (int i = 0; i < 4; i++) br_c.rip[i] = ip[i];
     for (int i = 0; i < 6; i++) br_c.rmac[i] = mac[i];
-    br_c.rport = 80;
+    br_c.rport = (unsigned short)(br_port > 0 ? br_port : 80);   /* URL の :port（Pi 3 の 8080 など） */
     br_c.lport = (unsigned short)(49152 + (br_now_us() & 0x3FFF));
     br_c.snd_nxt = (br_now_us() & 0x7FFFFFFF);
     br_c.rcv_nxt = 0;
@@ -719,6 +720,9 @@ static int browser_fetch1(const char *url)
     { int i = 0; while (p[i] && p[i] != '/' && i < 127) { host[i] = p[i]; i++; } host[i] = 0; p += i; }
     if (*p == 0) b_cpy(path, "/", sizeof path); else b_cpy(path, p, sizeof path);
     b_cpy(br_url, url, sizeof br_url);
+    br_port = 80;
+    { char *c = host; while (*c && *c != ':') c++;        /* host:port */
+      if (*c == ':') { *c = 0; c++; int v = 0; while (*c >= '0' && *c <= '9') v = v * 10 + (*c++ - '0'); if (v > 0 && v < 65536) br_port = v; } }
 
     unsigned char ip[4];
     { int d = 0, v = 0, k = 0, ok = 1;             /* 数字ならそのまま IP として読む */

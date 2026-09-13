@@ -1954,7 +1954,7 @@ static void wifi_handle_frame(u8 *fr, int len, int doff)
         } else if (ip[9] == 6 && wifi_ip_eq(ip + 16)) {
             /* inbound TCP to our IP -> hand to the HTTP/JIT server
              * (tcp_server.c); its replies go out via tcp_set_tx(wifi_eth_tx). */
-            tcp_handle_packet(e, elen);
+            { extern int tcp_handle_packet_via(const unsigned char *, int, int); tcp_handle_packet_via(e, elen, 1); }
         }
     }
 }

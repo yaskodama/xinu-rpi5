@@ -108,6 +108,7 @@ struct tcp_conn {
     unsigned long my_seq;       /* next byte we will send */
     unsigned long peer_seq;     /* next byte we expect to receive */
     int greeted;
+    int via;                    /* 0=有線（既定の口） 1=無線（メッシュから来た接続。返事も無線へ） */
     /* Wall-clock stamp of the last segment seen on this conn.  Without it
      * the connection only ever advances on receive, so a single bare SYN
      * whose final ACK never arrives pins the one slot in SYN_RCVD forever
@@ -208,8 +209,13 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
     for (int i = 0; i < 54; i++) tx_frame[i] = 0;
 
     /* --- Ethernet --- */
+    /* メッシュ（無線）から来た接続は、無線の IP/MAC で無線へ返す。有線の制御面は動かさない。 */
+    unsigned char src_mac[6], src_ip[4];
+    if (g_conn.via) { extern void wifi_macaddr(unsigned char *); extern void wifi_ipaddr(unsigned char *);
+                      wifi_macaddr(src_mac); wifi_ipaddr(src_ip); }
+    else { for (int i = 0; i < 6; i++) src_mac[i] = g_my_mac[i]; for (int i = 0; i < 4; i++) src_ip[i] = g_my_ip[i]; }
     for (int i = 0; i < 6; i++) tx_frame[i]     = g_conn.peer_mac[i];
-    for (int i = 0; i < 6; i++) tx_frame[6 + i] = g_my_mac[i];
+    for (int i = 0; i < 6; i++) tx_frame[6 + i] = src_mac[i];
     tx_frame[12] = 0x08; tx_frame[13] = 0x00;
 
     /* --- IPv4 --- */
@@ -223,7 +229,7 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
     ih[8]  = 64;
     ih[9]  = 6;                                /* proto = TCP */
     ih[10] = 0; ih[11] = 0;
-    for (int i = 0; i < 4; i++) ih[12 + i] = g_my_ip[i];
+    for (int i = 0; i < 4; i++) ih[12 + i] = src_ip[i];
     for (int i = 0; i < 4; i++) ih[16 + i] = g_conn.peer_ip[i];
     unsigned short ipsum = ip_checksum((const unsigned char *)ih, 20);
     ih[10] = (unsigned char)(ipsum >> 8);
@@ -254,7 +260,7 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
             tx_frame[54 + i] = (unsigned char)payload[i];
     }
 
-    unsigned short ucs = tcp_checksum(g_my_ip, g_conn.peer_ip,
+    unsigned short ucs = tcp_checksum(src_ip, g_conn.peer_ip,
                                       (const unsigned char *)th, tcp_len);
     th[16] = (unsigned char)(ucs >> 8);
     th[17] = (unsigned char)(ucs & 0xFF);
@@ -271,6 +277,7 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
         send_len = 60;
     }
 
+    if (g_conn.via) { extern int wifi_eth_tx(const unsigned char *, int); return wifi_eth_tx((const unsigned char *)tx_frame, send_len); }
     return g_tcp_tx((const unsigned char *)tx_frame, send_len);
 }
 
@@ -2451,8 +2458,12 @@ static int http_build(const char *req, char *out, int max)
 
 /* Handle one received Ethernet frame.  Returns 1 if it was TCP-for-us
  * (consumed), 0 otherwise. */
-int tcp_handle_packet(const unsigned char *frame, int len)
+static int g_rx_via = 0;          /* いま処理中の受信がどの口から来たか（wifi.c は 1 で呼ぶ） */
+int tcp_handle_packet_via(const unsigned char *frame, int len, int via);
+int tcp_handle_packet(const unsigned char *frame, int len) { return tcp_handle_packet_via(frame, len, 0); }
+int tcp_handle_packet_via(const unsigned char *frame, int len, int via)
 {
+    g_rx_via = via;
     if (len < 14 + 20 + 20) return 0;
     if (frame[12] != 0x08 || frame[13] != 0x00) return 0;
     /* volatile is CRITICAL here.  The MMU is off, so all DRAM (incl. the
@@ -2471,7 +2482,13 @@ int tcp_handle_packet(const unsigned char *frame, int len)
     if (ip[9] != 6) return 0;                       /* not TCP */
 
     if (ip[16] != g_my_ip[0] || ip[17] != g_my_ip[1] ||
-        ip[18] != g_my_ip[2] || ip[19] != g_my_ip[3]) return 0;
+        ip[18] != g_my_ip[2] || ip[19] != g_my_ip[3]) {
+        /* 無線の IP 宛（メッシュ上の板からの接続）も受ける */
+        int mine = 0;
+        if (g_rx_via) { extern void wifi_ipaddr(unsigned char *); unsigned char w[4]; wifi_ipaddr(w);
+                        mine = (ip[16] == w[0] && ip[17] == w[1] && ip[18] == w[2] && ip[19] == w[3]); }
+        if (!mine) return 0;
+    }
 
     const volatile unsigned char *tcp = ip + ihl;
     unsigned short sport = ((unsigned short)tcp[0] << 8) | tcp[1];
@@ -2527,6 +2544,7 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         if (!(flags & TCP_FLAG_SYN)) return 1;       /* ignore */
 
         /* Capture peer */
+        g_conn.via = g_rx_via;                        /* この接続は来た口で返す */
         for (int i = 0; i < 6; i++) g_conn.peer_mac[i] = frame[6 + i];
         for (int i = 0; i < 4; i++) g_conn.peer_ip[i]  = ip[12 + i];
         g_conn.peer_port = sport;
