@@ -455,8 +455,14 @@ static int br_http_get(const unsigned char *ip, const char *host, const char *pa
     for (int i = 0; path[i]; i++)     req[n++] = path[i];
     const char *h = " HTTP/1.1\r\nHost: "; for (int i=0; h[i]; i++) req[n++] = h[i];
     for (int i = 0; host[i]; i++)     req[n++] = host[i];
-    const char *e = "\r\nUser-Agent: XinuBrowser/1.0\r\nAccept: text/html\r\nConnection: close\r\n\r\n";
+    /* airilab.app はこの UA を見て来訪を記録し、X-Xinu-Board で板を見分ける
+       （同じ家の板は同じ公開 IP になるので、IP だけでは区別できない）。 */
+    const char *e = "\r\nUser-Agent: XinuBrowser/1.0\r\nX-Xinu-Board: Pi5 build ";
     for (int i = 0; e[i]; i++)        req[n++] = e[i];
+    { extern const char *kernel_build_id(void); const char *b = kernel_build_id();
+      for (int i = 0; b[i] && n < 440; i++) req[n++] = b[i]; }
+    const char *e2 = "\r\nAccept: text/html\r\nConnection: close\r\n\r\n";
+    for (int i = 0; e2[i]; i++)       req[n++] = e2[i];
 
     br_tcp_send(0x18, (const unsigned char *)req, n);      /* PSH|ACK */
     br_c.snd_nxt += (unsigned long)n;
