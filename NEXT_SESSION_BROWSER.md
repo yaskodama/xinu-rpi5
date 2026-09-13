@@ -4,7 +4,7 @@
 
 | 板 | 実機で動いている版 | 手元でビルド済み（**未焼き**） |
 |---|---|---|
-| Pi 5 | **`build Sep 13 2026 15:45:15`**（md5 `c277526b…`, 2.42 MB）CSS＋日本語フォント＋リンク＋言語切替。**実機確認済み** | 同じ（手元と板が一致） |
+| Pi 5 | **`build Sep 13 2026 16:04:04`**（md5 `2fe9fc3f…`）X-Xinu-Board＋メッシュ経路＋xinu://mesh。実機で起動・英語版・xinu://mesh（未参加表示）・airilab.app の記録に板名が付くことを確認 | 同じ |
 | Pi 4 | `build Sep 10 2026 06:29:46` | 同じ（変更なし） |
 | Pi 3 | 06:33 ビルド（`xinu.boot`） | 同じ（変更なし） |
 
@@ -109,6 +109,16 @@
 - `/browse?url=http://airilab.app/about.html` → 別ページも CSS 込みで整形（リンクを辿る経路と同じ）。
 - 未確認: 実機のマウスでリンク／[EN] をクリックしたときの座標合わせ（`browser_click` の top=22+6+26）。
   合っていなければ `html_link_at` の判定幅（±2px）か top を疑う。
+
+### メッシュ上の板のページ（2026-09-13、未検証は実機のみ）
+- `br_route_mac()` が宛先を見て **無線か有線かを選ぶ**（`br_via_wifi`）: WiFi の副網なら `wifi_eth_tx`＋無線の IP/MAC、
+  ARP も無線で。待ちの間は `wifi_net_poll()` も汲む。受信は `wifi_handle_frame()` の先頭で `browser_handle()`。
+- 組み込み `xinu://mesh`（`br_builtin_mesh`）: `wifi_mesh_peers()`（HELLO の近隣表 g_mn_peers）を一覧し
+  `http://10.0.0.<n>/` へリンク。窓の **URL 行をクリック**で開く。`/browse?url=xinu://mesh` でも。
+- 板の `GET /` は text/plain なので `<pre>` で包む（`browser_fetch_en` 内）。
+- **多段中継は通らない**（ARP が直接届く近隣だけ）。外（airilab.app）はメッシュからは無理（ゲートウェイ無し）。
+- 実機の試し方: Pi5 で `wifi adhoc <ssid> <ch> <node>`（HTTP は有線に残る）→ 他の板も参加 → `/browse?url=xinu://mesh` →
+  `/browse?url=http://10.0.0.<n>/`。`net=` の `seg=` が増えれば無線で取れている。
 
 ## 最初にやること
 
