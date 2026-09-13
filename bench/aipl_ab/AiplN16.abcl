@@ -1,0 +1,89 @@
+// AiplN16.abcl — アクター数 16、粒度 50（1メッセージあたりの反復数）
+//
+//   実験2「バッチ長と配布コストの関係」用。宛先が互いに異なる par_safe な
+//   アクターが連続して並ぶと、実行時系はそれらを 1 バッチにまとめて配る。
+//   ワーカーズ型は「1 バッチにつき郵便箱 1 往復」なので、バッチが長いほど
+//   1 メッセージあたりの費用が薄まるはず。対称SMP型は 1 単位ごとに
+//   プロセスを作るので、バッチ長に関係なく一定のはず。そこを測る。
+//   合計は 16 * 50 = 800。毎ラウンド検算する。
+class Main {
+  var ready = 0;
+  var c = 0;
+  var w0 = 0;
+  var w1 = 0;
+  var w2 = 0;
+  var w3 = 0;
+  var w4 = 0;
+  var w5 = 0;
+  var w6 = 0;
+  var w7 = 0;
+  var w8 = 0;
+  var w9 = 0;
+  var w10 = 0;
+  var w11 = 0;
+  var w12 = 0;
+  var w13 = 0;
+  var w14 = 0;
+  var w15 = 0;
+  method tick() {
+    if (ready == 0) {
+      ready = 1;
+      c = new Collector();
+      w0 = new Worker();
+    w1 = new Worker();
+    w2 = new Worker();
+    w3 = new Worker();
+    w4 = new Worker();
+    w5 = new Worker();
+    w6 = new Worker();
+    w7 = new Worker();
+    w8 = new Worker();
+    w9 = new Worker();
+    w10 = new Worker();
+    w11 = new Worker();
+    w12 = new Worker();
+    w13 = new Worker();
+    w14 = new Worker();
+    w15 = new Worker();
+    }
+    send w0.run(c, 50);
+    send w1.run(c, 50);
+    send w2.run(c, 50);
+    send w3.run(c, 50);
+    send w4.run(c, 50);
+    send w5.run(c, 50);
+    send w6.run(c, 50);
+    send w7.run(c, 50);
+    send w8.run(c, 50);
+    send w9.run(c, 50);
+    send w10.run(c, 50);
+    send w11.run(c, 50);
+    send w12.run(c, 50);
+    send w13.run(c, 50);
+    send w14.run(c, 50);
+    send w15.run(c, 50);
+  }
+}
+class Worker {
+  var acc = 0; var i = 0;
+  method run(coll, n) {
+    acc = 0;
+    i = 0;
+    while (i < n) do { acc = acc + 1; i = i + 1; }
+    send coll.report(acc);
+  }
+}
+class Collector {
+  var total = 0; var got = 0;
+  method report(v) {
+    total = total + v;
+    got = got + 1;
+    if (got == 16) {
+      got = 0;
+      // 合計が合ったときだけ次ラウンドを起こす。誤っていれば止まるので
+      // /avm-par の msgs が伸びないことで **外から** 誤りが分かる。
+      if (total == 800) { total = 0; line(80, 300, 680, 300, 2); wait(1); }
+      else { total = 0; line(80, 300, 680, 300, 4); }
+    }
+  }
+}

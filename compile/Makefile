@@ -95,8 +95,18 @@ COMMON  = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
 # 対称 SMP 版（feat/smp-symmetric ブランチ）。SMP_SYM=0 で従来のワーカ型に戻せる
 # ので、同じ木から両方を焼いて比較できる:  make pi5 SMP_SYM=0
 SMP_SYM ?= 1
+# スピンロックの実装。この板は D-cache を OFF で走らせているので、
+# 既定は **パン屋（原子命令なし）**。ldaxr/stxr は非キャッシュ可能メモリでは
+# 保証されず、実機で「Xinu の画面が出てから止まる」を引き起こした。
+# 排他版を試すときだけ  make pi5 SPIN=exclusive
+SPIN ?= bakery
+ifeq ($(SPIN),bakery)
+SPIN_FLAG = -DSPIN_BAKERY
+else
+SPIN_FLAG =
+endif
 ifeq ($(SMP_SYM),1)
-SMP_SYM_FLAG = -DSMP_SYMMETRIC
+SMP_SYM_FLAG = -DSMP_SYMMETRIC $(SPIN_FLAG)
 else
 SMP_SYM_FLAG =
 endif

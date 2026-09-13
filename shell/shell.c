@@ -1794,7 +1794,31 @@ static int cmd_sdtest(int argc, char **argv)
     return 0;
 }
 
+/* browser <url> —— 機内ブラウザ。引数が無ければ既定（airilab.app）を読む。
+ * 表示装置が無い構成でも中身を確かめられるよう、本文は /browse からも読める。 */
+static int cmd_browser(int argc, char *argv[])
+{
+    extern int  browser_fetch(const char *url);
+    extern const char *browser_url(void), *browser_text(void), *browser_note(void);
+    extern int  browser_text_len(void), browser_status(void);
+    const char *url = (argc >= 2) ? argv[1] : browser_url();
+    uart_puts("browser: GET "); uart_puts(url); uart_puts("\n");
+    int r = browser_fetch(url);
+    if (r <= 0) { uart_puts("browser: "); uart_puts(browser_note()); uart_puts("\n"); return 1; }
+    { const char *t = browser_text(); int n = browser_text_len();
+      int shown = n > 2000 ? 2000 : n;              /* 端末には先頭だけ出す */
+      for (int i = 0; i < shown; i++) uart_putc(t[i]);
+      uart_puts("\n");
+      uart_puts("browser: "); 
+      { char b[16]; int k=0, v=n; if(!v) b[k++]='0';
+        while(v){ b[k++]=(char)('0'+v%10); v/=10; }
+        while(k) uart_putc(b[--k]); }
+      uart_puts(" 文字（全文は /browse）\n"); }
+    return 0;
+}
+
 static const struct centry commandtab[] = {
+    { "browser","browser [url]  fetch a web page (default airilab.app)", cmd_browser },
     { "help",   "list the commands",                       cmd_help   },
     { "echo",   "echo the remaining words back",           cmd_echo   },
     { "wine",   "spin a 3D wireframe wine glass (Graphics)", cmd_wine  },

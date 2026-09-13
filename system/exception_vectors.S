@@ -99,7 +99,7 @@ exception_init:
 // ----------------------------------------------------------------
 .global sync_entry
 sync_entry:
-    sub     sp, sp, #(16 * 16)
+    sub     sp, sp, #(16 * 17)
     stp     x0,  x1,  [sp, #16 *  0]
     stp     x2,  x3,  [sp, #16 *  1]
     stp     x4,  x5,  [sp, #16 *  2]
@@ -116,9 +116,20 @@ sync_entry:
     stp     x26, x27, [sp, #16 * 13]
     stp     x28, x29, [sp, #16 * 14]
     str     x30,      [sp, #16 * 15]
+    // ★ ELR_EL1 / SPSR_EL1 も退避する。この核は割り込みハンドラの中で
+    //    文脈切替(proc_preempt -> proc_resched -> ctxsw)を行うため、
+    //    「戻り先が未確定の例外」が同時に複数存在しうる。保存しないと
+    //    後から入った例外が上書きし、別の戻り先へ eret して計算が壊れる
+    //    （実測: 計算プロセス2本以上のときだけ結果が毎回変わった）。
+    mrs     x0,  elr_el1
+    mrs     x1,  spsr_el1
+    stp     x0,  x1,  [sp, #16 * 16]
 
     bl      sync_dispatch_c
 
+    ldp     x0,  x1,  [sp, #16 * 16]     // 先に ELR/SPSR を戻す（x0/x1 はこの後で上書きされる）
+    msr     elr_el1,  x0
+    msr     spsr_el1, x1
     ldp     x0,  x1,  [sp, #16 *  0]
     ldp     x2,  x3,  [sp, #16 *  1]
     ldp     x4,  x5,  [sp, #16 *  2]
@@ -135,12 +146,12 @@ sync_entry:
     ldp     x26, x27, [sp, #16 * 13]
     ldp     x28, x29, [sp, #16 * 14]
     ldr     x30,      [sp, #16 * 15]
-    add     sp, sp, #(16 * 16)
+    add     sp, sp, #(16 * 17)
     eret
 
 .global irq_entry
 irq_entry:
-    sub     sp, sp, #(16 * 16)
+    sub     sp, sp, #(16 * 17)
     stp     x0,  x1,  [sp, #16 *  0]
     stp     x2,  x3,  [sp, #16 *  1]
     stp     x4,  x5,  [sp, #16 *  2]
@@ -157,9 +168,20 @@ irq_entry:
     stp     x26, x27, [sp, #16 * 13]
     stp     x28, x29, [sp, #16 * 14]
     str     x30,      [sp, #16 * 15]
+    // ★ ELR_EL1 / SPSR_EL1 も退避する。この核は割り込みハンドラの中で
+    //    文脈切替(proc_preempt -> proc_resched -> ctxsw)を行うため、
+    //    「戻り先が未確定の例外」が同時に複数存在しうる。保存しないと
+    //    後から入った例外が上書きし、別の戻り先へ eret して計算が壊れる
+    //    （実測: 計算プロセス2本以上のときだけ結果が毎回変わった）。
+    mrs     x0,  elr_el1
+    mrs     x1,  spsr_el1
+    stp     x0,  x1,  [sp, #16 * 16]
 
     bl      irq_dispatch_c
 
+    ldp     x0,  x1,  [sp, #16 * 16]     // 先に ELR/SPSR を戻す（x0/x1 はこの後で上書きされる）
+    msr     elr_el1,  x0
+    msr     spsr_el1, x1
     ldp     x0,  x1,  [sp, #16 *  0]
     ldp     x2,  x3,  [sp, #16 *  1]
     ldp     x4,  x5,  [sp, #16 *  2]
@@ -176,5 +198,5 @@ irq_entry:
     ldp     x26, x27, [sp, #16 * 13]
     ldp     x28, x29, [sp, #16 * 14]
     ldr     x30,      [sp, #16 * 15]
-    add     sp, sp, #(16 * 16)
+    add     sp, sp, #(16 * 17)
     eret

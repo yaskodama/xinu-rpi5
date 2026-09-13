@@ -1,0 +1,43 @@
+long smpsched_parallel(smp_range_fn fn, long n, int nunits)
+{
+    /* 再入よけ。この関数は wm ループ（核0）から呼ばれ、待ちの proc_resched() で
+     * ネットワーク・プロセスが走る。そこから何かがまた並列配布を要求しても
+     * 大域（sp_res/sp_done…）を壊さないよう、入れ子は直列で処理する。 */
+    static volatile int sp_busy;
+    if (n <= 0) return 0;
+    if (sp_busy) return fn(0, n, smp_core_id());
+    if (nunits < 1) nunits = 1;
+    if (nunits > SP_MAXUNIT) nunits = SP_MAXUNIT;
+    if (nunits > n) nunits = (int)n;
+    if (!smpsched_on || nunits == 1) return fn(0, n, smp_core_id());   /* 対称でなければ直列 */
+
+    sp_busy = 1;
+    sp_fn = fn;
+    sp_done = 0;
+    for (int i = 0; i < SMP_NCORES; i++) sp_ran[i] = 0;
+
+    int pids[SP_MAXUNIT], nproc = 0;
+    for (int t = 0; t < nunits - 1; t++) {          /* 最後の 1 単位は呼び手が直接走らせる */
+        int pid = proc_create_static_susp(sp_task, sp_stk[t], SP_STK, "sptask");
+        if (pid < 0) break;
+        pids[nproc] = pid;
+        sp_lo[pid] = (int)(((long)t * n) / nunits);
+        sp_hi[pid] = (int)(((long)(t + 1) * n) / nunits);
+        sp_res[pid] = 0;
+        nproc++;
+    }
+    for (int t = 0; t < nproc; t++) proc_ready(pids[t]);
+
+    unsigned long t0 = now_us();
+    /* 呼び手の持ち分 = [nproc*n/nunits, n)。作れなかったぶんもここに入るので
+       区間は必ずちょうど一度だけ覆われる。 */
+    long total = fn((long)(((long)nproc * n) / nunits), n, smp_core_id());
+    sp_ran[smp_core_id()]++;                       /* 呼び手の持ち分も数える */
+    while (sp_done < nproc) proc_resched();
+    sp_us = (long)(now_us() - t0);
+    sp_calls++; sp_units_tot += nunits;
+
+    for (int t = 0; t < nproc; t++) total += sp_res[pids[t]];
+    sp_busy = 0;
+    return total;
+}

@@ -1,0 +1,1066 @@
+% smp_report.tex — Xinu Pi 5 上の並列実行方式の比較（ワーカーズ型 対 対称SMP型）
+%   組版:  lualatex smp_report.tex   （2回）
+%   図は pgfplots で描く。数値は本文中にそのまま残るので、原稿が実測値の一次資料になる。
+\documentclass[a4paper,11pt]{ltjsarticle}
+\usepackage{luatexja}
+\usepackage{geometry}
+\geometry{margin=25mm}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{caption}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  framesep=3pt,
+  rulecolor=\color{black!30},
+  backgroundcolor=\color{black!3},
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+}
+
+\input{data_aipl}
+\input{data_exp23}
+\input{data_abc}
+
+\title{Xinu Pi 上の並列実行方式の比較\\
+\large ワーカーズ型（郵便箱・静的分割）対 対称SMP型（共有 ready キュー）\\
+\normalsize ---- N-Queens・通常の並列計算・AIPL アクター並列の実測（Pi 5 / Pi 4 / Pi 3）}
+\author{児玉研究室}
+\date{2026年9月9日}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Raspberry Pi 5 上のベアメタル Xinu（\texttt{xinu-rpi5}）に、並列実行の二方式
+---- 核0が各二次コアの郵便箱へ仕事を静的に配る\textbf{ワーカーズ型}と、
+各コアが共有 ready キューから自分で取る\textbf{対称SMP型}---- を同一カーネルに実装し、
+同じ起動のまま切り替えて比較した。題材は (1) N-Queens（木の大きさが不揃いな探索）、
+(2) 通常の並列計算（素数計数・独立卓・メモリ充填）、(3) \textbf{AIPL のアクター並列}である。
+結果、AIPL のメッセージ 1 通あたりの配布コストは
+ワーカーズ型 $2.28\,\mu\mathrm{s}$、対称SMP型 $4.71\,\mu\mathrm{s}$ で、
+\textbf{対称SMP型が 2.06 倍高い}。本体の実行速度は両方式で一致（$698\,\mathrm{ns}$/反復）しており、
+差は配布機構そのものに由来する。仕事の粒度を細かくするほど比は開き、
+粒度 1 反復では 1.49 倍に達する。一方、\textbf{仕事が長く不揃いな場合は対称SMP型が有利}で、実測で最大 1.25 倍速い。
+ただしその優位は 1.25 倍で飽和し、しかも\textbf{重い仕事を隣り合わせにせず細かく分割するだけで、
+郵便箱方式のまま 1.07 倍差まで詰められる}。すなわち方式を替える必要はない。
+N-Queens では、核0 をスケジューラに参加させて 4 コア対 4 コアにしたうえで、
+ワーカーズ型 $2.21\times$ に対し対称SMP型 $1.66\times$ であった。
+また、仕事を完全に等量にしても 4 コアで $3.0\times$ 程度が天井であることを確かめた。
+
+同じ実験を Pi 4（A72）と Pi 3（A53）でも行った。均一な負荷では三板の速度向上曲線が
+\textbf{完全に一致する}のに対し、N-Queens では Pi 4 が $1.64\times$、Pi 3 が $2.75\times$ と
+大きく違う。原因はハードウェアではなく\textbf{分割の仕方}であり、
+Pi 4 の分割を変えるだけで $1.64\times \to 1.81\times$ に改善した。
+
+測定の過程で、例外処理が \texttt{ELR\_EL1}/\texttt{SPSR\_EL1} を保存していないという
+カーネルの重大な不具合を発見・修正した。これを直すまでは、計算プロセスが 2 本以上
+同時に走ると計算結果そのものが壊れており、両方式の測定値も汚染されていた。
+\textbf{同じ不具合が Pi 4 にも存在することを確かめ、修正した}
+---- 先取りを有効にすると、修正前は 8 プロセス中 8 個すべてが誤った答えを返す。
+\end{abstract}
+
+\section{目的と仮説}
+
+我々の研究は、Xinu Pi の上で AIPL を実行することを目的としている。そのための
+マルチプロセッサ構成として、\textbf{ワーカーズ型が効率的である}というのが作業仮説である。
+本報告はこの仮説を実機で検証する。
+
+主張を「速い」で終わらせず、\textbf{なぜ速いのか}を機構で説明できる形にした。すなわち
+1 メッセージあたりの費用を
+\[
+  \text{us/msg} \;=\; \underbrace{a}_{\text{配布コスト}} \;+\; \underbrace{b \times (\text{粒度})}_{\text{本体の実行}}
+\]
+と分解し、両方式で $a$ を比較する。$b$（本体の実行速度）は方式によらず同じはずで、
+実測でも一致した。これにより「条件を選んだから速い」のではなく、
+\textbf{配布機構の費用が違う}ことを示せる。
+
+\section{二方式の実装}
+
+\subsection{ワーカーズ型（郵便箱・静的分割）}
+核0が各二次コアの郵便箱（\texttt{smp\_job\_*}）に「関数と区間」を置き、\texttt{SEV} で起こす。
+二次コアは \texttt{smp\_worker\_loop} で待っており、受け取った区間を実行して結果を書き戻す。
+区間は\textbf{あらかじめ}均等に割る（静的分割）。核0も自分の区間をその場で実行する。
+プロセス生成も文脈切替もスケジューラのロックも要らない。
+実装は \texttt{system/smp.c} の \texttt{smp\_parallel\_sum}。
+
+\subsection{対称SMP型（共有 ready キュー）}
+仕事の単位ごとに Xinu プロセスを作って共有 ready キューへ入れ、各コアが
+\texttt{smpsched\_core\_loop} で\textbf{自分で取る}。偏りは走行中に均される。
+実装は \texttt{system/smpsched.c}。AIPL のアクター・バッチ用に汎用の
+\texttt{smpsched\_parallel(fn, n, nunits)} を新設した。
+
+\subsection{同一カーネルでの切り替え}
+二方式を別々のカーネルにすると、温度・過渡・環境が交絡する。そこで
+\textbf{起動時は必ずワーカーズ型で上がり}、\texttt{/smpmode?on=1} を叩いた時点で
+二次コアが共有 ready キューへ移る作りにした（一方通行。戻すには電源再投入）。
+これにより同じ起動のまま A/B が取れる。
+
+なお当初は対称スケジューラが二次コアの起動先そのものだったため、そこに不具合があると
+\textbf{板ごと起動しなかった}。危険な機構を起動経路から外したのは、実験を回すための
+前提整備でもある。
+
+\section{測定の作法}
+
+\begin{enumerate}
+\item \textbf{計器を先に確かめる}。スピンロックの自己診断（4コア $\times$ 20000 回で
+      期待値 80000 と一致）と、いまどちらの方式かを毎回確認してから測る。
+\item \textbf{正しさを毎回検算する}。N-Queens は既知の解数（$n=13$ で 73,712）と、
+      AIPL 標本は合計値と突き合わせる。\textbf{速いが間違っている}を弾くため。
+\item \textbf{中央値と最小・最大}で示す（平均では分布が見えない）。
+\item \textbf{暖機を捨てる}。起動直後の過渡を数に入れない。
+\end{enumerate}
+
+\section{発見した不具合とその影響}\label{sec:bug}
+
+測定中、計算プロセスが 2 本以上同時に走ると\textbf{計算結果そのものが壊れる}現象に遭遇した。
+値は毎回異なり、1 本なら常に正しかった。原因は
+\texttt{system/exception\_vectors.S} の例外入口が \texttt{ELR\_EL1}（戻り番地）と
+\texttt{SPSR\_EL1}（戻り状態）を保存していないことであった。
+この核は\textbf{割り込みハンドラの中で文脈切替を行う}
+（\texttt{irq\_dispatch\_c} $\to$ \texttt{proc\_preempt} $\to$ \texttt{proc\_resched} $\to$ \texttt{ctxsw}）ため、
+「戻り先が未確定の例外」が同時に複数存在しうる。保存していないと後から入った例外が
+\texttt{ELR\_EL1} を上書きし、タスクが別の番地へ \texttt{eret} して計算がずれる。
+板は落ちず、\textbf{結果だけが静かに壊れる}。
+
+修正後、$n=13$ の解は全構成で 73,712 に一致し、同じタスク内で二度計算した値も一致した
+（計器 \texttt{mism}$=0$）。\textbf{修正前に採った測定値はすべて破棄した}。
+本報告の数値はすべて修正後（ビルド \texttt{Sep 9 2026 19:24:47}）のものである。
+なおこの不具合はワーカーズ型にも影響しており、N-Queens 4 コアの速度向上は
+$1.86\times \to 2.22\times$ に改善した。
+
+\section{結果1: N-Queens（不揃いな探索木）}
+
+$n=13$、解 73,712。直列 $686.6\,\mathrm{ms}$。同一カーネル・同一起動。
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+方式 & 時間 [ms] & 速度向上 \\
+\midrule
+ワーカーズ型 1コア & 686.0 & 1.00 \\
+ワーカーズ型 2コア & 370.0 & 1.86 \\
+ワーカーズ型 3コア & 316.8 & 2.17 \\
+\textbf{ワーカーズ型 4コア} & \textbf{308.9} & \textbf{2.22} \\
+\midrule
+対称SMP型（8単位, 核0直接あり） & 546 & 1.26 \\
+\textbf{対称SMP型（2単位, 最良）} & \textbf{541} & \textbf{1.27} \\
+対称SMP型（4単位, 従来配布） & 696 & 0.99 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6cm,ybar,ymin=0,ymax=2.6,
+  ylabel={speedup vs serial},
+  symbolic x coords={W-1core,W-2core,W-3core,W-4core,S-2unit,S-8unit,S-4unit-old},
+  xtick=data,x tick label style={rotate=25,anchor=east,font=\scriptsize},
+  nodes near coords,nodes near coords style={font=\scriptsize},
+  bar width=14pt,ymajorgrids,grid style={black!15}]
+\addplot+[fill=blue!45,draw=blue!60!black] coordinates
+  {(W-1core,1.00) (W-2core,1.86) (W-3core,2.17) (W-4core,2.22)};
+\addplot+[fill=orange!60,draw=orange!60!black] coordinates
+  {(S-2unit,1.27) (S-8unit,1.26) (S-4unit-old,0.99)};
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{N-Queens $n=13$ の速度向上。青=ワーカーズ型、橙=対称SMP型。}
+\end{center}
+
+この表の対称SMP側は\textbf{核0がスケジューラに参加していない状態}の値である
+（計器 \texttt{ran\_per\_core} の先頭が常に 0 ＝ 実質 3 コア）。
+これは実装の穴であり、第\ref{sec:exp1}節で直した。\textbf{直したあとの
+4 コア対 4 コアの比較は第\ref{sec:exp1}節を見よ}（ワーカーズ型 298.8 ms 対
+対称SMP型 397 ms、差は 1.66 倍から \textbf{1.33 倍}へ縮んだ）。
+
+\section{結果1b: 核0をスケジューラに参加させる（実験1）}\label{sec:exp1}
+
+\subsection{原因は 2 段構えで、途中まで私の読みは誤っていた}
+「核0が参加していない」ことは計器で分かっていたが、\textbf{どこで参加させるか}を
+二度取り違えた。順に書く。実測でしか分からなかったからである。
+
+\begin{enumerate}
+\item \textbf{hook を置いた関数が呼ばれていなかった}。核0 は描画ループ
+      \texttt{wm\_run()} に居ると考えて、そこへ引き取り口を置いた。しかし
+      この板は HDMI が無く、\texttt{kernel\_main} は \texttt{shell\_main()} へ落ちる。
+      \texttt{wm\_run()} は\textbf{呼び出し元が存在しない}。hook は一度も走っていなかった。
+\item \textbf{移した先も回らなかった}。核0 の暇は \texttt{uart\_getc()} の
+      RX 空回りだと考えて移したが、シリアルアダプタが TX$\to$RX ループバックのため
+      RX FIFO がほとんど空にならない。計器 \texttt{poll\_calls} は HTTP 要求あたり
+      約 1 回しか増えず、\texttt{poll\_hits} は 0 のままだった。
+\item \textbf{正解は \texttt{proc\_preempt()}}。ここは 100\,Hz のタイマ IRQ から
+      EOI 後に必ず呼ばれる。しかも既存の
+      \texttt{if (!IS\_IDLE(currpid)) proc\_resched();} という判定こそが
+      「核0 は idle だから何もしない」＝不参加の原因そのものだった。
+\end{enumerate}
+
+\noindent
+なお \texttt{core\_hits}（AIPL メッセージをコア別に何通実行したか）を足して分かったのだが、
+\textbf{AIPL の配布経路では核0 は最初から働いていた}。
+\texttt{smpsched\_parallel} の「呼び手が最後の 1 単位を直接走らせる」ぶんが核0 で
+実行されるからである。核0 不参加は \texttt{/smpsched}（N-Queens 駆動部）に固有の穴であって、
+AIPL の配布経路の穴ではない。初稿の記述をここで訂正する。
+
+\subsection{直した結果}
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+ & 修正前 (build 21:09:08) & \textbf{修正後 (build 21:37:48)} \\
+\midrule
+\texttt{ran\_per\_core}（4単位） & \textbf{0}/1/2/1 & \textbf{1/1/1/1} \\
+N-Queens $n=13$ 最良 & 496 ms & \textbf{397 ms} \\
+核0 が取った本数 \texttt{poll\_hits} & 0 & 13 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+\textbf{4 コア対 4 コア} & 時間 [ms] & 直列 660.1 ms からの速度向上 \\
+\midrule
+\textbf{ワーカーズ型 4コア} & \textbf{298.8} & \textbf{2.21} \\
+対称SMP型（4単位, 最良） & 397 & 1.66 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\textbf{N-Queens ではワーカーズ型が 1.33 倍速い。}
+修正前の 1.66 倍から縮んだので、\textbf{差の約半分は核0 の不参加という実装の穴が
+作っていた}ことになる。残る 1.33 倍が方式そのものの差である。
+
+\section{結果2: 通常の並列計算（負荷の性質による差）}
+
+ワーカーズ型・4コア・同一起動。いずれも直列と並列で結果が一致（\texttt{agree=yes}）。
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+負荷 & 直列 [ms] & 4コア [ms] & 速度向上 \\
+\midrule
+dining（独立卓・均一） & 95.59 & 23.92 & \textbf{4.00} \\
+primes 30万（ほぼ均一） & 41.75 & 13.83 & \textbf{3.02} \\
+nqueens $n{=}13$（木が不揃い） & 571.08 & 286.53 & 1.99 \\
+fill 20万語（メモリ律速・短い） & 1.04 & 1.38 & 0.75 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.5cm,
+  xlabel={cores},ylabel={time [ms], log scale},ymode=log,
+  xtick={1,2,3,4},legend pos=north east,legend style={font=\scriptsize},
+  ymajorgrids,grid style={black!15}]
+\addplot+[mark=*] coordinates {(1,571.08)(2,304.79)(3,278.32)(4,286.53)};
+\addlegendentry{nqueens n=13}
+\addplot+[mark=square*] coordinates {(1,95.59)(2,47.84)(3,31.90)(4,23.92)};
+\addlegendentry{dining}
+\addplot+[mark=triangle*] coordinates {(1,41.75)(2,25.90)(3,18.06)(4,13.83)};
+\addlegendentry{primes 300k}
+\addplot+[mark=diamond*] coordinates {(1,1.04)(2,0.88)(3,1.20)(4,1.38)};
+\addlegendentry{fill 200k words}
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{ワーカーズ型のコア数掃引。均一な仕事は 4 コアぶん出る一方、
+木が不揃いな nqueens は 3 コアで頭打ちになり、メモリ律速の fill は伸びない。}
+\end{center}
+
+\textbf{静的分割は、仕事が均一なら理想に近い}（dining で $4.00\times$）。
+逆に不揃いだと一番重い区間を引いたコアの終了時刻が全体を決め、頭打ちになる。
+これは静的分割の原理的な限界であり、対称SMP型が本来有利になりうる領域である。
+
+\section{結果3: AIPL アクター並列（本命）}\label{sec:aipl}
+
+\subsection{測り方}
+AIPL 標本（\S\ref{sec:prog}）は 8 個の Worker が\textbf{同じ量}の計算をする。
+宛先が互いに異なり \texttt{par\_safe}（WAIT も描画命令も含まない）なので、実行時系はこの
+8 通を 1 つのバッチにまとめて配る。粒度（1 メッセージあたりのループ回数）を
+1 から 200{,}000 まで 9 段階に振り、両方式で
+\textbf{並列配布に費やした総時間 $us$} と\textbf{その間に配ったメッセージ数 $msgs$} を計器から読み、
+$us/msgs$ を 1 メッセージあたりの費用とした。各点 2 回、再現性は $\pm 0.1\%$ 未満。
+
+\subsection{測定値}
+
+\begin{center}
+\begin{tabular}{rrrr}
+\toprule
+粒度 [反復/msg] & ワーカーズ型 [$\mu$s/msg] & 対称SMP型 [$\mu$s/msg] & 比 \\
+\midrule
+1        & 3.56 & 5.31 & \textbf{1.49} \\
+10       & 8.94 & 11.69 & 1.31 \\
+50       & 36.72 & 39.63 & 1.08 \\
+200      & 141.91 & 144.81 & 1.02 \\
+1{,}000    & 699.50 & 704.09 & 1.01 \\
+5{,}000    & 3{,}487.06 & 3{,}505.88 & 1.005 \\
+20{,}000   & 13{,}954.62 & 14{,}005.00 & 1.004 \\
+100{,}000  & 69{,}764.09 & 70{,}009.50 & 1.004 \\
+200{,}000  & 139{,}695.69 & 140{,}007.62 & 1.002 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=7cm,xmode=log,ymode=log,
+  xlabel={granularity [loop iterations per message]},
+  ylabel={cost [$\mu$s per message]},
+  legend pos=north west,legend style={font=\scriptsize},
+  ymajorgrids,xmajorgrids,grid style={black!15}]
+\addplot+[mark=*,thick] coordinates \aiplW;   \addlegendentry{workers (mailbox)}
+\addplot+[mark=square*,thick] coordinates \aiplS; \addlegendentry{symmetric SMP}
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{AIPL のメッセージ 1 通あたりの費用。粒度が大きい領域では
+両者は重なる（本体の実行が支配的）。細かい領域で分かれる。}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6cm,xmode=log,
+  xlabel={granularity [loop iterations per message]},
+  ylabel={cost ratio (symmetric / workers)},
+  ymin=0.95,ymax=1.6,ymajorgrids,xmajorgrids,grid style={black!15},
+  extra y ticks={1.0},extra y tick style={grid=major,grid style={black!45,dashed}}]
+\addplot+[mark=*,thick,color=red!70!black] coordinates \aiplRatio;
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{同じ仕事に対する費用の比。粒度が細かいほどワーカーズ型が有利になり、
+粒度 1 反復では 1.49 倍の差がつく。粒度 200 反復（$\simeq 140\,\mu$s の仕事）を超えると
+差は 2\% 以下に埋もれる。}
+\end{center}
+
+\subsection{配布コストの分離}
+
+粒度が小さい領域（$\le 1{,}000$）で $us/msg = a + b\times$粒度 に当てはめると:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+ & 配布コスト $a$ [$\mu$s/msg] & 傾き $b$ [ns/反復/msg] \\
+\midrule
+ワーカーズ型 & \textbf{2.28} & 697.2 \\
+対称SMP型 & \textbf{4.71} & 699.4 \\
+\midrule
+差 & \textbf{2.43}（\textbf{2.06 倍}） & 0.3\%（一致） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5cm,xbar,xmin=0,
+  xlabel={dispatch cost [$\mu$s per AIPL message]},
+  symbolic y coords={symmetricSMP,workers},ytick=data,
+  yticklabels={symmetric SMP,workers (mailbox)},
+  nodes near coords,nodes near coords style={font=\small},
+  bar width=18pt,xmajorgrids,grid style={black!15},xmax=5.6]
+\addplot+[fill=orange!60,draw=orange!60!black] coordinates {(4.71,symmetricSMP)};
+\addplot+[fill=blue!45,draw=blue!60!black] coordinates {(2.28,workers)};
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{AIPL メッセージ 1 通を配るのに要する費用。本体の実行時間は含まない。}
+\end{center}
+
+\paragraph{傾き $b$ の読み方（訂正）。}
+$b$ を「解釈器 1 反復の所要時間」と読んではならない。測っているのは
+\emph{バッチ全体の壁時計時間をバッチ内メッセージ数で割った値}なので、
+バッチが 4 コアで同時に走るぶん $b$ には $1/4$ が掛かっている。
+すなわち解釈器の素の速度は $b\times 4 \simeq 2.79\,\mu\mathrm{s}$/反復である。
+（この $2.79\,\mu\mathrm{s}$ は第\ref{sec:exp3}節で独立に検証される。）
+初稿ではここを取り違えて「バッチが直列に走っている」と述べたが、
+第\ref{sec:exp2}節のバッチ長掃引がそれを否定した。
+
+\textbf{$b$ が両方式で一致している}ことが重要である。本体の実行速度は同じなのだから、
+$a$ の差は\textbf{配布機構そのものの費用}である。ワーカーズ型は 1 バッチにつき
+郵便箱への書き込みと \texttt{SEV} 一回で済み、その費用がバッチ内の 8 通に薄まる。
+対称SMP型は 1 単位ごとにプロセスを作り、共有キューのロックを取り、文脈を切り替える。
+
+
+\section{結果4: バッチ長と並列度（実験2）}\label{sec:exp2}
+
+前節の粒度掃引はバッチ長を 8 に固定していた。バッチ長そのものを振ると、
+\textbf{AIPL のアクター・バッチが本当に 4 コアで同時に走っているか}が分かる。
+標本は \texttt{AiplP$n$.abcl}（アクター $n$ 個・各 1{,}000 反復・粒度は全て同じ）。
+
+\begin{center}
+\begin{tabular}{lrrrrrrr}
+\toprule
+バッチ長 & msgs & 巡回数 & \multicolumn{3}{c}{1 メッセージあたり [$\mu$s]} & \multicolumn{2}{c}{1 巡 [$\mu$s]} \\
+\cmidrule(lr){4-6}\cmidrule(lr){7-8}
+ & & & W & S & S/W & W & S \\
+\midrule
+2+2 & 4 & 2 & 1072.5 & 1093.0 & 1.019 & 2145 & 2186 \\%
+4+4 & 8 & 2 & 686.0 & 690.9 & 1.007 & 2744 & 2764 \\%
+8+8 & 16 & 4 & 699.1 & 705.7 & 1.009 & 2796 & 2823 \\%
+16+16 & 32 & 8 & 740.3 & 746.8 & 1.009 & 2961 & 2987 \\%
+32+23 & 55 & 14 & 581.7 & 590.3 & 1.015 & 2285 & 2319 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+「巡回数」は $\sum \lceil \text{バッチ長}/4 \rceil$、すなわち 4 コアで何巡すれば
+そのバッチを配り終えるかである。W = ワーカーズ型、S = 対称SMP型。
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xmode=log,log basis x=2,
+  xlabel={バッチ長（同時に発射されたメッセージ数）},
+  ylabel={1 メッセージあたり [$\mu$s]},
+  ymin=500,ymax=1150,legend pos=north east,
+  xmajorgrids,ymajorgrids,grid style={black!15}]
+\addplot+[mark=*,thick] coordinates \batW;   \addlegendentry{workers (mailbox)}
+\addplot+[mark=square*,thick] coordinates \batS; \addlegendentry{symmetric SMP}
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{バッチ長を変えたときの 1 メッセージあたりの費用。
+バッチ長 2（コア数 4 に満たない）では約 2 倍高く、4 以上でほぼ一定になる。}
+\end{center}
+
+\paragraph{読み取れること。}
+\begin{enumerate}
+\item \textbf{バッチはコア数まで並列に走っている}。バッチ長 2 では 1{,}072$\,\mu$s/msg、
+      4 では 686$\,\mu$s/msg。半分に落ちるのは、長さ 2 のバッチが 4 コアのうち
+      2 コアしか使えていないからである。\textbf{直列に走っているなら
+      バッチ長を変えても $\mu$s/msg は変わらないはずで、この落ち込みが並列の証拠になる。}
+\item 「1 巡」の欄（1{,}000 反復を全コア同時に走らせた所要時間）は
+      2{,}100$\sim$3{,}000$\,\mu$s にほぼ収まる。$\Rightarrow$ 解釈器 1 反復
+      $\simeq 2.8\,\mu\mathrm{s}$。前節の傾き $b\simeq 700\,$ns の 4 倍で、辻褄が合う。
+\item \textbf{方式差はどのバッチ長でもほぼ一定}（S/W $= 1.007\sim1.019$）。
+      この粒度（1{,}000 反復 $\simeq 2.8\,$ms）では配布コストは埋もれる。
+      方式差が効くのは第\ref{sec:aipl}節で見たとおり\textbf{粒度が小さいとき}である。
+\end{enumerate}
+
+\noindent
+（バッチ長 32 の標本は実測でバッチが $32+23$ に割れており、他の行と同列には読めない。
+再測が必要な行として残す。）
+
+\section{結果5: 不揃いな仕事 —— 対称SMP型が勝つ領域（実験3）}\label{sec:exp3}
+
+仮説を検証するには、\textbf{仮説が破れる場所}も探さなければならない。
+静的分割が不利になる条件は理論的にはっきりしている：
+\textbf{仕事が長く、かつ不揃い}なときである。そこで標本
+\texttt{AiplUneven.abcl} を書いた。8 個のアクターに $1{,}000\cdot 2^k\ (k=0..7)$ 反復、
+合計 255{,}000 反復を割り当てる。
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+ & 各コアの持ち分 [反復] & makespan [反復] & 予測 [ms] \\
+\midrule
+ワーカーズ型（静的・連続 2 通ずつ） & 3{,}000 / 12{,}000 / 48{,}000 / \textbf{192{,}000} & 192{,}000 & 535.7 \\
+対称SMP型（動的・空いた核が取る） & 17{,}000 / 34{,}000 / 68{,}000 / \textbf{136{,}000} & 136{,}000 & 379.4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+ & 予測 [ms] & 実測 [ms] & 差 \\
+\midrule
+ワーカーズ型 & 535.7 & \textbf{505.1} & $-5.7\%$ \\
+対称SMP型 & 379.4 & \textbf{403.1} & $+6.2\%$ \\
+\midrule
+比 & 1.41$\times$ & \textbf{1.25}$\times$ & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.4cm,ybar,ymin=0,
+  ylabel={1 バッチの makespan [ms]},
+  symbolic x coords={workers,symmetricSMP},
+  xtick={workers,symmetricSMP},
+  xticklabels={workers (static split),symmetric SMP (dynamic)},
+  enlarge x limits=0.55,
+  nodes near coords,nodes near coords style={font=\small,yshift=1pt},
+  bar width=44pt,ymajorgrids,grid style={black!15},ymax=620]
+\addplot[ybar,bar shift=0pt,fill=blue!45,draw=blue!60!black,
+         point meta=explicit symbolic]
+  coordinates {(workers,505.1) [505.1]};
+\addplot[ybar,bar shift=0pt,fill=orange!60,draw=orange!60!black,
+         point meta=explicit symbolic]
+  coordinates {(symmetricSMP,403.1) [403.1]};
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{仕事が不揃いなとき（$1{,}000\cdot2^k$ 反復・8 アクター）。
+\textbf{対称SMP型が 1.25 倍速い} —— 本報告で唯一、対称SMP型が勝った条件。}
+\end{center}
+
+\paragraph{これは仮説の反例であり、そう報告する。}
+静的分割は重い 2 通（64{,}000 と 128{,}000）を同じコアが引くので、
+その 1 コアの終了時刻が全体を決める。動的分配は走行中に均すので、
+最長のタスク 128{,}000 反復に 8{,}000 の頭出しが乗った分で止まる。
+\textbf{予測が両方式とも $\pm 6\%$ で当たった}ことは、
+第\ref{sec:exp2}節で得た $2.79\,\mu\mathrm{s}$/反復という係数と、
+「静的分割か動的分配か」という makespan の読みが、どちらも正しいことを示している。
+
+すなわち、方式の優劣は\textbf{仕事の不揃いさ}が決める:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+仕事の性質 & 有利な方式 & 本報告の実測 \\
+\midrule
+短く・揃っている（AIPL の典型） & ワーカーズ型 & 1.00$\sim$1.49$\times$（第\ref{sec:aipl}節）\\
+長く・揃っている & 差はほぼ無い & 1.007$\sim$1.019$\times$（第\ref{sec:exp2}節）\\
+長く・不揃い & \textbf{対称SMP型} & \textbf{0.80}$\times$（本節）\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+
+\section{結果6: 交差点はどこか（実験A）}\label{sec:expA}
+
+第\ref{sec:exp3}節は「揃っている」「極端に不揃い」の両端しか無かった。
+そこで\textbf{総仕事量を 128{,}000 反復に固定したまま、ばらつき比だけ}を
+$1{:}1$ から $1{:}128$ まで振った（8 アクター、等比配分）。
+予測は makespan[反復] $\times\,2.79\,\mu\mathrm{s}$。
+
+\begin{center}
+\begin{tabular}{rrrrrrrr}
+\toprule
+比 & \multicolumn{3}{c}{ワーカーズ型（静的分割）} & \multicolumn{3}{c}{対称SMP型（動的分配）} & W/S \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+ & 実測 [ms] & 予測 & 誤差 & 実測 [ms] & 予測 & 誤差 & \\
+\midrule
+1 & 89.3 & 89.3 & $+0.0\%$ & 89.8 & 89.3 & $+0.6\%$ & \textbf{0.994} \\
+2 & 119.0 & 117.5 & $+1.3\%$ & 107.0 & 103.0 & $+3.9\%$ & 1.112 \\
+4 & 148.1 & 147.0 & $+0.7\%$ & 125.2 & 117.5 & $+6.6\%$ & 1.183 \\
+8 & 175.1 & 176.3 & $-0.7\%$ & 143.4 & 132.2 & $+8.4\%$ & 1.221 \\
+16 & 199.5 & 203.9 & $-2.2\%$ & 160.8 & 147.0 & $+9.4\%$ & 1.241 \\
+32 & 220.8 & 229.1 & $-3.6\%$ & 176.7 & 161.8 & $+9.2\%$ & 1.250 \\
+64 & 238.5 & 250.5 & $-4.8\%$ & 190.6 & 176.6 & $+7.9\%$ & 1.251 \\
+128 & 253.4 & 269.0 & $-5.8\%$ & 202.5 & 190.6 & $+6.3\%$ & \textbf{1.251} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xmode=log,log basis x=2,
+  xlabel={ばらつき比（最重量 : 最軽量。総仕事量は固定）},
+  ylabel={1 バッチの makespan [ms]},
+  ymin=70,legend pos=north west,xmajorgrids,ymajorgrids,grid style={black!15}]
+\addplot+[mark=*,thick] coordinates \spreadW;   \addlegendentry{workers (static split)}
+\addplot+[mark=square*,thick] coordinates \spreadS; \addlegendentry{symmetric SMP (dynamic)}
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{総仕事量を固定してばらつきだけを振る。
+揃っていれば重なり、ばらつくほど静的分割だけが伸びる。}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=4.6cm,xmode=log,log basis x=2,
+  xlabel={ばらつき比},ylabel={W/S（1 未満ならワーカーズ型が速い）},
+  ymin=0.95,ymax=1.30,xmajorgrids,ymajorgrids,grid style={black!15}]
+\addplot+[mark=*,thick,color=red!70!black] coordinates \spreadR;
+\addplot[dashed,domain=1:128,samples=2,black] {1};
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{同じデータの比。\textbf{対称SMP型の優位は 1.25 倍で頭打ちになる}
+――青天井ではない。}
+\end{center}
+
+\paragraph{読み取れること。}
+\begin{enumerate}
+\item \textbf{ワーカーズ型は静的分割の予測に $\pm6\%$ で乗る}。モデルが効いている。
+\item \textbf{対称SMP型は一貫して予測より $6\text{--}9\%$ 遅い}。
+      これが動的分配の固定費であり、両方式の差を素直に分解できる：
+      \emph{対称SMP型は約 7\% の固定費を払って、最大 29\% の均し効果を買っている}。
+\item \textbf{仕事が揃っていれば両者は同じ}（0.994）。ばらつきが増えると対称SMP型が
+      有利になるが、\textbf{1.25 倍で飽和する}。
+\item この実験では 1 通が 16{,}000 反復（$\simeq 45\,$ms）と大きいので、配布コストは埋もれる。
+      ワーカーズ型が勝つのは第\ref{sec:aipl}節で見た\textbf{粒度が小さい領域}である。
+      \textbf{優劣は「粒度」と「ばらつき」の二軸で決まる。}
+\end{enumerate}
+
+\section{結果7: 細かく割れば静的分割は救えるか（実験B）}\label{sec:expB}
+
+実験Aは「不揃いなら対称SMP型」で終わっている。しかし静的分割の弱点が
+\emph{分割の粗さ}に由来するなら、\textbf{多めに分割するだけで救えるはずである}。
+そこで\textbf{同じ重み集合}（$1..M$ を正規化、合計 128{,}000 反復）を、
+\textbf{散らした場合 B1}（ビット反転順。恣意性を避けるための決定的な低食い違い順）と
+\textbf{後ろに固めた場合 B2}（単調増加）に並べ替えて比べた。
+
+\begin{center}
+\begin{tabular}{llrrrr}
+\toprule
+形 & $M$ & W 実測 [ms] & W 予測 & S 実測 [ms] & W/S \\
+\midrule
+B1 散らす & 4 & 144.8 & 142.8 & 119.7 & 1.210 \\
+B1 散らす & 8 & 122.6 & 118.9 & 108.4 & 1.131 \\
+B1 散らす & 16 & \textbf{113.0} & 105.2 & 105.5 & \textbf{1.071} \\
+\midrule
+B2 固める & 4 & 144.7 & 142.8 & 119.7 & 1.209 \\
+B2 固める & 8 & 154.4 & 148.7 & 125.7 & 1.228 \\
+B2 固める & 16 & \textbf{166.8} & 152.3 & 134.6 & \textbf{1.239} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xmode=log,log basis x=2,
+  xlabel={分割数 $M$（総仕事量・重み集合は同じ）},
+  ylabel={1 バッチの makespan [ms]},
+  legend pos=north west,xmajorgrids,ymajorgrids,grid style={black!15},
+  ymin=95,ymax=180]
+\addplot+[mark=*,thick,color=blue!60!black] coordinates \bOneW;
+  \addlegendentry{workers, 重い仕事を散らす}
+\addplot+[mark=triangle*,thick,color=red!70!black] coordinates \bTwoW;
+  \addlegendentry{workers, 重い仕事が固まる}
+\addplot+[mark=square*,thick,dashed,color=orange!80!black] coordinates \bOneS;
+  \addlegendentry{symmetric, 散らす}
+\addplot+[mark=diamond*,thick,dashed,color=orange!50!black] coordinates \bTwoS;
+  \addlegendentry{symmetric, 固まる}
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{同じ重み集合を $M$ 通に割る。
+\textbf{散らせば細かく割るほど速くなり、固まっていれば細かく割るほど遅くなる。}}
+\end{center}
+
+\paragraph{予測どおりに分かれた。}
+郵便箱は区間を\textbf{連続}に 4 等分する。だから
+\begin{itemize}
+\item \textbf{重い仕事が散らばっていれば}、$M$ を増やすほど各区間の合計が平均化され、
+      ワーカーズ型は $144.8 \to 113.0\,$ms と改善し、対称SMP型との差は
+      $1.21 \to \mathbf{1.07}$ 倍まで縮む。
+\item \textbf{重い仕事が固まっていれば}、$M$ を増やしても同じコアに集まり続けるので
+      $144.7 \to 166.8\,$ms と\textbf{悪化}し、差は $1.21 \to 1.24$ 倍へ開く。
+\end{itemize}
+
+\noindent
+すなわち処方は「共有 ready キューへ移れ」ではない。
+\textbf{多めに分割し、重い仕事を隣り合わせにするな}――
+これは郵便箱方式を保ったまま実行できる。
+
+\paragraph{$M=32$ は測れなかった（処理系の限界）。}
+$M=32$ の標本はいずれも \texttt{msgs=55 nbatch=2} で停止する（測定窓を 6 秒から
+20 秒に伸ばしても同じ値）。1 論理ラウンド 32 通のはずが $32+23$ で打ち切られ、
+Collector が \texttt{got == 32} に届かず次ラウンドを起こさない。
+\texttt{VM\_Q=512} なのでキュー溢れではない。\textbf{AVM のバッチ化が 32 アクターの
+この形で破綻している}。スケジューリングの結果ではないので実験Bからは除外し、
+第\ref{sec:open}節に残す。
+
+\section{結果8: 4 コアで 4 倍は出ない（実験C）}\label{sec:expC}
+
+これまでの速度向上は 4 コアでも $2.2\times$ 止まりだった。その理由を、
+\textbf{分割の不均等をゼロにして}切り分ける。
+\texttt{core\_hits} により「バッチ長がコア数に満たないと残りのコアは 1 通も実行しない」
+ことが分かっているので、\textbf{1 通 32{,}000 反復に完全に揃えたまま}、
+バッチ長で使用コア数だけを $2\to4$ と変えられる。
+
+\begin{center}
+\begin{tabular}{rrrrr}
+\toprule
+使用コア & makespan [ms] & 1 反復あたり [$\mu$s] & 2 コア比の実効スループット & 理想 \\
+\midrule
+2 & 69.2 & 2.163 & 1.00$\times$ & 1.00$\times$ \\
+3 & 77.7 & 2.428 & 1.34$\times$ & 1.50$\times$ \\
+4 & 87.4 & \textbf{2.731} & \textbf{1.58}$\times$ & 2.00$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=4.6cm,xlabel={同時に働くコア数},
+  ylabel={1 反復あたり [$\mu$s]},xtick={2,3,4},ymin=2.0,ymax=2.9,
+  xmajorgrids,ymajorgrids,grid style={black!15},nodes near coords,
+  nodes near coords style={font=\small}]
+\addplot+[mark=*,thick,color=violet] coordinates \coreUs;
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{仕事を完全に等量にしても、コアを増やすと 1 反復の所要が伸びる。
+$2\to4$ コアで $+26\%$。}
+\end{center}
+
+\paragraph{これは分割の問題ではない。}
+仕事は完全に等量で、\texttt{core\_hits} も \texttt{2/2/0/0}, \texttt{2/2/2/0},
+\texttt{2/2/2/2} と設計どおりである。それでも 1 反復の所要が
+$2.163 \to 2.731\,\mu\mathrm{s}$ と伸びる。この板は\textbf{D-cache を切って走っている}ので、
+すべてのメモリ参照がバスに出る。1 コア増やすごとに約 $+13\%$。
+ここから 1 コア相当は約 $1.88\,\mu\mathrm{s}$/反復と外挿でき、
+4 コアの実効速度向上は約 $\mathbf{2.75\times}$ ――
+\textbf{N-Queens の $2.21\times$ 頭打ちの主要部分はここで説明がつく}
+（残りが静的分割の不均等である）。
+
+\paragraph{測り損ねた 1 コア基準値。}
+1 コア基準値のつもりで作った標本（4 通のうち 1 通だけ 32{,}000 反復、他は 100 反復）は
+$85.1\,$ms $= 2.659\,\mu\mathrm{s}$/反復で、4 コア全開（2.731）とほぼ同じだった。
+1 コアしか計算していないのに速くならない。有力な疑いは
+\texttt{smpsched\_parallel} の \texttt{while (sp\_done < nproc) proc\_resched();}
+という\textbf{駆動側の空回り}が共有ロックを叩き続け、計算中のコアの足を引くことである。
+確かめていないので\textbf{上表の外挿にはこの値を使っていない}
+（2$\sim$4 コアの傾きから取った）。第\ref{sec:open}節に残す。
+
+
+\section{結果9: 三板での追試（Pi 4 / Pi 3）}\label{sec:boards}
+
+Pi 5 で得た「分割の仕方が効く」という結論を、別アーキテクチャで確かめる。
+Pi 4（Cortex-A72）と Pi 3（Cortex-A53）には対称SMPスケジューラは無いので、
+ここで比べるのは\textbf{ワーカーズ型（郵便箱・静的分割）における分割の仕方}である。
+
+\subsection{N-Queens $n=13$}
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+コア & Pi 5 (A76) & Pi 4 (A72) & Pi 3 (A53) \\
+\midrule
+1 & 660.1 ms (1.00$\times$) & 1401.3 ms (1.00$\times$) & 1426.1 ms (1.00$\times$) \\
+2 & 355.8 ms (1.85$\times$) & 959.3 ms (1.46$\times$) & 789.0 ms (1.81$\times$) \\
+3 & 306.0 ms (2.16$\times$) & 859.0 ms (1.63$\times$) & 641.6 ms (2.22$\times$) \\
+4 & \textbf{298.8 ms (2.21}$\times$\textbf{)} & \textbf{847.9 ms (1.65}$\times$\textbf{)}
+  & \textbf{517.4 ms (2.76}$\times$\textbf{)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xlabel={コア数},ylabel={速度向上},
+  xtick={1,2,3,4},ymin=0.9,ymax=3.0,legend pos=north west,
+  xmajorgrids,ymajorgrids,grid style={black!15}]
+\addplot+[mark=*,thick] coordinates {(1,1.00)(2,1.85)(3,2.16)(4,2.21)};
+  \addlegendentry{Pi 5 (A76)}
+\addplot+[mark=triangle*,thick] coordinates {(1,1.00)(2,1.46)(3,1.63)(4,1.65)};
+  \addlegendentry{Pi 4 (A72)}
+\addplot+[mark=square*,thick] coordinates {(1,1.00)(2,1.81)(3,2.22)(4,2.76)};
+  \addlegendentry{Pi 3 (A53)}
+\addplot[dashed,black,domain=1:4,samples=2] {3.01};
+  \addlegendentry{均一負荷での天井 3.01}
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{N-Queens $n=13$ の速度向上（各 3 回の中央値、ばらつきは全点 0.1\% 未満）。
+\textbf{Pi 4 は 3 コアで頭打ちになる}のに対し、Pi 3 は 4 コア目でも伸びる。}
+\end{center}
+
+\noindent
+\textbf{Pi 3 と Pi 4 は直列がほぼ同じ}（1426 対 1401 ms）\textbf{なのに、4 コアでは
+Pi 3 が 1.6 倍速い}。素直に読めば「A53 のほうが並列に強い」となるが、それは誤りである。
+なお \textbf{Pi 4 は 3 コアで頭打ちになる}（$1.63\times \to 1.65\times$）。
+連続分割で重い列が同じコアに固まると、コアを足しても効かなくなる
+---- 第\ref{sec:expB}節と同じ形である。
+
+\subsection{均一な負荷なら三板とも同じ}
+
+分割の不均等がほとんど無い負荷（\texttt{primes}, $n=300{,}000$）で測り直す。
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+コア & Pi 4 & Pi 3 \\
+\midrule
+1 & 0.99$\times$ & 1.00$\times$ \\
+2 & 1.61$\times$ & 1.61$\times$ \\
+3 & 2.31$\times$ & 2.31$\times$ \\
+4 & \textbf{3.01}$\times$ & \textbf{3.01}$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\textbf{曲線が完全に一致した}（Pi 5 の \texttt{primes} も 3.02$\times$）。
+したがって N-Queens の差はハードウェアの差ではなく、
+\textbf{各カーネルが N-Queens をどう分割しているか}の差である。
+
+\subsection{分割の仕方だけを変える}
+
+Pi 4 は \texttt{/bench?il=} で分割を選べる（各 2 回、再現性あり）。
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+分割 & 4 コア [ms] & 速度向上 \\
+\midrule
+\texttt{il=0} 連続 4 等分 & 847.6 / 847.3 & 1.64$\times$ \\
+\texttt{il=1} ストライド（第1行） & 811.1 / 811.1 & 1.72$\times$ \\
+\texttt{il=2} ストライド（第2行・Pi 3 と同じ方式） & \textbf{774.3 / 774.4} & \textbf{1.81}$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\textbf{スケジューラを一切変えず、分割の仕方を変えるだけで $+10\%$。}
+第\ref{sec:expB}節（重い仕事を散らせば静的分割は救える）の、
+\textbf{実機・別アーキテクチャでの追認}である。
+なお Pi 3 は \texttt{il=} を受け付けず既定の分割ひとつだけだが、それで 2.75$\times$ 出る。
+Pi 4 の \texttt{il=2} が本当に Pi 3 と同じ分割なら 1.81$\times$ 対 2.75$\times$ の差が残るので、
+別要因（D-cache の扱い、L2 の共有の仕方）を疑う必要がある。ここは未解決である。
+
+\subsection{4 コアで 4 倍は出ない、も三板に共通}
+均一な負荷でも 4 コアで 3.01$\times$（Pi 5 も 3.02$\times$）。
+分割の不均等がゼロでもここが天井であることは、第\ref{sec:expC}節と整合する。
+
+\section{結果10: Pi 4 にも同じ例外復帰の穴があった}\label{sec:pi4bug}
+
+第\ref{sec:bug}節で Pi 5 に見つけた穴（例外エントリが \texttt{ELR\_EL1}/\texttt{SPSR\_EL1} を
+退避しない）が、\textbf{Pi 4 にもそのまま存在した}。
+
+\begin{itemize}
+\item \texttt{irq\_dispatch\_c} $\to$ \texttt{proc\_preempt()} $\to$ \texttt{proc\_resched()}
+      $\to$ \textbf{割り込み区間の中で \texttt{ctxsw}}
+\item \texttt{irq\_entry} は x0--x30 と \textbf{q0--q31 まで}退避するのに
+      \texttt{ELR\_EL1}/\texttt{SPSR\_EL1} は退避しない
+\item その場のコメント自身が「\texttt{irq\_dispatch\_c} は ctxsw を呼びうるので
+      割り込まれた側の FP 状態は生き延びねばならない」と書いている。
+      \textbf{同じ理屈が ELR/SPSR にも当てはまるのに抜けていた。}
+\end{itemize}
+
+\subsection{計器そのものを先に検証する}
+最初の測定は \texttt{mismatch=0}、つまり\textbf{穴が無いように見えた}。
+しかしそれは \textbf{Pi 4 が先取り(preemption)を既定で切っている}ためで、
+\textbf{危険が起こり得ない状態を測っていた}のである。
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\texttt{/netpreempt} & \texttt{net\_preempt=off}（既定） \\
+\texttt{/rtos-jitter preempt=0} & \texttt{pp\_calls=1296 off=1296 fired=0} ← 一度も発火しない \\
+\texttt{/rtos-jitter preempt=1} & \texttt{pp\_calls=605 off=0 fired=605} ← 発火する \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{同じ起動のまま A/B を取る}
+\texttt{/elrfix?on=0|1} で復帰時の書き戻しを実行時に切り替えられるようにし、
+\texttt{/preempttest?procs=\&n=} で答えの決まった計算（積・和・剰余のみ、メモリを持たない）を
+複数プロセスで同時に回して基準値と突き合わせた。先取りは ON。
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+プロセス数 & 修正なし \texttt{elr\_restore\_on=0} & 修正あり \texttt{=1} \\
+\midrule
+2 & \texttt{991055 906373} → \textbf{mismatch 2/2} & 全て 480003 → \textbf{0} \\
+4 & \texttt{428433 258890 504716 480003} → \textbf{3/4} & 全て 480003 → \textbf{0} \\
+8 & 8 個すべて相異なる値 → \textbf{8/8} & 全て 480003 → \textbf{0} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+期待値は 480003。\textbf{先取りが入った瞬間に、修正なしでは答えが全部狂う。}
+修正あり側は N-Queens も 1397.2 / 960.8 / 847.8 ms・解 73712・\texttt{agree = yes} と
+焼く前に一致し、退行は無い。
+
+\subsection{Pi 3 に同じ穴は無い ---- ARM32 の実装は正しかった}
+Pi 3 の実機カーネルは \texttt{kernel7.img}、すなわち \textbf{ARMv7 (32 bit)} で、
+\texttt{xinu-rpi4}/\texttt{xinu-rpi5} とは別系統（classic Embedded Xinu）である。
+AArch64 の \texttt{ELR\_EL1}/\texttt{SPSR\_EL1} に相当するのはバンクされた
+\texttt{LR\_irq}/\texttt{SPSR\_irq} で、その IRQ 入口はこうなっている:
+
+\begin{lstlisting}
+    sub  lr, lr, #4
+    srsdb #ARM_MODE_SYS!     /* SPSR_irq と LR_irq を **SYS スタック** へ積む */
+    cpsid if, #ARM_MODE_SYS  /* = 割り込まれたスレッド自身のスタック          */
+    push {r0-r4, r12, lr}
+    bl   dispatch            /* この中で clkhandler -> resched() が起こりうる */
+    pop  {r0-r4, r12, lr}
+    rfeia sp!                /* 自分のスタックから PC と CPSR を戻す          */
+\end{lstlisting}
+
+\noindent
+\textbf{復帰状態を「割り込まれたスレッド自身のスタック」に積んでいる}ので、
+\texttt{dispatch()} の中で文脈が切り替わっても、各スレッドは自分の復帰状態を持って戻る。
+\texttt{clkhandler.c} は実際に割り込み中に \texttt{resched()} を呼ぶが、それでも安全である。
+
+\textbf{つまり AArch64 版（rpi4/rpi5）は、ARM32 版が正しくやっていたことを
+再実装の際に落としていた。} Pi 3 は対象外であり、焼き直しも要らない。
+
+\subsection{三板の測定状況}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+実験 & Pi 5 & Pi 4 & Pi 3 \\
+\midrule
+N-Queens コア 1--4 & 済 & 済 & 済 \\
+均一負荷 \texttt{primes} コア 1--4 & 済 & 済 & 済 \\
+分割の仕方 \texttt{il=} & 口あり & 済 & 対象外（受け付けない） \\
+ELR/SPSR の穴 & 済（発見・修正） & 済（実証・修正） & \textbf{対象外}（ARM32 で元から正しい） \\
+\texttt{dining} / \texttt{fill} & 済 & 済 & 未対応 \\
+AIPL 実験 A/B/C & 済 & \textbf{未実装} & \textbf{未実装} \\
+対称SMP型 & 済 & \textbf{未移植} & \textbf{未移植} \\
+実験1（核0 の参加） & 済 & 対象外 & 対象外 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Pi 3 / Pi 4 で残っているのは \textbf{AIPL のアクター並列}と\textbf{対称SMP型}の 2 つだけで、
+どちらも機構そのものが無いため、実装（移植）が先である。
+Pi 3 は classic Embedded Xinu の系統なので、Pi 5 からの移植は Pi 4 より重い。
+
+\section{考察}
+
+\subsection{仮説は支持された。ただし条件つきで}
+AIPL のアクター本体は短い。本実測では 1 反復 $\simeq 2.8\,\mu\mathrm{s}$（4 コア同時なら
+実効 $700\,\mathrm{ns}$/msg）であり、実用的なアクター本体（数十$\sim$数百反復）は
+$20\text{--}150\,\mu\mathrm{s}$ の領域に入る。
+この領域で対称SMP型はワーカーズ型より $2\text{--}8\%$ 高く、
+さらに細かい粒度では最大 1.49 倍に達する。
+\textbf{AIPL のメッセージ粒度では、ワーカーズ型が効率的である}と言える。
+
+\subsection{対称SMP型が有利になりうる領域も併記する}
+公平を期すために書いておく――というより、\textbf{実際にその領域を探して測った}。
+仕事が\textbf{長く、かつ不揃い}な場合、静的分割は一番重い区間に律速され、
+動的に取る方式が有利になる。第\ref{sec:exp3}節の \texttt{AiplUneven} では
+\textbf{対称SMP型が 1.25 倍速い}。
+
+初稿では「対称SMP型が勝てないのは核0 が参加していないからだ」と書いたが、
+\textbf{これは半分しか当たっていなかった}ので訂正する。
+\begin{itemize}
+\item \textbf{AIPL の配布経路では核0 は最初から働いていた}。計器 \texttt{core\_hits}
+      が先頭から非 0 を示す。したがって上の 1.25 倍は\textbf{4 コア対 4 コアの値}である。
+\item 核0 の不参加は \texttt{/smpsched}（N-Queens 駆動部）に固有の穴だった。
+      第\ref{sec:exp1}節で直した結果、対称SMP型は 496 ms から 397 ms へ改善し、
+      ワーカーズ型との差は 1.66 倍から \textbf{1.33 倍}へ縮んだ。
+      \textbf{差の約半分は方式ではなく実装の穴が作っていた}ことになる。
+\end{itemize}
+残る 1.33 倍が方式そのものの差であり、その内訳は
+第\ref{sec:expA}節が定量的に分けている――
+\textbf{対称SMP型は約 7\% の固定費を払って、最大 29\% の均し効果を買っている}。
+
+\subsection{二軸の判断表（本報告の結論）}
+方式の優劣は一次元では決まらない。実測は\textbf{粒度}と\textbf{ばらつき}の二軸で整理できる。
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+条件 & 有利な方式 & 実測（W/S） \\
+\midrule
+粒度が細かい（$\le 200$ 反復） & \textbf{ワーカーズ型} & 0.67$\sim$0.98（第\ref{sec:aipl}節）\\
+粒度が粗く・仕事が揃っている & 差はほぼ無い & 0.99$\sim$1.02（第\ref{sec:expA}節）\\
+粒度が粗く・不揃いだが散らばる & ほぼ同等（分割を細かく） & 1.07（第\ref{sec:expB}節）\\
+粒度が粗く・重い仕事が固まる & \textbf{対称SMP型} & 1.24$\sim$1.25（第\ref{sec:expA}, \ref{sec:expB}節）\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+そして\textbf{対称SMP型の優位は 1.25 倍で頭打ちになる}のに対し、
+\textbf{ワーカーズ型の優位は粒度を細かくするほど伸びる}（最大 1.49 倍）。
+AIPL のメッセージは短いので、実運用の重心はワーカーズ型が有利な側にある。
+
+さらに第\ref{sec:expB}節が示すとおり、対称SMP型が勝つ唯一の領域（重い仕事が固まる）は、
+\textbf{分割を細かくし、重い仕事を隣り合わせにしない}ことで郵便箱方式のまま
+1.07 倍差まで詰められる。方式を替える必要はない。
+
+\subsection{アーキテクチャ上の含意}
+アクターモデルの言語処理系では、メッセージは\textbf{データとして}配るのが安い。
+プロセスとして配ると、汎用スケジューラが長寿命スレッドを前提に払っている費用
+（生成・キュー・文脈切替）を、寿命が $100\,\mu\mathrm{s}$ に満たない仕事にも払うことになる。
+Xinu Pi 上の AIPL 実行基盤としては、
+\textbf{バッチ化した郵便箱方式を既定とし、長く不揃いな仕事に限って動的分配を併用する}
+のが妥当と考える。
+
+\section{未解決}\label{sec:open}
+\begin{enumerate}
+\item \textbf{AVM のバッチ化が 32 アクターで破綻する}。1 論理ラウンドが $32+23$ で
+      打ち切られ、Collector が揃わず次ラウンドが起きない（第\ref{sec:expB}節）。
+      \texttt{PAR\_BATCH\_MAX} 境界の扱いを疑っている。
+\item \textbf{駆動側の空回り}。\texttt{while (sp\_done < nproc) proc\_resched();} が
+      共有ロックを叩き続け、計算中のコアの足を引いている疑いがある（第\ref{sec:expC}節）。
+      待ち方を変えれば対称SMP型の固定費 $6\text{--}9\%$ も減るかもしれない。
+\item \textbf{ワークスティーリング（第3の方式）}。郵便箱の安い配布のまま、
+      暇なワーカが他のワーカの区間の後ろ半分を奪う。実験A・Bの示すところでは、
+      これが両方の領域で勝てる可能性が高い。
+\item \textbf{二方式の同居}。対称モードに切り替えたあと郵便箱経路を叩くと結果が壊れる。
+      現状は排他的に使う前提である。
+\item \textbf{Pi 3 の例外エントリも同じ穴か}。Pi 4 と同じ手順（\texttt{/elrfix} +
+      \texttt{/preempttest}）がそのまま使える。
+\item \textbf{Pi 3 の分割方式}が Pi 4 の \texttt{il=2} と本当に同じか。
+      同じなら $1.81\times$ 対 $2.75\times$ の差が残り、別要因を疑うことになる。
+\item Pi 3 の \texttt{/bench} は \texttt{kind=dining} を投げると HTTP が固まる
+      （\texttt{ping} は 100\% 通る＝ネットワークは生きてサーバだけ停止）。要調査。
+\item \textbf{対称SMP型の Pi 4 移植}。\texttt{smpsched.c} の追加に加え
+      \texttt{proc.c}（420 行 対 852 行）の分岐が要り、機械的作業では済まない。
+\end{enumerate}
+
+\section{実行したプログラム}\label{sec:prog}
+
+\subsection{AIPL 標本（粒度 200 の版）}
+粒度だけが異なる 9 本を用意した（1, 10, 50, 200, 1{,}000, 5{,}000, 20{,}000, 100{,}000, 200{,}000）。
+以下は粒度 200 の版。\texttt{bench/aipl\_ab/AiplBenchG200.abcl}。
+
+\lstinputlisting{../../bench/aipl_ab/AiplBenchG200.abcl}
+
+\subsection{ばらつき比を振る標本（実験A・比 1:16 の版）}
+\lstinputlisting[language=Java]{../../bench/aipl_ab/AiplSpread16.abcl}
+
+\subsection{分割の粗さを見る標本（実験B・重い仕事が固まる $M=8$ の版）}
+\lstinputlisting[language=Java]{../../bench/aipl_ab/AiplB2M8.abcl}
+
+\subsection{使用コア数を変える標本（実験C・4 コアの版）}
+\lstinputlisting[language=Java]{../../bench/aipl_ab/AiplEq4.abcl}
+
+\subsection{核0を対称スケジューラに参加させる修正（実験1）}
+\begin{lstlisting}[language=C]
+/* system/proc.c —— タイマ IRQ から EOI 後に必ず呼ばれる地点。
+ * 既存の「currpid が idle なら何もしない」判定こそが、核0 が
+ * 対称スケジューラに一度も参加しない原因だった。 */
+void proc_preempt(void)
+{
+#ifdef SMP_SYMMETRIC
+    /* この核が暇（idle プロセスに居る）なら、共有 ready キューから 1 本引き受ける。 */
+    {
+        extern volatile int smpsched_on;
+        extern int smpsched_poll_once(void);
+        if (smpsched_on && IS_IDLE(currpid)) { smpsched_poll_once(); return; }
+    }
+#endif
+    if (!g_preempt_on || !g_resched_pending) return;
+    if (g_actor_pump) return;
+    g_resched_pending = 0;
+    if (!IS_IDLE(currpid)) proc_resched();
+}
+\end{lstlisting}
+
+\subsection{不揃いな仕事の標本（実験3）}
+\lstinputlisting[language=Java]{../../bench/aipl_ab/AiplUneven.abcl}
+
+\subsection{バッチ長を振る標本（実験2・バッチ長 4 の版）}
+\lstinputlisting[language=Java]{../../bench/aipl_ab/AiplP4.abcl}
+
+\subsection{N-Queens: 対称SMP型の駆動部}
+\texttt{system/smpsched.c} より、比較実験の中核。単位ごとにプロセスを作って
+共有 ready キューへ入れ、呼び手も 1 単位を直接担当する。
+
+\lstinputlisting{extract_smpsched.txt}
+
+\subsection{ワーカーズ型の配布（郵便箱・静的分割）}
+\texttt{system/smp.c} の \texttt{smp\_parallel\_sum}。
+
+\lstinputlisting{extract_smp.txt}
+
+\subsection{AIPL アクター・バッチの配り分け}
+\texttt{device/video/avm.c}。実行時にどちらの方式で配るかを決める。
+
+\lstinputlisting{extract_avm.txt}
+
+\subsection{不具合の修正（例外の ELR/SPSR 退避）}
+\texttt{system/exception\_vectors.S}。
+
+\lstinputlisting{extract_ev.txt}
+
+\subsection{測定スクリプト}
+\lstinputlisting[language=bash]{../../bench/aipl_ab/measure.sh}
+
+\end{document}

@@ -164,7 +164,13 @@ char uart_getc(void)
 {
     /* Busy-wait until the RX FIFO has something. */
     while (UART_FR & FR_RXFE) {
-        /* spin */
+#ifdef SMP_SYMMETRIC
+        /* 対称SMPモードのときは、この空回りが核0 の「暇」そのものなので、
+         * 共有 ready キューから 1 本引き受けて走らせる。これが無いと核0 は
+         * スケジューラに一度も参加せず、4コアのはずが実質3コアになる。
+         * （HDMI 無しの構成では核0 はここに居る。HDMI 有りなら wm_run 側の hook。） */
+        { extern int smpsched_poll_once(void); smpsched_poll_once(); }
+#endif
     }
     return (char)(UART_DR & 0xFF);
 }

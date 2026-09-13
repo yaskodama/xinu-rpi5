@@ -1,0 +1,50 @@
+// AiplP4.abcl — アクター 4 個・粒度 1000。バッチ長 4 で 1 通あたりの費用を測る。
+//   並列に走っているなら、コア数より少ないバッチ長では 1 通あたりが増えるはず
+//   （2 個なら 2 コアしか使えないので 1 通あたりは 4 個・8 個のときの倍になる）。
+//   直列に走っているなら、バッチ長によらず 1 通あたりは一定になる。
+//   ＝この比較で「本当に並列に走っているか」が決まる。合計 4000。
+class Main {
+  var ready = 0;
+  var c = 0;
+  var w0 = 0;
+  var w1 = 0;
+  var w2 = 0;
+  var w3 = 0;
+  method tick() {
+    if (ready == 0) {
+      ready = 1;
+      c = new Collector();
+      w0 = new Worker();
+      w1 = new Worker();
+      w2 = new Worker();
+      w3 = new Worker();
+    }
+    send w0.run(c, 1000);
+    send w1.run(c, 1000);
+    send w2.run(c, 1000);
+    send w3.run(c, 1000);
+  }
+}
+class Worker {
+  var acc = 0; var i = 0;
+  method run(coll, n) {
+    acc = 0;
+    i = 0;
+    while (i < n) do { acc = acc + 1; i = i + 1; }
+    send coll.report(acc);
+  }
+}
+class Collector {
+  var total = 0; var got = 0;
+  method report(v) {
+    total = total + v;
+    got = got + 1;
+    if (got == 4) {
+      got = 0;
+      // 合計が合ったときだけ次ラウンドを起こす。誤っていれば止まるので
+      // /avm-par の msgs が伸びないことで **外から** 誤りが分かる。
+      if (total == 4000) { total = 0; line(80, 300, 680, 300, 2); wait(1); }
+      else { total = 0; line(80, 300, 680, 300, 4); }
+    }
+  }
+}

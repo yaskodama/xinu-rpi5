@@ -1,0 +1,137 @@
+// AiplB1M32.abcl — 同じ重み集合を 散らした（ビ・32 通に分割
+//
+//   実験B「分割を細かくすれば静的分割は救えるか」用。同じ重み集合(1..M を正規化)を
+//   散らした（ビット反転順・恣意性を避けるため決定的な低食い違い順）。
+//   郵便箱は区間を **連続** に 4 等分するので、重い仕事が固まっていれば M を増やしても
+//   救えないはず。散らばっていれば平均化されて理想に近づくはず。
+//   予測 makespan: 静的 34900 / 動的 35200 反復（比 0.99、理想 32000）。
+//   ワーカ 32 個・合計 128000 反復。毎ラウンド合計を検算する。
+class Main {
+  var ready = 0;
+  var c = 0;
+  var w0 = 0;
+  var w1 = 0;
+  var w2 = 0;
+  var w3 = 0;
+  var w4 = 0;
+  var w5 = 0;
+  var w6 = 0;
+  var w7 = 0;
+  var w8 = 0;
+  var w9 = 0;
+  var w10 = 0;
+  var w11 = 0;
+  var w12 = 0;
+  var w13 = 0;
+  var w14 = 0;
+  var w15 = 0;
+  var w16 = 0;
+  var w17 = 0;
+  var w18 = 0;
+  var w19 = 0;
+  var w20 = 0;
+  var w21 = 0;
+  var w22 = 0;
+  var w23 = 0;
+  var w24 = 0;
+  var w25 = 0;
+  var w26 = 0;
+  var w27 = 0;
+  var w28 = 0;
+  var w29 = 0;
+  var w30 = 0;
+  var w31 = 0;
+  method tick() {
+    if (ready == 0) {
+      ready = 1;
+      c = new Collector();
+      w0 = new Worker();
+      w1 = new Worker();
+      w2 = new Worker();
+      w3 = new Worker();
+      w4 = new Worker();
+      w5 = new Worker();
+      w6 = new Worker();
+      w7 = new Worker();
+      w8 = new Worker();
+      w9 = new Worker();
+      w10 = new Worker();
+      w11 = new Worker();
+      w12 = new Worker();
+      w13 = new Worker();
+      w14 = new Worker();
+      w15 = new Worker();
+      w16 = new Worker();
+      w17 = new Worker();
+      w18 = new Worker();
+      w19 = new Worker();
+      w20 = new Worker();
+      w21 = new Worker();
+      w22 = new Worker();
+      w23 = new Worker();
+      w24 = new Worker();
+      w25 = new Worker();
+      w26 = new Worker();
+      w27 = new Worker();
+      w28 = new Worker();
+      w29 = new Worker();
+      w30 = new Worker();
+      w31 = new Worker();
+    }
+    send w0.run(c, 200);
+    send w1.run(c, 4100);
+    send w2.run(c, 2200);
+    send w3.run(c, 6100);
+    send w4.run(c, 1200);
+    send w5.run(c, 5100);
+    send w6.run(c, 3200);
+    send w7.run(c, 7000);
+    send w8.run(c, 700);
+    send w9.run(c, 4600);
+    send w10.run(c, 2700);
+    send w11.run(c, 6500);
+    send w12.run(c, 1700);
+    send w13.run(c, 5600);
+    send w14.run(c, 3600);
+    send w15.run(c, 7500);
+    send w16.run(c, 500);
+    send w17.run(c, 4400);
+    send w18.run(c, 2400);
+    send w19.run(c, 6300);
+    send w20.run(c, 1500);
+    send w21.run(c, 5300);
+    send w22.run(c, 3400);
+    send w23.run(c, 7300);
+    send w24.run(c, 1000);
+    send w25.run(c, 4800);
+    send w26.run(c, 2900);
+    send w27.run(c, 6800);
+    send w28.run(c, 1900);
+    send w29.run(c, 5800);
+    send w30.run(c, 3900);
+    send w31.run(c, 7800);
+  }
+}
+class Worker {
+  var acc = 0; var i = 0;
+  method run(coll, n) {
+    acc = 0;
+    i = 0;
+    while (i < n) do { acc = acc + 1; i = i + 1; }
+    send coll.report(acc);
+  }
+}
+class Collector {
+  var total = 0; var got = 0;
+  method report(v) {
+    total = total + v;
+    got = got + 1;
+    if (got == 32) {
+      got = 0;
+      // 合計が合ったときだけ次ラウンドを起こす。誤っていれば止まるので
+      // /avm-par の msgs が伸びないことで **外から** 誤りが分かる。
+      if (total == 128000) { total = 0; line(80, 300, 680, 300, 2); wait(1); }
+      else { total = 0; line(80, 300, 680, 300, 4); }
+    }
+  }
+}

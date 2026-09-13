@@ -1,0 +1,58 @@
+// AiplBenchG200.abcl — AIPL のアクター並列を測る標本（粒度 200 = 1メッセージあたりのループ回数）
+//
+//   8 個の Worker が **同じ量** の計算をする。宛先が互いに異なり par_safe
+//   （WAIT も描画命令も含まない）ので、実行時系はこの 8 通を 1 バッチに
+//   まとめて各コアへ配る。Main.tick() は毎フレーム呼ばれるので、走らせている
+//   あいだ同じ形の並列バッチが流れ続ける＝スループットを測れる。
+//
+//   ★ アクターは **最初の 1 回だけ**作り、以後は同じ相手へ送り直す。
+//     毎フレーム new すると VM のオブジェクト表がすぐ埋まり、数ラウンドで
+//     止まってしまう（実測でそうなった）。
+//
+//   Collector は合計が 1600（= 8 * 200）と一致するかを毎ラウンド確かめ、
+//   一致すれば緑、違えば赤の線を引く。壊れた状態の速い数字を良い結果と
+//   取り違えないための自己検査。
+//
+//   測り方: /avm-par?on=1&reset=1 → 一定時間走らせる → /avm-par の us と msgs。
+//   us/msgs が「1 メッセージあたりの費用」で、方式の比較はこの値で行う。
+class Main {
+  var ready = 0;
+  var c = 0;
+  var w0 = 0; var w1 = 0; var w2 = 0; var w3 = 0;
+  var w4 = 0; var w5 = 0; var w6 = 0; var w7 = 0;
+  method tick() {
+    if (ready == 0) {
+      ready = 1;
+      c  = new Collector();
+      w0 = new Worker(); w1 = new Worker(); w2 = new Worker(); w3 = new Worker();
+      w4 = new Worker(); w5 = new Worker(); w6 = new Worker(); w7 = new Worker();
+    }
+    send w0.run(c, 200); send w1.run(c, 200);
+    send w2.run(c, 200); send w3.run(c, 200);
+    send w4.run(c, 200); send w5.run(c, 200);
+    send w6.run(c, 200); send w7.run(c, 200);
+  }
+}
+class Worker {
+  var acc = 0; var i = 0;
+  method run(coll, n) {
+    acc = 0;
+    i = 0;
+    while (i < n) do { acc = acc + 1; i = i + 1; }
+    send coll.report(acc);
+  }
+}
+class Collector {
+  var total = 0; var got = 0;
+  method report(v) {
+    total = total + v;
+    got = got + 1;
+    if (got == 8) {
+      got = 0;
+      // 合計が合ったときだけ次ラウンドを起こす（これが無いと 1 ラウンドで止まる）。
+      // 誤っていれば止まるので、/avm-par の msgs が伸びないことで外から誤りが分かる。
+      if (total == 1600) { total = 0; line(80, 300, 680, 300, 2); wait(1); }
+      else { total = 0; line(80, 300, 680, 300, 4); }
+    }
+  }
+}

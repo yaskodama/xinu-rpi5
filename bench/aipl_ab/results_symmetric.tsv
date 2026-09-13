@@ -1,0 +1,22 @@
+# host=192.168.3.101 label=symmetric wait=4s reps=2
+# build Sep  9 2026 19:24:47
+# smpmode = symmetric (shared ready queue)
+granularity	rep	us	msgs	batches	us_per_msg	path
+1	1	86	16	2	5.375	symmetric
+1	2	84	16	2	5.250	symmetric
+10	1	187	16	2	11.688	symmetric
+10	2	187	16	2	11.688	symmetric
+50	1	633	16	2	39.562	symmetric
+50	2	635	16	2	39.688	symmetric
+200	1	2317	16	2	144.812	symmetric
+200	2	2317	16	2	144.812	symmetric
+1000	1	11265	16	2	704.062	symmetric
+1000	2	11266	16	2	704.125	symmetric
+5000	1	56157	16	2	3509.812	symmetric
+5000	2	56031	16	2	3501.938	symmetric
+20000	1	224029	16	2	14001.812	symmetric
+20000	2	224131	16	2	14008.188	symmetric
+100000	1	1120104	16	2	70006.500	symmetric
+100000	2	1120200	16	2	70012.500	symmetric
+200000	1	2239934	16	2	139995.875	symmetric
+200000	2	2240310	16	2	140019.375	symmetric

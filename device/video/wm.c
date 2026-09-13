@@ -405,6 +405,13 @@ void wm_run(void)
 
     int s_last_vp_x = -999999, s_last_vp_y = -999999;   /* force a wipe on frame 0 */
     for (;;) {
+        /* 対称 SMP モードのときだけ、核0 も共有 ready キューから 1 本引き受ける。
+         * 核0 はこの描画ループに居てスケジューラを一度も引かないので、
+         * これが無いと対称モードでも核0 だけが働かない（実測で確認）。
+         * 走らせている間デスクトップは止まる ―― 実験のための割り切り。 */
+#ifdef SMP_SYMMETRIC
+        { extern int smpsched_poll_once(void); smpsched_poll_once(); }
+#endif
         if (wm_tick) wm_tick();
 
         /* Auto-pan demo: cycle the viewport through the four

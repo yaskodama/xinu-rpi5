@@ -45,6 +45,8 @@ extern void proc_entry_trampoline(void);   /* ctxsw.S: msr daifclr #2; br x19 */
  * enabled, and never while the actor pump runs. */
 static volatile int g_preempt_on;
 static volatile int g_resched_pending;
+static volatile unsigned long g_pp_fired;   /* 先取りが実際に文脈を切り替えた回数 */
+unsigned long proc_dbg_ppfired(void) { return g_pp_fired; }
 static volatile int g_actor_pump;
 void proc_set_preempt(int on)      { g_preempt_on = on ? 1 : 0; }
 void proc_resched_request(void)    { g_resched_pending = 1; }
@@ -260,6 +262,9 @@ void proc_resched(void)
     SCHED_LOCK();
     struct procent *newp = ready_pop();
     if (newp == 0) { SCHED_UNLOCK(); irq_restore(d); return; }
+#ifdef SMP_SYMMETRIC
+    { extern volatile long sched_pick[SMP_NCORES]; sched_pick[smp_core_id()]++; }
+#endif
 
     int new_pid       = (int)(newp - proctab);
     struct procent *oldp = &proctab[currpid];
@@ -361,10 +366,21 @@ unsigned long proc_next_delay_us(void)
 /* Timer-driven preemption point: called after the IRQ is EOI'd. */
 void proc_preempt(void)
 {
+#ifdef SMP_SYMMETRIC
+    /* この核が暇（idle プロセスに居る）なら、共有 ready キューから 1 本引き受ける。
+     * 核0 は NULLPROC（シェル）に居るため、下の「idle なら何もしない」判定で
+     * 対称スケジューラに一度も参加できず、4 コアのはずが実質 3 コアになっていた。
+     * EOI 済みなのでここで文脈を切り替えてよい（通常の先取りと同じ地点）。 */
+    {
+        extern volatile int smpsched_on;
+        extern int smpsched_poll_once(void);
+        if (smpsched_on && IS_IDLE(currpid)) { smpsched_poll_once(); return; }
+    }
+#endif
     if (!g_preempt_on || !g_resched_pending) return;
     if (g_actor_pump) return;   /* actors run cooperatively */
     g_resched_pending = 0;
-    if (!IS_IDLE(currpid)) proc_resched();
+    if (!IS_IDLE(currpid)) { g_pp_fired++; proc_resched(); }
 }
 
 void proc_yield(void)

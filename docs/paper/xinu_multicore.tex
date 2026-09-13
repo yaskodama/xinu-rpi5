@@ -1,0 +1,691 @@
+% xinu_multicore.tex —— 論文「Raspberry Pi 上の Embedded Xinu のマルチコア化」
+%   組版: lualatex xinu_multicore.tex （2回）
+%   技術報告 ../smp_report/smp_report.pdf を土台に、論文として構成し直したもの。
+\documentclass[a4paper,11pt]{ltjsarticle}
+\usepackage{luatexja}
+\usepackage{geometry}
+\geometry{margin=24mm}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black}
+\lstset{basicstyle=\ttfamily\scriptsize,breaklines=true,frame=single,
+        framesep=3pt,columns=fullflexible,showstringspaces=false,
+        keywordstyle=\color{blue!60!black},commentstyle=\color{green!40!black}}
+
+\title{Raspberry Pi 上の Embedded Xinu のマルチコア化\\
+\large ---- アクター言語処理系のための並列実行方式の設計と実測 ----}
+\author{児玉 靖司\\法政大学 データサイエンスセンター}
+\date{2026年9月10日}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+教育用小型オペレーティングシステム Embedded Xinu を Raspberry Pi 3 / 4 / 5 の
+3 世代の実機上でマルチコア化し、その上でアクター指向言語 AIPL の処理系を
+並列実行する基盤を実装した。並列実行方式として、核0が各二次コアの郵便箱へ仕事を
+静的に配る\textbf{ワーカーズ型}と、各コアが共有 ready キューから自分で取る
+\textbf{対称SMP型}の 2 つを\textbf{同一カーネルに実装し、実行時に切り替えられる}
+ようにして比較した。
+
+主要な結果は次の 4 点である。(1) ワーカーズ型については、静的分割の makespan モデルが
+実測を $5\%$ 前後で説明し、\textbf{Cortex-A76 と A72 で比の曲線がほぼ一致する}。
+(2) 静的分割の弱点は「静的であること」ではなく\textbf{分割の粗さ}であり、
+重い仕事が散らばっていれば分割数を増やすだけで理想に近づく。
+(3) 仕事を完全に等量にしても 4 コアで 4 倍は出ず、2$\to$4 コアで 1 反復の所要が
+A76 で $+27.7\%$、A72 で $+18.4\%$ 伸びる。データキャッシュを無効にして走らせている
+構成の帰結であり、N-Queens が $2.2\times$ で頭打ちになる主因である。
+(4) 対称SMP型は AIPL を正しく走らせられなかった。原因は\textbf{配布側の呼び手が
+自分の持ち分を計算すると、先取りのたびにタイマ 1 ティックを失う}ことにあり、
+399 回の先取り $\times\ 10.4$\,ms $= 4.15$ 秒が実測と一致した。
+
+さらに、AArch64 への再実装過程で\textbf{例外復帰時に \texttt{ELR\_EL1} /
+\texttt{SPSR\_EL1} を退避していない}という重大な欠陥を Pi 5 と Pi 4 の双方で発見・修正した。
+先取りを有効にすると、8 プロセス中 8 個すべてが誤った計算結果を返す。
+同じ機能を持つ ARM32 版（Pi 3）は当該状態をスレッド自身のスタックに退避しており、
+この欠陥は\textbf{64 ビット化の際に落としたもの}であった。
+本稿では、こうした\textbf{実装上の落とし穴}と\textbf{測定手続き自体の検証法}を
+結果と同じ重みで報告する。
+\end{abstract}
+
+\section{はじめに}
+
+\subsection{背景}
+Embedded Xinu\cite{comer,embxinu} は、教育用に設計された小型のオペレーティングシステムである。
+構造が単純で全体を読み切れることから、オペレーティングシステム教育および
+組込みシステムの研究基盤として広く用いられてきた。近年これを Raspberry Pi へ
+移植する試みが行われているが、\textbf{その多くは単一コアを前提としている}。
+Raspberry Pi 3 / 4 / 5 はいずれも 4 コアの ARM プロセッサを搭載しており、
+計算資源の 4 分の 3 が使われないまま残っている。
+
+一方、本研究室ではアクター指向言語 AIPL とその処理系を開発している。
+アクターモデル\cite{agha}に基づく言語は、メッセージ送受の単位が細かく、
+1 つのメソッド本体の実行時間が数十マイクロ秒に満たないことが珍しくない。
+このような処理系を複数コアで動かすとき、\textbf{「メッセージをどう配るか」の設計が
+そのまま性能を決める}。
+
+\subsection{問題設定}
+マルチコア化には、大きく 2 つの設計がある。
+
+\begin{description}
+\item[ワーカーズ型（郵便箱・静的分割）] 核0 が仕事を区間に分け、各二次コアの
+  郵便箱へ書き込んで起こす。仕事は\textbf{データとして}配られ、
+  1 コアに 1 区間が固定される。
+\item[対称SMP型（共有 ready キュー）] 仕事を通常のプロセスとして生成し、
+  全コアが共有 ready キューから自分で取る。仕事は\textbf{プロセスとして}配られる。
+\end{description}
+
+前者は汎用性に欠けるが軽い。後者は汎用的だが、プロセス生成・キュー操作・文脈切替・
+先取りの費用を、寿命の短い仕事にも払うことになる。
+\textbf{AIPL のようにメッセージが短い処理系では前者が有利である}というのが本研究の作業仮説である。
+
+\subsection{本稿の貢献}
+\begin{enumerate}
+\item Raspberry Pi 3 / 4 / 5 の\textbf{3 世代の実機}で Embedded Xinu をマルチコア化し、
+      同一のベンチマーク基盤（N-Queens・素数計数・食事する哲学者・メモリ充填・
+      AIPL アクター並列）を実装した（第\ref{sec:design}節）。
+\item 上記 2 方式を\textbf{同一カーネルに実装し、実行時に切り替えられる}ようにした。
+      同じ起動・同じ温度条件のまま A/B を取れるため、方式以外の要因を排除できる（第\ref{sec:design}節）。
+\item AArch64 への再実装で共通して落とされていた\textbf{例外復帰の欠陥}を発見し、
+      同一起動内での A/B により実証したうえで修正した（第\ref{sec:pitfall}節）。
+\item \textbf{測定手続き自体を検証する方法}を確立した。計器を先に作り、計器が
+      嘘をつかないことを別の計器で確かめ、正誤の検算を測定値と同時に採る（第\ref{sec:method}節）。
+      本稿では、この方法によって\textbf{自分の初期測定に見つけた 3 つの誤り}も報告する。
+\item 静的分割の弱点が\textbf{「静的であること」ではなく「分割の粗さ」}であることを、
+      2 つのアーキテクチャで示した（第\ref{sec:eval}節）。
+\item アクターを\textbf{データとして}扱う方式と\textbf{スレッドとして}扱う方式の違いが、
+      速度だけでなく\textbf{系全体の可用性}に及ぼす影響を実測した（第\ref{sec:eval}節）。
+\end{enumerate}
+
+\section{対象と前提}\label{sec:target}
+
+\subsection{3 世代の実機}
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+ & Raspberry Pi 3 B+ & Raspberry Pi 4 & Raspberry Pi 5 \\
+\midrule
+CPU & Cortex-A53 $\times$ 4 & Cortex-A72 $\times$ 4 & Cortex-A76 $\times$ 4 \\
+実行モード & \textbf{ARM32 (ARMv7)} & AArch64 & AArch64 \\
+カーネル & \texttt{kernel7.img} & \texttt{kernel8.img} & \texttt{kernel\_2712.img} \\
+系統 & classic Embedded Xinu & AArch64 再実装 & AArch64 再実装 \\
+データキャッシュ & 有効 & \textbf{無効} & \textbf{無効} \\
+更新手段 & SD 交換 & SD 交換 & USB 交換 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Pi 3 は classic Embedded Xinu の系統を保った 32 ビット実装であり、
+Pi 4 / Pi 5 は AArch64 で書き直された別系統である。この\textbf{系統の違いが、
+後述する欠陥の有無をそのまま決めている}。
+
+3 板ともデータキャッシュの扱いが単純ではない。Pi 4 / Pi 5 では、
+実験の再現性を優先してデータキャッシュを\textbf{無効}にした状態で走らせている。
+この選択は 2 つの帰結をもたらす。第一に、非キャッシュ可能メモリ上では
+\texttt{ldaxr}/\texttt{stxr} による排他が保証されないため、
+\textbf{原子命令を使わない排他制御}が必要になる。第二に、すべてのメモリ参照が
+バスに出るため、\textbf{コアを増やすほど 1 命令あたりの所要が伸びる}
+（第\ref{sec:eval}節）。
+
+\subsection{AIPL とその実行基盤}
+AIPL はアクター指向の言語で、効果注釈・期限・第一級の返信先などを持つ。
+本稿で用いるのは、AIPL を\textbf{バイトコード（AVM）}へコンパイルし、
+カーネル内の仮想機械で実行する経路である。
+
+Pi 4 / Pi 5 では、アクターは\textbf{データ}である。オブジェクト表 \texttt{vm\_obj[]} と
+メッセージ待ち行列 \texttt{vm\_q[]} を持ち、仮想機械が待ち行列から取り出して
+メソッド本体を実行する。Pi 3 では、アクターは\textbf{Xinu スレッド}である
+（アクターごとに \texttt{tid\_typ} とセマフォによるメールボックスを持つ）。
+バイトコード仮想機械はそのスレッド機構の上に載っている。
+\textbf{この違いは移植の都合ではなく、方式そのものの違い}であり、
+第\ref{sec:eval}節で比較の対象とする。
+
+\section{マルチコア化の設計}\label{sec:design}
+
+\subsection{二次コアの起動と排他制御}
+二次コアは起動後スピンし、郵便箱に仕事が来るまで \texttt{wfe} で待つ。
+共有データの排他には、当初 ARM の排他命令（\texttt{ldaxr}/\texttt{stxr}）を用いた。
+しかしデータキャッシュ無効の構成では\textbf{排他命令の動作が保証されない}。
+実機では「Xinu の起動画面が出た直後に停止する」という形で現れた。
+
+そこで\textbf{Lamport のパン屋のアルゴリズム}\cite{bakery}による、
+原子命令を使わない排他に置き換えた。ビルド時に \texttt{SPIN=bakery} と
+\texttt{SPIN=exclusive} を選べるようにし、既定を前者とした。
+排他機構そのものが正しいことは、4 コアが各 20{,}000 回加算して 80{,}000 になることを
+確かめる自己診断口（\texttt{/smplock}）で毎回検証する。
+
+\subsection{方式A: ワーカーズ型}
+核0 が区間 $[0,n)$ を $\lceil$コア数$\rceil$ 個に分け、
+各二次コアの郵便箱（関数ポインタ・区間・世代番号）へ書き込み、
+\texttt{dsb; sev} で起こす。核0 自身も 1 区間を担当する。
+完了は世代番号の一致で判定する。
+
+区間の切り方には注意を要する。$\mathit{chunk} = n/\mathit{ncores}$ の整数除算で
+余りを最後のコアに載せると、$n$ がコア数で割り切れないときにその 1 コアだけが
+余りを抱え、makespan が跳ねる。$\mathit{lo} = c\,n/\mathit{nc}$、
+$\mathit{hi} = (c{+}1)\,n/\mathit{nc}$ とすれば余りは各コアへ 1 つずつ散る。
+
+\subsection{方式B: 対称SMP型}
+仕事を通常の Xinu プロセスとして生成し、共有 ready キューへ載せる。
+各コアは自分の idle ループでキューから取り出して実行する。
+キューはスピンロックで保護し、\textbf{文脈切替を跨いでロックを保持し、
+再開した側が離す}受け渡し方式とする。こうしないと、
+「ready に戻したがスタックポインタをまだ書いていないプロセス」を
+他コアが拾ってしまう。
+
+\subsection{同一カーネルでの切り替え}
+2 方式は\textbf{同じカーネルに同居}させ、\texttt{/smpmode?on=1} で
+実行時に切り替える。起動時は必ずワーカーズ型で立ち上がるため、
+対称側が壊れていても板は起動する ---- これは実験の初期に、
+対称スケジューラを起動経路に置いたために板が起動しなくなった経験から得た設計である。
+
+\subsection{AIPL アクター・バッチの並列配布}\label{sec:batch}
+仮想機械の待ち行列の先頭から、\textbf{宛先アクターが互いに異なり}、
+かつ\textbf{描画命令と WAIT を含まないクラス}のメッセージを連ねてバッチとし、
+そのバッチを上記いずれかの方式で配る。描画・WAIT を含むクラスを除外するのは、
+それらが大域状態（フレームバッファ・フレーム境界）を触るためで、
+クラス単位の静的解析（オペコード列をオペランドを読み飛ばしながら走査する）で判定する。
+
+メソッド本体が\textbf{生む}ものは 3 つあり、それぞれ分離する。
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+生むもの & 分離の方法 \\
+\midrule
+メッセージ送信 & コアごとの控え \texttt{par\_q[core]} に積み、join 後に本待ち行列へ併合 \\
+アクター生成 & オブジェクト表をコアごとに重ならない範囲へ分割 \\
+描画 & 除外（該当クラスは 1 コア経路） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+これにより、バッチ内の各メッセージは\textbf{自分のアクターの領域と自前の値スタック}
+しか触らないため、錠を用いずに並列実行できる。
+
+\section{実装上の落とし穴}\label{sec:pitfall}
+
+本節では、マルチコア化の過程で遭遇した欠陥を報告する。
+いずれも\textbf{単一コアでは顕在化しない}か、\textbf{特定の使い方でのみ顕在化する}
+性質を持ち、発見には計器の設計が必要だった。
+
+\subsection{例外復帰時に ELR/SPSR を退避していない}\label{sec:elr}
+\paragraph{症状。}Pi 5 で N-Queens の並列解が直列解と一致しない。
+1 タスクなら常に正しく、2 タスク以上で狂う。
+
+\paragraph{原因。}割り込みハンドラ \texttt{irq\_dispatch\_c} は
+\texttt{proc\_preempt()} $\to$ \texttt{proc\_resched()} $\to$ \texttt{ctxsw()} を呼び、
+\textbf{割り込み区間の中で別プロセスへ切り替わる}。ところが例外エントリは
+汎用レジスタ（および Pi 4 では浮動小数点レジスタ）を退避する一方、
+\texttt{ELR\_EL1} と \texttt{SPSR\_EL1} を退避していなかった。
+これらはコアごとに 1 組しかないため、割り込まれたプロセス A が待たされている間に
+別のプロセス B が同じように割り込まれると上書きされ、
+A は\textbf{B の復帰先へ \texttt{eret} して戻る}。
+
+興味深いことに、Pi 4 の当該箇所には
+「\texttt{irq\_dispatch\_c} は ctxsw を呼びうるので、割り込まれた側の
+浮動小数点状態は生き延びねばならない」という注釈が書かれていた。
+\textbf{まったく同じ理屈が ELR/SPSR にも当てはまるのに、そこだけ抜けていた}。
+
+\paragraph{ARM32 版は正しかった。}Pi 3 の ARM32 実装は次のようになっている。
+
+\begin{lstlisting}
+    sub  lr, lr, #4
+    srsdb #ARM_MODE_SYS!     /* SPSR_irq と LR_irq を SYS スタックへ積む      */
+    cpsid if, #ARM_MODE_SYS  /* = 割り込まれたスレッド自身のスタック          */
+    push {r0-r4, r12, lr}
+    bl   dispatch            /* この中で clkhandler -> resched() が起こりうる */
+    pop  {r0-r4, r12, lr}
+    rfeia sp!                /* 自分のスタックから PC と CPSR を戻す          */
+\end{lstlisting}
+
+\noindent
+復帰状態を\textbf{割り込まれたスレッド自身のスタック}に積んでいるため、
+\texttt{dispatch()} の中で文脈が切り替わっても各スレッドは自分の復帰状態を持って戻る。
+\textbf{AArch64 版は、ARM32 版が正しく行っていたことを再実装の際に落としていた}
+のである。
+
+\paragraph{実証。}修正の効果は、\textbf{同一起動内で切り替えられる形}にして示した。
+例外復帰時の書き戻しを実行時スイッチ（\texttt{/elrfix?on=0|1}）で入切できるようにし、
+答えの決まった計算（積・和・剰余のみでメモリを持たない）を複数プロセスで
+同時に走らせて基準値と突き合わせる計器（\texttt{/preempttest}）を用意した。
+結果を表\ref{tab:elr}に示す。
+
+\begin{table}[t]
+\centering
+\caption{Pi 4 における ELR/SPSR 退避の有無（先取り有効・同一起動・期待値 480003）}
+\label{tab:elr}
+\begin{tabular}{lll}
+\toprule
+プロセス数 & 退避なし（旧挙動） & 退避あり（修正） \\
+\midrule
+2 & \texttt{991055 906373} $\to$ \textbf{2/2 誤り} & 全て 480003 $\to$ \textbf{誤り 0} \\
+4 & \texttt{428433 258890 504716 480003} $\to$ \textbf{3/4} & 全て 480003 $\to$ \textbf{0} \\
+8 & 8 個すべて相異なる値 $\to$ \textbf{8/8} & 全て 480003 $\to$ \textbf{0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{計器そのものを先に検証すること。}最初の測定では誤りが 0 であり、
+\textbf{欠陥が無いように見えた}。しかしそれは Pi 4 が先取りを既定で無効にしているためで、
+\textbf{危険が起こり得ない状態を測っていた}のである。先取りの発火回数を数える計器で
+\texttt{fired=0} を確認して初めて、この測定が無意味であると分かった。
+先取りを有効にすると \texttt{fired=605} となり、表\ref{tab:elr}の結果が得られた。
+\textbf{計器が「異常なし」と言うとき、それが「異常が無い」のか
+「異常が起こり得ない条件で測っている」のかを、別の計器で確かめる必要がある。}
+
+\subsection{核0 がスケジューラに参加しない}
+対称SMP型で N-Queens を解かせると、コア別の実行数の\textbf{先頭が常に 0}であった。
+すなわち核0 は 1 つもタスクを走らせておらず、実質 3 コアで解いていた。
+
+原因の特定には 2 度の誤りを経た。第一に、核0 は窓系の描画ループに居ると考えて
+そこへ引き取り口を置いたが、この構成では HDMI が無く\textbf{当該関数の呼び出し元が
+存在しなかった}。第二に、核0 の暇はシリアル入力待ちの空回りだと考えて移したが、
+シリアルアダプタが送信を受信へ折り返す配線であったため受信 FIFO がほとんど空にならず、
+引き取り口はほぼ回らなかった。
+
+正解は \texttt{proc\_preempt()} であった。ここは 100\,Hz のタイマ割り込みから
+EOI 後に必ず呼ばれる。しかも既存の
+\texttt{if (!IS\_IDLE(currpid)) proc\_resched();} という判定こそが
+「核0 は idle だから何もしない」＝不参加の原因そのものであった。
+修正後、コア別の実行数は $1/1/1/1$ となり、N-Queens は 496\,ms から 397\,ms へ改善した。
+\textbf{2 方式の差の約半分は、方式ではなくこの実装の穴が作っていた}ことになる。
+
+\subsection{静的スタックの再利用}\label{sec:stk}
+対称SMP型の並列配布では、単位ごとにプロセスを生成する。
+そのスタックは静的配列を再利用していた。ところが単位プロセスは
+
+\begin{lstlisting}
+    sp_done++;                    /* 駆動側はこの瞬間に「終わった」と判断して戻る */
+    spin_unlock(&proc_sched_lock);
+    proc_exit();                  /* まだ自分のスタックの上で実行中 */
+\end{lstlisting}
+
+\noindent
+という順で終わるため、\textbf{完了を通知したあとも自分のスタック上で動いている}。
+駆動側は直ちに戻り、次の呼び出しが\textbf{同じ静的スタックへ新しい文脈を書き込む}。
+
+AIPL は毎秒数百回この経路を通るため必ず踏み、N-Queens は要求ごとに 1 回しか
+通らないため踏まない。スタックを\textbf{世代}で回して再利用まで数バッチ挟むと、
+誤答は 28$\sim$78 件から 0$\sim$1 件へ、コア別実行数の偏りは解消した。
+再利用時に前の占有者がまだ解放されていない回数を数える計器で、
+\textbf{この危険が実際に起きていることを数で確認した}。
+
+\subsection{配布側の呼び手が自分で計算すること}\label{sec:inline}
+上記を直しても、対称SMP型では 1 バッチに 4.15 秒（ワーカーズ型の約 20 倍）
+かかる場合が残った。時間の行き先を分解する計器を入れて、原因が特定できた（表\ref{tab:inline}）。
+
+\begin{table}[t]
+\centering
+\caption{対称SMP型における 1 バッチの時間の内訳（\texttt{AiplEq4}）}
+\label{tab:inline}
+\begin{tabular}{lrl}
+\toprule
+計器 & 値 & 読み \\
+\midrule
+待ちループ \texttt{wait\_us} & 1{,}850 & 生成した単位は\textbf{1.85\,ms で完了} \\
+呼び手の持ち分 \texttt{inline\_us} & \textbf{4{,}150{,}086} & ここだけが\textbf{4.15 秒} \\
+呼び手への先取り \texttt{pp\_inline} & \textbf{399} & その間に 399 回 先取りされた \\
+スタック再利用 \texttt{reuse} & 0 & 第\ref{sec:stk}節の危険は解消済み \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+$399 \times 10.4\,\mathrm{ms}$（タイマ 1 ティック）$= 4.15$ 秒であり、
+\texttt{inline\_us} と一致する。すなわち\textbf{先取り 1 回につき丸ごと 1 ティックを失っている}。
+
+\textbf{並列配布そのものは健全であった}（生成した単位は 1.85\,ms で完了）。
+壊れていたのは\textbf{呼び手が自分の持ち分を計算する}という設計である。
+ワーカーズ型では呼び手は核0 に固定され先取りされないため、
+「呼び手も 1 単位ぶん働く」という自然で効率的な設計が成立する。
+対称SMP型では呼び手は通常のプロセスとして共有 ready キューに載るため、
+同じ設計が\textbf{20 倍の劣化}を招く。
+
+\textbf{これは方式の差が実装の細部に現れた例である。}
+静的分割で自然な設計が、動的スケジューラの上では成り立たない。
+
+\section{測定の作法}\label{sec:method}
+
+実機の測定では、\textbf{どの計器を信じてよいかを確かめる過程そのものが結果の一部}である。
+本節では採用した作法と、それによって発見した\textbf{自分の初期測定の誤り}を述べる。
+
+\subsection{採用した作法}
+\begin{enumerate}
+\item \textbf{計器を先に作る。}板が停止すると何も分からない。焼き直し 1 回は
+      当てずっぽう 5 回より安い。
+\item \textbf{計器自体を検証する。}排他機構は 4 コア $\times$ 20{,}000 回の加算で、
+      並列配布はコア別実行数で、先取りは発火回数で確かめる。
+\item \textbf{正誤を測定値と同時に採る。}N-Queens は毎回 \texttt{solutions=73712} と
+      直列解との一致を突き合わせる。
+\item \textbf{同一起動内で A/B を取る。}方式・修正の有無を実行時スイッチで切り替え、
+      温度・配置・断片化などの条件を揃える。
+\item \textbf{暖機を捨て、中央値・最小・最大で報告する。}
+\end{enumerate}
+
+\subsection{自分の測定に見つけた 3 つの誤り}
+上記のうち (3) と (5) は、当初 N-Queens 側にのみ適用しており、
+\textbf{AIPL 側では抜けていた}。その結果 3 つの誤りが生じた。
+
+\paragraph{誤り1: 正誤を確かめていなかった。}
+AIPL の標本は各ラウンドで合計を照合し、正なら色 2・誤なら色 4 の線を引くが、
+\textbf{その色は画面にしか出ない}。この板には表示装置が無い。
+標本を書き換えずに済ませるため、\textbf{カーネル側で線の色を数える}ことにした
+（LINE 命令で色 2 なら \texttt{ok++}、色 4 なら \texttt{ng++}）。
+\textbf{\texttt{ok>0} かつ \texttt{ng==0} でなければ採用しない}という規則を導入した。
+
+\paragraph{誤り2: 標本が 2 ラウンドで停止していた。}
+仮想機械への最初のメッセージは読み込み時に一度だけ積まれ、
+WAIT はフレーム境界を立てるだけで積み直さない。仮想機械を進める関数を呼ぶのは
+描画ループだけだが、表示装置が無いためそれが呼ばれない。
+つまり\textbf{読み込み直後の 2 ラウンドしか走っていなかった}。
+測定窓を明示的に指定する駆動口（\texttt{/avm-run?ms=$N$}）を設け、
+待ち行列が空なら次のラウンドを積み直すようにした。
+
+なお本稿の初期報告にあった「仮想機械のバッチ化が 32 アクターで破綻している」
+という記述は、この誤りに由来する。\textbf{$M=32$ が特別だったのではなく、
+どの標本も 2 ラウンドで止まっていた}のである。
+
+\paragraph{誤り3: その 2 ラウンドは冷間始動の過渡だった。}
+駆動口を入れて回すと、1 バッチの所要時間はバッチ数とともに増えて収束する
+（93.1 $\to$ 148.9 $\to$ 177.1 $\to$ 183.7 $\to$ 定常 186.0\,ms）。
+定常値は測定窓を 2 倍にしても $0.05\%$ 以内で一致する。
+\textbf{初期測定の絶対値は、すべて定常値の約半分であった。}
+過渡が定常のちょうど半分になる機序は特定できていない。
+
+\section{評価}\label{sec:eval}
+
+以下、AIPL の測定はすべて\textbf{暖機を捨てた定常値}であり、
+\textbf{全点で誤答 0}（各ラウンドの合計が検算に通った）を確認してある。
+
+\subsection{N-Queens ($n=13$)}
+探索木の大きさが列ごとに大きく異なる、不揃いな負荷である。
+各 3 回の中央値、解は毎回 73{,}712 で直列解と一致。
+
+\begin{table}[t]
+\centering
+\caption{N-Queens $n=13$ の速度向上（ワーカーズ型）}
+\label{tab:nq}
+\begin{tabular}{rrrr}
+\toprule
+コア & Pi 5 (A76) & Pi 4 (A72) & Pi 3 (A53) \\
+\midrule
+1 & 660.1\,ms (1.00$\times$) & 1401.3\,ms (1.00$\times$) & 1426.5\,ms (1.00$\times$) \\
+2 & 355.8\,ms (1.85$\times$) & 959.3\,ms (1.46$\times$) & 779.0\,ms (1.83$\times$) \\
+3 & 306.0\,ms (2.16$\times$) & 859.0\,ms (1.63$\times$) & 560.3\,ms (2.55$\times$) \\
+4 & \textbf{298.8\,ms (2.21}$\times$\textbf{)} & \textbf{847.9\,ms (1.65}$\times$\textbf{)}
+  & \textbf{487.1\,ms (2.93}$\times$\textbf{)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Pi 3 と Pi 4 は\textbf{直列がほぼ同じ}（1426.5 対 1401.3\,ms、差 $1.8\%$）であるのに、
+4 コアでは Pi 3 が 1.7 倍速い。素直に読めば「A53 のほうが並列に強い」となるが、
+\textbf{これは誤りである}。次節がそれを示す。
+
+\subsection{均一な負荷なら三板とも同じ}
+分割の不均等がほとんど無い負荷（素数計数、$n=300{,}000$）で測り直すと、
+Pi 4 と Pi 3 の速度向上曲線は $0.99/1.61/2.31/3.01$ 対 $1.00/1.61/2.31/3.01$ と
+\textbf{完全に一致}した（Pi 5 も 4 コアで $3.02\times$）。
+したがって表\ref{tab:nq}の差はハードウェアの差ではなく、
+\textbf{各カーネルが N-Queens をどう分割しているか}の差である。
+
+実際、Pi 4 で分割の仕方だけを変えると次のようになる（各 2 回、再現性あり）。
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+分割 & 4 コア & 速度向上 \\
+\midrule
+連続 4 等分 & 847.6 / 847.3\,ms & 1.64$\times$ \\
+ストライド（第1行） & 811.1 / 811.1\,ms & 1.72$\times$ \\
+ストライド（第2行・Pi 3 と同方式） & \textbf{774.3 / 774.4\,ms} & \textbf{1.81}$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\textbf{スケジューラを一切変えず、分割の仕方を変えるだけで $+10\%$}である。
+
+\subsection{AIPL: ばらつきと makespan}
+総仕事量を 128{,}000 反復に固定し、8 アクターへの配分のばらつき比だけを振る。
+予測は静的分割の makespan（各コアの持ち分の最大値）である。
+
+\begin{table}[t]
+\centering
+\caption{ばらつき比と 1 バッチの所要（総仕事量固定・ワーカーズ型・定常値）}
+\label{tab:spread}
+\begin{tabular}{rrrrrr}
+\toprule
+比 & \multicolumn{2}{c}{Pi 5 (A76)} & \multicolumn{2}{c}{Pi 4 (A72)} & 予測比 \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+ & ms/batch & 比 & ms/batch & 比 & \\
+\midrule
+1 & 186.0 & 1.00 & 253.8 & 1.00 & 1.00 \\
+2 & 248.1 & 1.33 & --- & --- & 1.32 \\
+4 & 308.7 & 1.66 & 412.1 & 1.62 & 1.65 \\
+8 & 365.1 & 1.96 & --- & --- & 1.98 \\
+16 & 415.7 & 2.23 & 557.3 & 2.20 & 2.28 \\
+32 & 460.1 & 2.47 & --- & --- & 2.57 \\
+64 & 498.8 & 2.68 & 671.3 & 2.64 & 2.81 \\
+128 & 534.3 & \textbf{2.87} & 715.2 & \textbf{2.82} & \textbf{3.01} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+実測は予測に $5\%$ 前後で追随し、\textbf{A76 と A72 で比の曲線がほぼ一致する}。
+\textbf{方式の振る舞いはアーキテクチャに依らない}。
+
+\subsection{AIPL: 静的分割の弱点は「分割の粗さ」}
+同じ重み集合（$1..M$ を正規化、合計 128{,}000 反復）を、
+\textbf{散らした場合}（ビット反転順という決定的な低食い違い順）と
+\textbf{後ろに固めた場合}（単調増加）で比べる。
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+ & $M=4$ & $M=8$ & $M=16$ \\
+\midrule
+Pi 5 \ 散らす & 301.5\,ms & 255.5\,ms & \textbf{235.3\,ms}（改善）\\
+Pi 5 \ 固める & 301.5\,ms & 322.6\,ms & \textbf{349.4\,ms}（悪化）\\
+Pi 4 \ 散らす & 408.9\,ms & 339.1\,ms & \textbf{300.2\,ms}（改善）\\
+Pi 4 \ 固める & 410.6\,ms & 424.6\,ms & \textbf{434.7\,ms}（悪化）\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+郵便箱は区間を\textbf{連続}に等分するため、重い仕事が散らばっていれば
+$M$ を増やすほど各区間の合計が平均化されて理想に近づき、
+固まっていれば同じコアに集まり続けて\textbf{悪化する}。
+両板で同じ向きに分かれた。
+
+\textbf{したがって処方は「共有 ready キューへ移れ」ではない。}
+\textbf{多めに分割し、重い仕事を隣り合わせにするな} ---- これは郵便箱方式を
+保ったまま実行できる。
+
+\subsection{AIPL: 4 コアで 4 倍は出ない}
+仕事を完全に等量（1 通 32{,}000 反復）にしたまま、バッチ長で使用コア数だけを変える。
+バッチ長がコア数に満たないと残りのコアは 1 通も実行しないことを利用している
+（コア別実行数で確認）。
+
+\begin{center}
+\begin{tabular}{rrrrr}
+\toprule
+使用コア & \multicolumn{2}{c}{Pi 5 (A76)} & \multicolumn{2}{c}{Pi 4 (A72)} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+ & ms/batch & 1 反復 & ms/batch & 1 反復 \\
+\midrule
+2 & 145.3 & 4.54\,$\mu$s & 215.3 & 6.73\,$\mu$s \\
+3 & 164.1 & 5.13\,$\mu$s & 232.8 & 7.28\,$\mu$s \\
+4 & 185.5 & \textbf{5.80\,$\mu$s} & 255.0 & \textbf{7.97\,$\mu$s} \\
+\midrule
+2$\to$4 の劣化 & \multicolumn{2}{c}{\textbf{$+27.7\%$}} & \multicolumn{2}{c}{\textbf{$+18.4\%$}} \\
+実効スループット & \multicolumn{2}{c}{1.57$\times$（理想 2.00）} & \multicolumn{2}{c}{1.69$\times$（理想 2.00）} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\textbf{分割の不均等はゼロなのに、コアを増やすと 1 反復の所要が伸びる。}
+データキャッシュを無効にしているため、すべてのメモリ参照がバスに出る。
+A72 のほうが劣化が小さいのは、素の 1 反復が遅いぶんメモリ帯域への要求が緩いためと読める。
+\textbf{N-Queens が 4 コアで $2.2\times$ 止まりだった主因はここにある}（分割の不均等ではない）。
+
+\subsection{アクター＝データ 対 アクター＝スレッド}
+Pi 3 に AIPL のバッチ配布を移植しようとして、\textbf{移植すべきものが無い}と分かった。
+Pi 3 のアクターは Xinu スレッドであり、「メッセージを束ねてコアへ配る」段階が存在しない。
+同じ計器と駆動口を Pi 3 にも実装して測ったところ、2 つの構造的な事実が得られた。
+
+\paragraph{(1) 1 通も他コアへ配られない。}
+コア別実行数は常に $N/0/0/0$ である ---- 4 アクターでも 16 アクターでも、
+すべてのメッセージが核0 で実行される。\textbf{アクターをスレッドにしても、
+それだけでは多コアは使われない}。同じ標本で Pi 4 / Pi 5 は $N/N/N/N$ と均等に散る。
+
+\paragraph{(2) 計算の重いアクターを 8 個載せると系が止まった。}
+HTTP がまったく応答しなくなった（\texttt{ping} は 100\% 通るのでネットワーク層は生存）。
+原因は仮想機械アクターの優先度が既定値のままで、\textbf{Web サーバと同値}だったことである。
+優先度を下げて解消した。\textbf{アクター＝データ方式では仮想機械が協調的に進むため、
+優先度の設計を誤っても系は止まらない。}
+
+\paragraph{定量比較は保留する。}Pi 3 では複数のディスパッチが同時に計時中になり、
+壁時計の区間が重なって積算されるため（2 秒の窓に 21.4 秒を計上）、
+1 メッセージあたりの費用は Pi 4 / Pi 5 と比較できない。
+共通の物差しは検算に通ったラウンド数だが、Pi 3 は暖機後に一定数で停止する
+未解決の問題があり、スループットを並べるのは時期尚早である。
+
+\subsection{対称SMP型と AIPL の比較は取れなかった}
+第\ref{sec:inline}節に述べたとおり、対称SMP型は AIPL を正しく走らせられなかった。
+検算計器を入れると誤答・停止・板の停止が現れる。
+\textbf{したがって本稿では、2 方式の AIPL における定量比較を報告しない。}
+
+\textbf{ただし壊れ方に情報がある。}同じコードが N-Queens
+（要求ごとに 1 回、重い区間を配る）では正しく動き、
+AIPL（毎秒数百回、短いバッチを配る）でのみ壊れる。
+\textbf{壊れ方が「短く・頻繁」という条件に選択的である}ことは、
+本研究の作業仮説 ---- 短いメッセージを汎用スケジューラに載せる費用が高い ----
+と方向が一致する。
+
+\section{考察}\label{sec:disc}
+
+\subsection{何が言えて、何が言えないか}
+本稿の測定は\textbf{ワーカーズ型については完結している}。
+一方\textbf{対称SMP型との定量比較は取れていない}。
+したがって「2 方式のどちらが速いか」を AIPL について数値で述べることはできない。
+言えるのは次の 3 点である。
+
+\begin{enumerate}
+\item \textbf{静的分割の makespan モデルは実測をよく説明し、アーキテクチャに依らない。}
+      ばらつき比を振ったとき、実測は予測に $5\%$ 前後で追随し、
+      A76 と A72 で比の曲線がほぼ一致する。
+\item \textbf{静的分割の弱点は「静的であること」ではなく「分割の粗さ」である。}
+      重い仕事が散らばっていれば分割数を増やすだけで理想に近づく。
+      この処方は郵便箱方式を保ったまま実行できる。
+\item \textbf{並列化の天井はメモリにある。}仕事を完全に等量にしても
+      4 コアで 4 倍は出ず、2$\to$4 コアで 1 反復が $18\sim28\%$ 伸びる。
+\end{enumerate}
+
+\subsection{仮説を支持する間接的な材料}
+直接の対決は測れなかったが、次の 3 つはいずれも作業仮説の向きを支持する。
+
+\begin{enumerate}
+\item \textbf{対称SMP型はそもそも AIPL を正しく走らせられなかった。}
+      原因は呼び手が先取りのたびに 1 ティックを失うことであり、
+      これは\textbf{短い仕事を汎用スケジューラに載せる費用}そのものである。
+      同じコードが N-Queens では正しく動く。
+\item \textbf{アクター＝スレッドの板では、1 通も他コアへ配られない。}
+      アクターをスレッドにすること自体は多コア利用を意味しない。
+\item \textbf{アクター＝スレッドの板では、計算の重いアクターが系を止めた。}
+      アクター＝データ方式では起こらない。\textbf{速度以外の面でも堅い。}
+\end{enumerate}
+
+\subsection{アーキテクチャ上の含意}
+アクターモデルの言語処理系では、メッセージは\textbf{データとして}配るのが安い。
+プロセスとして配ると、汎用スケジューラが長寿命スレッドを前提に払っている費用
+（生成・キュー操作・文脈切替・先取り）を、寿命が $100\,\mu\mathrm{s}$ に満たない仕事にも
+払うことになる。本稿で対称SMP型が壊れた形 ---- 呼び手が先取りされて
+1 ティックずつ失う ---- は、その費用が最も露骨に現れた例である。
+
+Raspberry Pi 上の Embedded Xinu で AIPL を実行する基盤としては、
+\textbf{バッチ化した郵便箱方式を既定とし、分割数を仕事の不揃いさに応じて増やす}
+のが妥当と考える。動的分配の併用は、第\ref{sec:inline}節の問題を解いたうえで
+改めて評価すべきである。
+
+\subsection{教育用 OS をマルチコア化することの意義}
+本稿で報告した欠陥は、いずれも\textbf{単一コアでは顕在化しない}か、
+\textbf{特定の使い方でのみ顕在化する}。例外復帰の欠陥（第\ref{sec:elr}節）は
+先取りを有効にした瞬間に全プロセスの計算結果を壊すが、
+先取りが既定で無効なら誰も気づかない。静的スタックの再利用（第\ref{sec:stk}節）は
+呼び出し頻度が低ければ踏まない。
+
+\textbf{教育用 OS をマルチコア化する作業は、こうした「単一コアでは見えない前提」を
+洗い出す作業でもある。}本稿がそれらを結果と同じ重みで報告したのは、
+そのためである。
+
+\section{関連研究}\label{sec:related}
+
+Embedded Xinu\cite{comer,embxinu} は教育用 OS として広く用いられており、
+複数のアーキテクチャへの移植が行われている。本研究はそれを Raspberry Pi の
+3 世代へ展開し、\textbf{マルチコア化と、その上でのアクター言語処理系の実行}
+という点で従来と異なる。
+
+アクターモデル\cite{agha}に基づく実行系では、アクターを軽量プロセスとして扱う方式が
+広く採られている（Erlang\cite{erlang} など）。本稿の Pi 3 実装はこの系統に近い。
+一方、Pi 4 / Pi 5 実装はアクターをデータとして扱い、メッセージをバッチ化して
+コアへ配る。\textbf{同一の言語処理系に対して両方式を実装し、
+同じ計器で比較した点}が本稿の位置づけである。
+
+原子命令を用いない排他制御には Lamport のパン屋のアルゴリズム\cite{bakery}を用いた。
+これはデータキャッシュ無効という本構成固有の制約に対する選択である。
+
+AArch64 の例外モデルおよび退避すべき状態については\cite{armarm}に従う。
+
+\medskip
+\noindent
+\textbf{注記:} 本節は骨子のみを示す。AIPL および本研究室の先行研究に関する引用、
+ならびに組込み OS のマルチコア化に関する個別の先行事例については、
+投稿先の様式に合わせて補うものとする。
+
+\section{おわりに}
+
+Embedded Xinu を Raspberry Pi 3 / 4 / 5 の 3 世代でマルチコア化し、
+アクター言語 AIPL の処理系を並列実行する基盤を実装・評価した。
+
+ワーカーズ型については、静的分割の makespan モデルが実測を $5\%$ 前後で説明し、
+その弱点が「静的であること」ではなく「分割の粗さ」であること、
+並列化の天井がメモリにあることを、2 つのアーキテクチャで示した。
+対称SMP型については、AIPL を正しく走らせられないことと、
+その原因が\textbf{呼び手が先取りのたびにタイマ 1 ティックを失うこと}にあることを、
+時間の内訳を分解する計器によって特定した。
+
+また、AArch64 への再実装で共通して落とされていた例外復帰の欠陥を発見・修正し、
+ARM32 版が同じ状態を正しく扱っていたことを示した。
+\textbf{マルチコア化は、単一コアでは見えない前提を洗い出す作業でもある。}
+
+今後の課題は、(1) 呼び手に持ち分を持たせない構成での対称SMP型の再評価、
+(2) 郵便箱方式へのワークスティーリングの導入、
+(3) Pi 3 のスレッド型実行系の多コア利用、
+(4) データキャッシュを有効にした構成での再測定である。
+
+\begin{thebibliography}{9}
+\bibitem{comer} D. E. Comer, \textit{Operating System Design: The XINU Approach},
+  2nd ed., CRC Press, 2015.
+\bibitem{embxinu} Embedded Xinu Project, Marquette University.
+  \url{https://embedded-xinu.readthedocs.io/}
+\bibitem{agha} G. Agha, \textit{ACTORS: A Model of Concurrent Computation in
+  Distributed Systems}, MIT Press, 1986.
+\bibitem{erlang} J. Armstrong, \textit{Making Reliable Distributed Systems in the
+  Presence of Software Errors}, PhD thesis, Royal Institute of Technology, Stockholm, 2003.
+\bibitem{bakery} L. Lamport, ``A New Solution of Dijkstra's Concurrent Programming
+  Problem,'' \textit{Communications of the ACM}, vol.~17, no.~8, pp.~453--455, 1974.
+\bibitem{armarm} Arm Ltd., \textit{Arm Architecture Reference Manual for A-profile
+  architecture}.
+\end{thebibliography}
+
+\end{document}

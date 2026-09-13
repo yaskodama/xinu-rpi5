@@ -183,7 +183,14 @@ static void smp_worker_loop(int core)
     int last = smp_job_seq[core];
     for (;;) {
         MB_INVAL(&smp_job_seq[core]);
-        while (smp_job_seq[core] == last) { __asm__ volatile("wfe"); MB_INVAL(&smp_job_seq[core]); }
+        while (smp_job_seq[core] == last) {
+#ifdef SMP_SYMMETRIC
+            /* 対称スケジューラへの切り替え（/smpmode?on=1）。戻らない。 */
+            { extern volatile int smpsched_on; extern void smpsched_core_loop(int);
+              if (smpsched_on) smpsched_core_loop(core); }
+#endif
+            __asm__ volatile("wfe"); MB_INVAL(&smp_job_seq[core]);
+        }
         last = smp_job_seq[core];
         MB_INVAL(&smp_job_fn[core]); MB_INVAL(&smp_job_lo[core]); MB_INVAL(&smp_job_hi[core]);
         smp_range_fn fn = smp_job_fn[core];
@@ -237,14 +244,11 @@ void smp_secondary_entry(int core)
     smp_online[core] = 1;
     MB_CLEAN(&smp_online[core]);             /* flush so core 0 sees us under C=1 */
     dsb_sev();                              /* tell core 0 we are up */
-#ifdef SMP_SYMMETRIC
-    /* 対称 SMP: 郵便箱を待つのではなく、共有 ready キューから自分で取る。
-       郵便箱経路（smp_parallel_sum）は比較のため残してあるが、この版では
-       二次コアはスケジューラ側に居るので使わないこと。 */
-    { extern void smpsched_core_loop(int); smpsched_core_loop(core); }
-#else
+    /* ★ 対称版でも、二次コアは**まずワーカ郵便箱**に入る。ここでいきなり
+       共有 ready キューへ入れると、スケジューラ側に不具合があったときに
+       板そのものが起動しなくなる（実機でそうなった）。移るのは
+       /smpmode?on=1 が smpsched_on を立てたときだけ。 */
     smp_worker_loop(core);                  /* never returns */
-#endif
 }
 
 void smp_init(void)

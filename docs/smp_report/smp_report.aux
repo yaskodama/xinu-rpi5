@@ -1,0 +1,103 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}目的と仮説}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}二方式の実装}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}ワーカーズ型（郵便箱・静的分割）}{2}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}対称SMP型（共有 ready キュー）}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}同一カーネルでの切り替え}{2}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}測定の作法}{2}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}測定の作法の破れ ---- 自分の測定に見つけた 3 つの穴}{3}{section.4}\protected@file@percent }
+\newlabel{sec:flaw}{{4}{3}{測定の作法の破れ ---- 自分の測定に見つけた 3 つの穴}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}穴1: 正誤を一度も外から確かめていなかった}{3}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}穴2: 標本が 2 ラウンドで止まっていた}{3}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}穴3: その 2 ラウンドは冷間始動の過渡だった}{3}{subsection.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}発見した不具合とその影響}{4}{section.5}\protected@file@percent }
+\newlabel{sec:bug}{{5}{4}{発見した不具合とその影響}{section.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}結果1: N-Queens（不揃いな探索木）}{4}{section.6}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces N-Queens $n=13$ の速度向上。青=ワーカーズ型、橙=対称SMP型。}}{4}{figure.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}結果1b: 核0をスケジューラに参加させる（実験1）}{5}{section.7}\protected@file@percent }
+\newlabel{sec:exp1}{{7}{5}{結果1b: 核0をスケジューラに参加させる（実験1）}{section.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}原因は 2 段構えで、途中まで私の読みは誤っていた}{5}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}直した結果}{5}{subsection.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}結果2: 通常の並列計算（負荷の性質による差）}{6}{section.8}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces ワーカーズ型のコア数掃引。均一な仕事は 4 コアぶん出る一方、木が不揃いな nqueens は 3 コアで頭打ちになり、メモリ律速の fill は伸びない。}}{6}{figure.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}結果3: AIPL アクター並列（本命）}{6}{section.9}\protected@file@percent }
+\newlabel{sec:aipl}{{9}{6}{結果3: AIPL アクター並列（本命）}{section.9}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.1}測り方}{6}{subsection.9.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.2}測定値}{7}{subsection.9.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces AIPL のメッセージ 1 通あたりの費用。粒度が大きい領域では両者は重なる（本体の実行が支配的）。細かい領域で分かれる。}}{7}{figure.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces 同じ仕事に対する費用の比。粒度が細かいほどワーカーズ型が有利になり、粒度 1 反復では 1.49 倍の差がつく。粒度 200 反復（$\simeq 140\,\mu $s の仕事）を超えると差は 2\% 以下に埋もれる。}}{7}{figure.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.3}配布コストの分離}{8}{subsection.9.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces AIPL メッセージ 1 通を配るのに要する費用。本体の実行時間は含まない。}}{8}{figure.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{傾き $b$ の読み方（訂正）。}{8}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}結果4: バッチ長と並列度（実験2）}{8}{section.10}\protected@file@percent }
+\newlabel{sec:exp2}{{10}{8}{結果4: バッチ長と並列度（実験2）}{section.10}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces バッチ長を変えたときの 1 メッセージあたりの費用。バッチ長 2（コア数 4 に満たない）では約 2 倍高く、4 以上でほぼ一定になる。}}{9}{figure.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{読み取れること。}{9}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11}結果5--8（改訂）: 定常値で測り直した実験A・B・C}{9}{section.11}\protected@file@percent }
+\newlabel{sec:abc}{{11}{9}{結果5--8（改訂）: 定常値で測り直した実験A・B・C}{section.11}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {11.1}実験A: 交差点はどこか（ばらつき比の掃引）}{10}{subsection.11.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {11.2}実験B: 細かく割れば静的分割は救えるか}{10}{subsection.11.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {11.3}実験C: 4 コアで 4 倍は出ない}{10}{subsection.11.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {11.4}不揃いな仕事（旧・実験3）}{11}{subsection.11.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {12}撤回: 「不揃いな仕事では対称SMP型が 1.25 倍速い」}{11}{section.12}\protected@file@percent }
+\newlabel{sec:retract}{{12}{11}{撤回: 「不揃いな仕事では対称SMP型が 1.25 倍速い」}{section.12}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {13}結果9: 三板での追試（Pi 4 / Pi 3）}{11}{section.13}\protected@file@percent }
+\newlabel{sec:boards3}{{13}{11}{結果9: 三板での追試（Pi 4 / Pi 3）}{section.13}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {13.1}N-Queens $n=13$}{12}{subsection.13.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces N-Queens $n=13$ の速度向上（各 3 回の中央値、ばらつきは全点 0.1\% 未満）。\textbf  {Pi 4 は 3 コアで頭打ちになる}のに対し、Pi 3 は 4 コア目でも伸びる。}}{12}{figure.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {13.2}均一な負荷なら三板とも同じ}{12}{subsection.13.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {13.3}分割の仕方だけを変える}{12}{subsection.13.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {13.4}Pi 3 は「アクター＝スレッド」という別の方式だった}{13}{subsection.13.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(1) 1 通も他コアへ配られない。}{13}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(2) 計算の重いアクターを 8 個載せると系が止まった。}{13}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{定量比較は保留する。}{13}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {13.5}4 コアで 4 倍は出ない、も三板に共通}{13}{subsection.13.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {14}結果10: Pi 4 にも同じ例外復帰の穴があった}{14}{section.14}\protected@file@percent }
+\newlabel{sec:pi4bug}{{14}{14}{結果10: Pi 4 にも同じ例外復帰の穴があった}{section.14}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {14.1}計器そのものを先に検証する}{14}{subsection.14.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {14.2}同じ起動のまま A/B を取る}{14}{subsection.14.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {14.3}Pi 3 に同じ穴は無い ---- ARM32 の実装は正しかった}{14}{subsection.14.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {14.4}三板の測定状況}{15}{subsection.14.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {15}対称SMP型の AIPL 経路は動かなかった ---- その診断}{15}{section.15}\protected@file@percent }
+\newlabel{sec:symbroken}{{15}{15}{対称SMP型の AIPL 経路は動かなかった ---- その診断}{section.15}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {15.1}症状}{15}{subsection.15.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {15.2}外れた仮説1: 控えの添字の競合}{16}{subsection.15.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {15.3}外れた仮説2 → 部分的に当たり: 静的スタックの再利用}{16}{subsection.15.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {15.4}当たり: 呼び手が自分で計算していること}{16}{subsection.15.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {15.5}現時点の状態}{17}{subsection.15.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16}考察}{17}{section.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {16.1}何が言えて、何が言えないか}{17}{subsection.16.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {16.2}仮説を支持する材料（間接的だが強い）}{17}{subsection.16.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {16.3}ワーカーズ型について実測で言えること}{17}{subsection.16.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {16.4}アーキテクチャ上の含意}{18}{subsection.16.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {17}未解決}{18}{section.17}\protected@file@percent }
+\newlabel{sec:open}{{17}{18}{未解決}{section.17}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {18}実行したプログラム}{18}{section.18}\protected@file@percent }
+\newlabel{sec:prog}{{18}{18}{実行したプログラム}{section.18}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.1}AIPL 標本（粒度 200 の版）}{18}{subsection.18.1}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{../../bench/aipl\textunderscore ab/AiplBenchG200.abcl}{18}{lstlisting.-2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.2}ばらつき比を振る標本（実験A・比 1:16 の版）}{19}{subsection.18.2}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{../../bench/aipl\textunderscore ab/AiplSpread16.abcl}{19}{lstlisting.-3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.3}分割の粗さを見る標本（実験B・重い仕事が固まる $M=8$ の版）}{20}{subsection.18.3}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{../../bench/aipl\textunderscore ab/AiplB2M8.abcl}{20}{lstlisting.-4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.4}使用コア数を変える標本（実験C・4 コアの版）}{21}{subsection.18.4}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{../../bench/aipl\textunderscore ab/AiplEq4.abcl}{21}{lstlisting.-5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.5}核0を対称スケジューラに参加させる修正（実験1）}{22}{subsection.18.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.6}不揃いな仕事の標本（実験3）}{22}{subsection.18.6}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{../../bench/aipl\textunderscore ab/AiplUneven.abcl}{22}{lstlisting.-7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.7}バッチ長を振る標本（実験2・バッチ長 4 の版）}{23}{subsection.18.7}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{../../bench/aipl\textunderscore ab/AiplP4.abcl}{23}{lstlisting.-8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.8}N-Queens: 対称SMP型の駆動部}{24}{subsection.18.8}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{extract\textunderscore smpsched.txt}{24}{lstlisting.-9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.9}ワーカーズ型の配布（郵便箱・静的分割）}{24}{subsection.18.9}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{extract\textunderscore smp.txt}{25}{lstlisting.-10}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.10}AIPL アクター・バッチの配り分け}{26}{subsection.18.10}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{extract\textunderscore avm.txt}{26}{lstlisting.-11}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.11}不具合の修正（例外の ELR/SPSR 退避）}{26}{subsection.18.11}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{extract\textunderscore ev.txt}{26}{lstlisting.-12}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {18.12}測定スクリプト}{27}{subsection.18.12}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{../../bench/aipl\textunderscore ab/measure.sh}{27}{lstlisting.-13}\protected@file@percent }
+\gdef \@abspage@last{27}

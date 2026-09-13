@@ -31,6 +31,16 @@ extern int smpsched_curr[SMP_NCORES];
 #define SMPIDLE_PID(core) (SMPIDLE_BASE + (core) - 1)
 
 void smpsched_init(void);            /* proc_init から呼ぶ */
+extern volatile int smpsched_on;     /* 0=ワーカ郵便箱のみ / 1=対称スケジューラ */
+void smpsched_enable(void);          /* /smpmode?on=1 から呼ぶ（戻せない） */
+int  smpsched_poll_once(void);       /* 核0（wm ループ）が 1 本だけ引き受ける */
+/* smp_parallel_sum の対称スケジューラ版。AIPL のアクター・バッチをこちらでも配れる */
+typedef long (*smp_range_fn_t)(long, long, int);
+long smpsched_parallel(smp_range_fn_t fn, long n, int nunits);
+long smpsched_last_us(void);
+long smpsched_calls(void);
+long smpsched_units_total(void);
+long smpsched_ran(int core);
 void smpsched_core_loop(int core);   /* 核1〜3 の本体（戻らない） */
 void smpsched_after_switch(void);    /* 新規プロセスの入口でロックを離す */
 

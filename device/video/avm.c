@@ -183,6 +183,26 @@ static unsigned char vm_class_parsafe[VM_MAX_CLASSES];   /* 1 = no WAIT/draw ops
 static int           avm_par_enable = 0;                 /* OFF by default; /avm-par?on=1 enables */
 static volatile int  avm_par_nbatch = 0;                 /* diag: parallel batches dispatched */
 static volatile int  avm_par_lastbn = 0;                 /* diag: size of the last batch */
+static unsigned long avm_now_us(void)
+{
+    unsigned long ct, hz;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
+    return hz ? (ct * 1000000UL) / hz : 0;
+}
+static int           avm_root_id  = -1;  /* 読み込んだ根オブジェクト（tick の宛先） */
+static volatile long avm_pump_rounds = 0;
+static volatile long avm_line_ok  = 0;   /* 診断: 検算に通ったラウンド数 */
+static volatile long avm_line_ng  = 0;   /* 診断: 検算に落ちたラウンド数 */
+long avm_get_line_ok(void) { return avm_line_ok; }
+long avm_get_line_ng(void) { return avm_line_ng; }
+static volatile long avm_par_us   = 0;   /* diag: 並列配布に費やした総時間[us] */
+static volatile long avm_par_msgs = 0;   /* diag: 並列で配ったメッセージ総数   */
+long avm_get_par_us(void)   { return avm_par_us; }
+long avm_get_par_msgs(void) { return avm_par_msgs; }
+void avm_par_reset_stats(void) { avm_line_ok = 0; avm_line_ng = 0;
+                                 avm_par_us = 0; avm_par_msgs = 0; avm_par_nbatch = 0;
+                                { extern void avm_par_hits_reset(void); avm_par_hits_reset(); } }
 void avm_set_par(int on) { avm_par_enable = on ? 1 : 0; }
 int  avm_get_par(void)   { return avm_par_enable; }
 int  avm_get_par_nbatch(void) { return avm_par_nbatch; }
@@ -851,6 +871,10 @@ static void avm_dispatch(int self, int sender, const char *method, long *args, i
         case 0x44: { int fi=vm_u16(code+pc); pc+=2; int na=code[pc++]; (void)fi; /* PRINTF (ignored) */
                      for (int i=0;i<na;i++) VPOP(); } break;
         case 0x45: { long col=VPOP(),y2=VPOP(),x2=VPOP(),y1=VPOP(),x1=VPOP();   /* LINE */
+                     /* 計器: ベンチ標本は検算の結果を線の色で表す(2=正 / 4=誤)。
+                      * 数えておけば /avm-par から正誤が読め、実験値が
+                      * 正しい実行の上で採られたことを外から確かめられる。 */
+                     if (col == 2) avm_line_ok++; else if (col == 4) avm_line_ng++;
                      vm_line((int)x1,(int)y1,(int)x2,(int)y2,(int)col); } break;
         case 0x46: vm_cls(); break;                                             /* CLS */
         case 0x47: { long col=VPOP(),y3=VPOP(),x3=VPOP(),y2=VPOP(),x2=VPOP(),y1=VPOP(),x1=VPOP(); /* TRI */
@@ -867,8 +891,25 @@ static void avm_dispatch(int self, int sender, const char *method, long *args, i
 }
 
 /* SMP range fn: dispatch par_batch[lo..hi) on this core (core = 0..3). */
-static long par_dispatch_range(long lo, long hi, int core)
+/* 計器: どのコアが何通のメッセージを実行したか。「4コアが本当に働いているか」を
+ * 推測でなく数で示すために置く（バッチ長を変えた比較で並列は確認できたが、
+ * コア別の内訳まで出せば一次資料になる）。 */
+static volatile long par_core_hits[PAR_NCORES];
+long avm_get_core_hits(int c) { return (c >= 0 && c < PAR_NCORES) ? par_core_hits[c] : -1; }
+static void par_core_hits_reset(void) { for (int c = 0; c < PAR_NCORES; c++) par_core_hits[c] = 0; }
+
+void avm_par_hits_reset(void) { par_core_hits_reset(); }
+
+/* 第3引数 idx は **単位番号**（0..nunits-1）。par_q / par_spawn の控えを選ぶので、
+ * 同時に走る実行のあいだで一意でなければならない。郵便箱方式では 1 コア 1 単位
+ * なので実コア番号と一致するが、対称方式では一致しない（先取りで同じコアに
+ * 別の単位が載りうる）。計器の core_hits は実コアで採るので別に数える。 */
+static long par_dispatch_range(long lo, long hi, int idx)
 {
+    int core = smp_core_id();
+    if (core >= 0 && core < PAR_NCORES) par_core_hits[core] += (hi - lo);
+    if (idx < 0 || idx >= PAR_NCORES) idx = 0;      /* 控えの添字は必ず範囲内に */
+    core = idx;                                     /* 以降 core は控えの添字 */
     for (long i = lo; i < hi; i++)
         avm_dispatch(par_batch[i].self, par_batch[i].sender, par_batch[i].method,
                      par_batch[i].a, par_batch[i].na, core);
@@ -953,7 +994,24 @@ static void avm_tick(void)
                 }
                 par_batch = batch; par_active = 1;
                 avm_par_nbatch++; avm_par_lastbn = bn;     /* diag */
-                smp_parallel_sum(par_dispatch_range, bn, nc);
+                /* ★ AIPL のアクター・バッチをどちらの方式で配るかは実行時に決まる。
+                 *   対称モード（/smpmode?on=1）では共有 ready キューへ、
+                 *   それ以外は従来どおり郵便箱（静的分割）へ。
+                 *   対称モードで郵便箱に落とすと壊れる（実測: 82 秒・解が不一致）ので、
+                 *   ここを分けないと「AIPL を対称SMP型で並列実行」ができない。 */
+                {
+                    unsigned long d0 = avm_now_us();
+#ifdef SMP_SYMMETRIC
+                    extern volatile int smpsched_on;
+                    extern long smpsched_parallel(long (*)(long, long, int), long, int);
+                    if (smpsched_on) smpsched_parallel(par_dispatch_range, bn, nc);
+                    else             smp_parallel_sum(par_dispatch_range, bn, nc);
+#else
+                    smp_parallel_sum(par_dispatch_range, bn, nc);
+#endif
+                    avm_par_us += (long)(avm_now_us() - d0);
+                    avm_par_msgs += bn;
+                }
                 par_active = 0;
                 for (int c = 0; c < PAR_NCORES; c++)          /* merge produced sends */
                     for (int j = 0; j < par_qn[c]; j++)
@@ -969,6 +1027,30 @@ static void avm_tick(void)
         avm_dispatch(m.self, m.sender, m.method, m.a, m.na, 0);
     }
 }
+
+/* 指定ミリ秒のあいだ VM を回す。戻り値は tick した回数。
+ * この板は HDMI が無く wm_run() が呼ばれないので、これが唯一の駆動源になる。
+ * 呼び出し元(HTTP ハンドラ)はその間ブロックする ―― 測定窓を正確にするための割り切り。 */
+long avm_pump(long ms)
+{
+    unsigned long t0 = avm_now_ms();
+    long ticks = 0, rounds = 0;
+    if (ms < 0) ms = 0;
+    if (ms > 60000) ms = 60000;                 /* 上限 60 秒（板を独占しすぎない） */
+    while ((long)(avm_now_ms() - t0) < ms) {
+        /* WAIT は「フレームの区切り」を立てるだけで tick を積み直さない。
+         * 読み込み時に一度だけ積まれた tick が尽きればそこで終わる ―― これが
+         * 「標本が 2 ラウンドで止まる」の正体だった。空なら積み直して次を回す。 */
+        if (vm_qh == vm_qt && avm_root_id >= 0) {
+            vm_enqueue(-1, avm_root_id, "tick", 0, 0);
+            rounds++;
+        }
+        avm_tick(); ticks++;
+    }
+    avm_pump_rounds = rounds;
+    return ticks;
+}
+long avm_get_pump_rounds(void) { return avm_pump_rounds; }
 
 /* ---- playback controls (toolbar buttons + arrow keys) ---- */
 void avm_ctl(int cmd)   /* 0 play, 1 pause, 2 stop, 3 prev, 4 next */
@@ -1032,6 +1114,7 @@ int avm_loadrun(int len)
 
     int id = vm_spawn(0);                         /* class 0 = synthetic __boot */
     if (id < 0) return -1;
+    avm_root_id = id;                             /* 駆動源が tick を積み直すため */
     vm_enqueue(-1, id, "tick", 0, 0);
     avm_active = 1;                                /* vmgfx_draw will tick it */
     return id;

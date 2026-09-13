@@ -1,0 +1,65 @@
+// AiplB2M8.abcl — 同じ重み集合を 後ろに固めた・8 通に分割
+//
+//   実験B「分割を細かくすれば静的分割は救えるか」用。同じ重み集合(1..M を正規化)を
+//   後ろに固めた（単調増加）。
+//   郵便箱は区間を **連続** に 4 等分するので、重い仕事が固まっていれば M を増やしても
+//   救えないはず。散らばっていれば平均化されて理想に近づくはず。
+//   予測 makespan: 静的 53300 / 動的 42600 反復（比 1.25、理想 32000）。
+//   ワーカ 8 個・合計 128000 反復。毎ラウンド合計を検算する。
+class Main {
+  var ready = 0;
+  var c = 0;
+  var w0 = 0;
+  var w1 = 0;
+  var w2 = 0;
+  var w3 = 0;
+  var w4 = 0;
+  var w5 = 0;
+  var w6 = 0;
+  var w7 = 0;
+  method tick() {
+    if (ready == 0) {
+      ready = 1;
+      c = new Collector();
+      w0 = new Worker();
+      w1 = new Worker();
+      w2 = new Worker();
+      w3 = new Worker();
+      w4 = new Worker();
+      w5 = new Worker();
+      w6 = new Worker();
+      w7 = new Worker();
+    }
+    send w0.run(c, 3600);
+    send w1.run(c, 7100);
+    send w2.run(c, 10700);
+    send w3.run(c, 14200);
+    send w4.run(c, 17800);
+    send w5.run(c, 21300);
+    send w6.run(c, 24900);
+    send w7.run(c, 28400);
+  }
+}
+class Worker {
+  var acc = 0; var i = 0;
+  method run(coll, n) {
+    acc = 0;
+    i = 0;
+    while (i < n) do { acc = acc + 1; i = i + 1; }
+    send coll.report(acc);
+  }
+}
+class Collector {
+  var total = 0; var got = 0;
+  method report(v) {
+    total = total + v;
+    got = got + 1;
+    if (got == 8) {
+      got = 0;
+      // 合計が合ったときだけ次ラウンドを起こす。誤っていれば止まるので
+      // /avm-par の msgs が伸びないことで **外から** 誤りが分かる。
+      if (total == 128000) { total = 0; line(80, 300, 680, 300, 2); wait(1); }
+      else { total = 0; line(80, 300, 680, 300, 4); }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+par_batch = batch; par_active = 1;
+                avm_par_nbatch++; avm_par_lastbn = bn;     /* diag */
+                /* ★ AIPL のアクター・バッチをどちらの方式で配るかは実行時に決まる。
+                 *   対称モード（/smpmode?on=1）では共有 ready キューへ、
+                 *   それ以外は従来どおり郵便箱（静的分割）へ。
+                 *   対称モードで郵便箱に落とすと壊れる（実測: 82 秒・解が不一致）ので、
+                 *   ここを分けないと「AIPL を対称SMP型で並列実行」ができない。 */
+                {
+                    unsigned long d0 = avm_now_us();
+#ifdef SMP_SYMMETRIC
+                    extern volatile int smpsched_on;
+                    extern long smpsched_parallel(long (*)(long, long, int), long, int);
+                    if (smpsched_on) smpsched_parallel(par_dispatch_range, bn, nc);
+                    else             smp_parallel_sum(par_dispatch_range, bn, nc);
+#else
+                    smp_parallel_sum(par_dispatch_range, bn, nc);
+#endif
+                    avm_par_us += (long)(avm_now_us() - d0);
+                    avm_par_msgs += bn;
+                }
+                par_active = 0;
