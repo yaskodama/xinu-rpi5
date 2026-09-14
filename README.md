@@ -237,6 +237,12 @@ restored after reboot — re-run `wifi adhoc` on each node.
 Raspberry Pi 5 edition) runs this kernel instead of Linux, and drives the arm,
 its wrist camera and the cooling fan directly. Nothing else runs on the board.
 
+**Video (2026-09-14):** the 22-move choreography running first on the simulator's
+model and then on the real arm, driven from AIPL —
+[youtu.be/MSeznEtUzes](https://youtu.be/MSeznEtUzes).
+
+[![DOFBOT driven by Xinu + AIPL — video](https://i.ytimg.com/vi/MSeznEtUzes/hqdefault.jpg)](https://youtu.be/MSeznEtUzes)
+
 ![DOFBOT arm window and live Xinu camera in the desktop simulator](docs/dofbot-desktop.png)
 
 *The Mac-side Xinu desktop simulator (aice-avm): a 3-D model of the arm drawn
@@ -316,6 +322,9 @@ for the next session: `NEXT_SESSION_DOFBOT.md`.
 *2026-09-14.* **Yahboom DOFBOT（6 軸アーム、Raspberry Pi 5 版）**に付属する Pi 5 で、
 Linux の代わりにこのカーネルを起動し、アーム・手首カメラ・冷却ファンを Xinu 自身が直接動かしています。
 板の上には他に何も走っていません。
+
+**動画（2026-09-14）：** 22 手の振り付けを、まずシミュレータの模型で、次に実機で、AIPL から動かしている様子 ——
+[youtu.be/MSeznEtUzes](https://youtu.be/MSeznEtUzes)。
 
 上の 1 枚目の図は Mac 側の Xinu デスクトップシミュレータ（aice-avm）で、6 軸のサーボ角から描いた
 アームの 3D 模型、**Xinu 自身の UVC ドライバが受けた生映像**、実行中の文の行を反転する「AIPL program」窓です。
