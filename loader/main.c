@@ -313,11 +313,19 @@ static void genet_rx_tick(void)
           if (!s_dofbot_boot && t >= 4500) {
               s_dofbot_boot = 1;
               extern const char dofbot_arm_aipl[]; extern int dofbot_arm_aipl_len(void);
-              extern int cc_actor_load(const char *, int, char *, int);
+              extern int abcl2c(const char *, int, char *, int);
+              extern int cc_run_source_proc(const char *, int, char *, int, long *);
               extern int rp1usb_cam_start(int, int, char *, int);
               extern int rp1i2c_present(void);
-              static char bo[512];
-              if (rp1i2c_present()) { cc_actor_load(dofbot_arm_aipl, dofbot_arm_aipl_len(), bo, (int)sizeof bo); uart_puts("boot: dofbot actor loaded\n"); }
+              static char bo[512], xlat[8192];
+              if (rp1i2c_present()) {
+                  /* HTTP の POST /cc と同じ経路: abcl2c で C にしてから専用プロセスで走らせる
+                     （web_expose のルートはプログラムと寿命を共にして常駐する） */
+                  int xr = abcl2c(dofbot_arm_aipl, dofbot_arm_aipl_len(), xlat, (int)sizeof xlat);
+                  long rv = 0;
+                  if (xr > 0) { cc_run_source_proc(xlat, xr, bo, (int)sizeof bo, &rv); uart_puts("boot: dofbot actor loaded: "); uart_puts(bo); uart_puts("\n"); }
+                  else uart_puts("boot: dofbot actor: abcl2c failed\n");
+              }
               rp1usb_cam_start(3, 10, bo, (int)sizeof bo); uart_puts(bo);
           } }
     }
