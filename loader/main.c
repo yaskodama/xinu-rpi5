@@ -309,6 +309,9 @@ static void genet_rx_tick(void)
          *   1) 腕のアクター "dofbot" を載せる —— 再起動後も remote_call が err にならない
          *   2) USB カメラの配信を始める（320x240 @10fps）—— 窓が /cam/start を待たなくてよい
          * どちらも HTTP の /cc・/cam/start と同じ文脈（net tick）で走る。 */
+        /* ファン: 10 秒ごとに SoC 温度を読んで Linux と同じ段で回す（/fan?level= で手動にできる） */
+        { static unsigned long s_fan_next = 1500; extern void rp1fan_thermal_tick(void);
+          if (t >= s_fan_next) { s_fan_next = t + 1000; rp1fan_thermal_tick(); } }
         { static int s_dofbot_boot = 0;
           if (!s_dofbot_boot && t >= 4500) {
               s_dofbot_boot = 1;

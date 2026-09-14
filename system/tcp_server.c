@@ -1505,7 +1505,9 @@ static int http_build(const char *req, char *out, int max)
         extern int rp1fan_set(int); extern int rp1fan_status(char *, int);
         ctype = "text/plain";
         char lv[8];
-        if (q_param(req, "level", lv, sizeof lv)) { int r = rp1fan_set(q_int(req, "level", 0)); bl = s_put(body, bl, r == 0 ? "ok " : "FAIL(unclocked) "); }
+        extern void rp1fan_set_auto(int);
+        if (q_param(req, "auto", lv, sizeof lv)) { rp1fan_set_auto(q_int(req, "auto", 1)); bl = s_put(body, bl, "ok "); }
+        if (q_param(req, "level", lv, sizeof lv)) { rp1fan_set_auto(0); int r = rp1fan_set(q_int(req, "level", 0)); bl = s_put(body, bl, r == 0 ? "ok " : "FAIL(unclocked) "); }
         bl += rp1fan_status(body + bl, (int)sizeof body - bl);
     } else if (str_starts(rpath, "/arm")) {
         /* DOFBOT アーム: GET /arm?cmd=pose+90+90+90+90+90+30+1000 ／ /arm?cmd=read ／ /arm/read ／ /arm/stat
