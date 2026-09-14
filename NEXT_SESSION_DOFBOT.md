@@ -1,6 +1,6 @@
 # DOFBOT（Xinu＋AIPL）—— 次のセッションへの引き継ぎ
 
-最終更新: 2026-09-14 15:50（セッション終了時）
+最終更新: 2026-09-14 16:10（セッション終了時）
 
 ## 30 秒で状況を掴む
 
@@ -79,3 +79,10 @@ cd ~/aios/abclcp && ./src/abclrepl_thread -q -f ~/dofbot_pi5/aipl/r.repl
 - AIPL と道具: `~/dofbot_pi5/`（`aipl/complex.aipl` `aipl/dofbot_arm.aipl` `cam_service.py` `arm.py` `dofbot_control_path.tex/pdf`）
 - レポート原稿の写し: `~/kodamay_org_site/kodamay.org/reports-src/2026-09-14_dofbot_xinu_aipl_uvc/report.tex`
 - メモリ: `project-dofbot-ultra-baremetal-arm` `project-xinu-pi5-uvc-camera` `project-dofbot-pi5-real-arm`
+
+## 追記（16:10）
+
+- xinu-rpi5 の README にロボットアームの節（英・日）と実演動画 https://youtu.be/MSeznEtUzes を載せた（`0d5dac5`）。
+- **GitHub の `main` を `feat/smp-symmetric` の先端まで早送りした**（分岐なし。以前の main の先端は `5887c97`）。
+  以後は `feat/smp-symmetric` へ push したら `git push origin feat/smp-symmetric:main` も打つ（README を main で見せるため）。
+- 全リポジトリ（xinu-rpi5 / abclcp / aice-avm / kodamay-org-web）はコミット・push 済み。abclcp の未コミットは build 生成物だけ。
