@@ -305,32 +305,6 @@ static void genet_rx_tick(void)
             s_usb_next = t + 300;                /* ~3 s between attempts */
         }
         rp1usb_mouse_pump();                                       /* USB mouse -> cursor */
-        /* DOFBOT の起動時仕事（USB の再結線が落ち着く 45 s 後に一度だけ）:
-         *   1) 腕のアクター "dofbot" を載せる —— 再起動後も remote_call が err にならない
-         *   2) USB カメラの配信を始める（320x240 @10fps）—— 窓が /cam/start を待たなくてよい
-         * どちらも HTTP の /cc・/cam/start と同じ文脈（net tick）で走る。 */
-        /* ファン: 10 秒ごとに SoC 温度を読んで Linux と同じ段で回す（/fan?level= で手動にできる） */
-        { static unsigned long s_fan_next = 1500; extern void rp1fan_thermal_tick(void);
-          if (t >= s_fan_next) { s_fan_next = t + 1000; rp1fan_thermal_tick(); } }
-        { static int s_dofbot_boot = 0;
-          if (!s_dofbot_boot && t >= 4500) {
-              s_dofbot_boot = 1;
-              extern const char dofbot_arm_aipl[]; extern int dofbot_arm_aipl_len(void);
-              extern int abcl2c(const char *, int, char *, int);
-              extern int cc_run_source_proc(const char *, int, char *, int, long *);
-              extern int rp1usb_cam_start(int, int, char *, int);
-              extern int rp1i2c_present(void);
-              static char bo[512], xlat[8192];
-              if (rp1i2c_present()) {
-                  /* HTTP の POST /cc と同じ経路: abcl2c で C にしてから専用プロセスで走らせる
-                     （web_expose のルートはプログラムと寿命を共にして常駐する） */
-                  int xr = abcl2c(dofbot_arm_aipl, dofbot_arm_aipl_len(), xlat, (int)sizeof xlat);
-                  long rv = 0;
-                  if (xr > 0) { cc_run_source_proc(xlat, xr, bo, (int)sizeof bo, &rv); uart_puts("boot: dofbot actor loaded: "); uart_puts(bo); uart_puts("\n"); }
-                  else uart_puts("boot: dofbot actor: abcl2c failed\n");
-              }
-              rp1usb_cam_start(3, 10, bo, (int)sizeof bo); uart_puts(bo);
-          } }
     }
 #endif
     g_rx_busy = 0;
@@ -401,6 +375,32 @@ void net_rx_pump(void)
  * of in interrupt context.  It is the only non-NULL process (prio 1), so nothing
  * preempts it mid-actor: the non-reentrant AIPL runtime stays safe. */
 static int g_net_pid = -1;
+
+/* DOFBOT の起動時仕事（専用プロセス）: USB の再結線が落ち着いてから一度だけ、
+ *   1) 腕のアクター "dofbot" を載せる —— 再起動後も remote_call が err にならない
+ *   2) USB カメラの配信を始める（320x240 @10fps）
+ * ★ 以前は 100 Hz の巡回（net tick）の中で走らせていたが、その巡回は画面ループ（NULLPROC）からも
+ *   呼ばれる。画面ループ側で当たると cc_run_source_proc が戻らず HTTP ごと固まった
+ *   （2026-09-14 12:18 の起動で実測。UDP と ping は生きていた）。ブラウザの起動時取得と同じく
+ *   専用プロセスで走らせる。 */
+static void dofbot_boot_proc(void)
+{
+    extern void proc_sleep_us(unsigned long us);
+    extern const char dofbot_arm_aipl[]; extern int dofbot_arm_aipl_len(void);
+    extern int abcl2c(const char *, int, char *, int);
+    extern int cc_run_source_proc(const char *, int, char *, int, long *);
+    extern int rp1usb_cam_start(int, int, char *, int);
+    extern int rp1i2c_present(void);
+    static char bo[512], xlat[8192];
+    proc_sleep_us(50000000UL);          /* USB の再結線（〜41 s）が終わるのを待つ */
+    if (rp1i2c_present()) {
+        int xr = abcl2c(dofbot_arm_aipl, dofbot_arm_aipl_len(), xlat, (int)sizeof xlat);
+        long rv = 0;
+        if (xr > 0) { cc_run_source_proc(xlat, xr, bo, (int)sizeof bo, &rv); uart_puts("boot: dofbot actor loaded: "); uart_puts(bo); uart_puts("\n"); }
+        else uart_puts("boot: dofbot actor: abcl2c failed\n");
+    }
+    rp1usb_cam_start(3, 10, bo, (int)sizeof bo); uart_puts(bo);
+}
 
 /* 起動時のブラウザ。ネットワークが安定するのを待ってから一度読む。 */
 static void browser_boot_proc(void)
@@ -1872,6 +1872,10 @@ void kernel_main(void)
      * 専用プロセスにするのは、ここで数秒ブロックすると起動が止まるため。 */
     { int bp = proc_create(browser_boot_proc, 32768, "browser");
       if (bp > 0) proc_ready(bp); }
+#ifdef RP1_ETH_BASE
+    { int dp = proc_create(dofbot_boot_proc, 65536, "dofbot");
+      if (dp > 0) proc_ready(dp); }
+#endif
     uart_puts("net: draining in net_proc (preemptive), ISR no longer runs the stack\n");
 
     /* Bring up the other 3 Cortex-A76 cores as compute workers (worker-pool
