@@ -1350,9 +1350,14 @@ static int http_build(const char *req, char *out, int max)
             fl = rp1usb_cam_stat(cbody, (int)sizeof cbody);
         } else {
             int srcw = rp1usb_cam_width(), srch = rp1usb_cam_height();
-            int flen = 0; const unsigned char *fr = rp1usb_cam_frame(&flen);
+            /* 1 枚を何回かに分けて取るあいだに「最新」が入れ替わると上下で別のフレームが継ぎ合わさる。
+               off=0 のときにフレームを写し取り、続きの off はその写しから返す（動作中の乱れの原因。実測）。 */
+            static unsigned char snap[640*480*2]; static int snap_len = 0;
             char offbuf[12]; int has_off = q_param(req, "off", offbuf, sizeof offbuf);
             int off = q_int(req, "off", 0); if (off < 0) off = 0; if (off & 1) off++;
+            if (!has_off || off == 0) { int fl0 = 0; const unsigned char *f0 = rp1usb_cam_frame(&fl0);
+                if (f0 && fl0 > 0 && fl0 <= (int)sizeof snap) { for (int i = 0; i < fl0; i++) snap[i] = f0[i]; snap_len = fl0; } }
+            int flen = snap_len; const unsigned char *fr = snap_len ? snap : 0;
             if (str_starts(rpath, "/cam.yuv")) {
                 cct = "application/octet-stream";
                 int chunk = 12288; if (off + chunk > flen) chunk = flen - off; if (chunk < 0) chunk = 0;
