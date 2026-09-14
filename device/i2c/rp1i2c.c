@@ -166,10 +166,10 @@ int rp1i2c_write(unsigned int addr, const unsigned char *buf, int n)
     set_target(addr);
     (void)R(IC_CLR_INTR);
     for (int i = 0; i < n; i++) {
-        if (wait_status(ST_TFNF, ST_TFNF, 20) < 0) return finish(1), -2;
+        if (wait_status(ST_TFNF, ST_TFNF, 100) < 0) return finish(1), -2;
         R(IC_DATA_CMD) = (unsigned int)buf[i] | (i == n - 1 ? CMD_STOP : 0);
     }
-    return finish(20);
+    return finish(100);   /* 腕の基板はサーボと通信中だと 20 ms を超えて待たせる（実測） */
 }
 
 /* Write `wn` bytes (usually one register number), repeated-START, then read `rn` bytes. */
@@ -180,11 +180,11 @@ int rp1i2c_write_read(unsigned int addr, const unsigned char *wbuf, int wn, unsi
     set_target(addr);
     (void)R(IC_CLR_INTR);
     for (int i = 0; i < wn; i++) {
-        if (wait_status(ST_TFNF, ST_TFNF, 20) < 0) return finish(1), -2;
+        if (wait_status(ST_TFNF, ST_TFNF, 100) < 0) return finish(1), -2;
         R(IC_DATA_CMD) = (unsigned int)wbuf[i];
     }
     for (int i = 0; i < rn; i++) {
-        if (wait_status(ST_TFNF, ST_TFNF, 20) < 0) return finish(1), -2;
+        if (wait_status(ST_TFNF, ST_TFNF, 100) < 0) return finish(1), -2;
         R(IC_DATA_CMD) = CMD_READ | (i == 0 && wn > 0 ? CMD_RESTART : 0) | (i == rn - 1 ? CMD_STOP : 0);
     }
     unsigned long end = now_ticks() + ms_ticks(30);
