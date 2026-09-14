@@ -48,7 +48,7 @@ int arm_write1(int id, int angle, int ms)
     unsigned char b[5] = { (unsigned char)(0x10 + id), (unsigned char)(pos >> 8), (unsigned char)pos,
                            (unsigned char)(ms >> 8), (unsigned char)ms };
     int r = rp1i2c_write(ARM_ADDR, b, 5);
-    if (r == -2) { delay_ms(5); r = rp1i2c_write(ARM_ADDR, b, 5); }
+    for (int t = 0; t < 3 && r == -2; t++) { delay_ms(10); r = rp1i2c_write(ARM_ADDR, b, 5); }
     return r;
 }
 
@@ -66,7 +66,7 @@ static int arm_write6_once(const int a[6], int ms)
 int arm_write6(const int a[6], int ms)
 {
     int r = arm_write6_once(a, ms);
-    if (r == -2) { delay_ms(5); r = arm_write6_once(a, ms); }
+    for (int t = 0; t < 3 && r == -2; t++) { delay_ms(10); r = arm_write6_once(a, ms); }
     return r;
 }
 
