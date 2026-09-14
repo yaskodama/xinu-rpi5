@@ -506,6 +506,8 @@ static int parse_primary(void)
             else if (a2c_streq(nm,"round")) rtfn = "v_m_round";
             else if (a2c_streq(nm,"abs"))   rtfn = "v_m_abs";
             else if (a2c_streq(nm,"neg"))   rtfn = "v_m_neg";
+            /* 実機の腕（DOFBOT）。文字列の命令を system/arm.c にそのまま渡す（io）。 */
+            else if (a2c_streq(nm,"arm_cmd")) rtfn = "v_arm_cmd";
             if      (a2c_streq(nm,"is_ok")) rtfn = "cc_is_ok";
             else if (a2c_streq(nm,"value")) rtfn = "cc_value";
             /* result の第三の観測子と、実行時の型 */

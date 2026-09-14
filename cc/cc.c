@@ -508,6 +508,26 @@ static long v_ai_call(long prompt)
     return v_str(r);
 }
 
+/* arm_cmd(s) — DOFBOT の腕。文字列の命令（"pose 90 90 90 90 90 30 1000" / "read" /
+   "rgb 0 255 0" ...）を system/arm.c の arm_command に渡し、その答の文字列を返す。
+   I2C はポーリングで数 ms、pose は書いて戻るだけ（到達を待たない）。 */
+static long v_arm_cmd(long s)
+{
+    extern int arm_command(const char *args, char *out, int cap);
+    char cb[160];
+    const char *c = v_render(s, cb, sizeof cb);
+    char out[256];
+    out[0] = 0;
+    arm_command(c, out, (int)sizeof out);
+    int n = 0; while (out[n]) n++;
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) n--;
+    char *r = vheap_alloc(n + 1);
+    if (!r) return v_str("");
+    for (int i = 0; i < n; i++) r[i] = out[i];
+    r[n] = 0;
+    return v_str(r);
+}
+
 /* v_truthy is also exported (raw 0/1) for if/while conditions. */
 static long v_truthy_x(long w)    { return v_truthy(w); }
 
@@ -1497,6 +1517,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "v_not",       (void *)&v_not        },
         { "v_print",     (void *)&v_print      },
         { "v_ai_call",   (void *)&v_ai_call    },
+        { "v_arm_cmd",   (void *)&v_arm_cmd    },
         { "v_truthy",    (void *)&v_truthy_x   },
         { "v_int_of",    (void *)&v_int_of     },
         { "v_list_new",   (void *)&v_list_new   },
