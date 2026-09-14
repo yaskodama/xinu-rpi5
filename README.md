@@ -103,6 +103,11 @@ A single-image AArch64 kernel with the MMU enabled (BCM2712, Cortex-A76):
   OS3-lower-res) from one source tree.
 - **On-device tooling** — `cc` / `make` compile and run a C/AIPL program in
   place; an AIPL actor gateway.
+- **Robot arm (Yahboom DOFBOT) + USB camera + fan** — an RP1 I²C driver talks
+  to the arm's servo board, a UVC driver receives isochronous video from the
+  wrist camera, and the Pi 5 fan is driven by RP1 PWM with a thermal curve; an
+  AIPL actor on the board exposes the arm to the network. See
+  [Robot arm](#robot-arm-yahboom-dofbot--i²c-uvc-camera-fan-aipl) below.
 
 **Boot media.** The board **boots from a USB stick**: the firmware loads
 `kernel_2712.img` from the stick's FAT partition (`bootfs`). The on-board
@@ -178,7 +183,8 @@ curl -X POST --data-binary "hello" http://192.168.3.101/microsd/write/TEST.TXT
 ```
 
 Endpoints: `/run?cmd=`, `/fs` (+ `/fs/ls`, `/fs/cat`, `/fs/write`),
-`/microsd/write/<NAME>`, `/usb/...`, `/api/actors`, `/send?to=&m=`.
+`/microsd/write/<NAME>`, `/usb/...`, `/api/actors`, `/send?to=&m=`,
+`/arm/...`, `/cam...`, `/fan` (robot arm, camera, fan — see below).
 
 ## WiFi
 
@@ -225,6 +231,86 @@ wifi aodv  <a.b.c.d>                 # discover a multi-hop route on demand
 Ad-hoc/AODV is independent of the infrastructure `wifi on` mode and is not
 restored after reboot — re-run `wifi adhoc` on each node.
 
+## Robot arm (Yahboom DOFBOT) — I²C, UVC camera, fan, AIPL
+
+*2026-09-14.* The Pi 5 that ships with the **Yahboom DOFBOT** (6-axis arm,
+Raspberry Pi 5 edition) runs this kernel instead of Linux, and drives the arm,
+its wrist camera and the cooling fan directly. Nothing else runs on the board.
+
+![DOFBOT arm window and live Xinu camera in the desktop simulator](docs/dofbot-desktop.png)
+
+*The Mac-side Xinu desktop simulator (aice-avm): a 3-D model of the arm drawn
+from the six servo angles, the **live video received by Xinu's own UVC driver**
+on the right, and an "AIPL program" window that inverts the statement being
+executed. The same AIPL program drives the model and the real arm.*
+
+![Frames from the wrist camera while the arm moves](docs/dofbot-wrist-camera.png)
+
+*Five frames taken from the board (`/cam`) during a 22-move choreography:
+floor and cables when the arm looks down, a wall close-up, then the ceiling
+once it stands upright.*
+
+### What the board can do
+
+| Piece | Where | What it is |
+|---|---|---|
+| RP1 I²C1 master | `device/i2c/rp1i2c.c` | DesignWare I²C at `0x1F00074000`, GPIO2/3 (FUNCSEL 3), 100 kHz, fully polled with `cntpct` deadlines. Refuses itself if `IC_COMP_TYPE` is not the DesignWare id (RP1 returns `0xDEADDEAD` for an unclocked block). |
+| Arm layer | `system/arm.c` | The DOFBOT servo board is I²C slave `0x15` (an STM8 that drives six bus servos). The wire format is exactly Yahboom's `Arm_Lib.py`: `0x10+id` one servo, `0x1E`→`0x1D` six servos at once, `0x30+id` read-back, `0x02` RGB, `0x06` buzzer, `0x1A` torque, `0x38` ping, `0x05` reset. Angle→position is `900+2200·θ/180` (servo 5: `380+3320·θ/270`; servos 2–4 are mirrored as `180−θ`). Retries an I²C timeout up to three times and resets the board after three all-failed reads (it stalls while it is talking to the servos). |
+| Text command | shell `arm …`, HTTP `/arm/...` | `pose a1 a2 a3 a4 a5 a6 [ms]`, `set id ang [ms]`, `read`, `rgb r g b`, `buzz n`, `torque 0/1`, `ping id`, `ver`, `scan`, `stat`, `reset`. One function, `arm_command()`, serves both. |
+| AIPL built-in | `cc/cc.c` `v_arm_cmd` | `arm_cmd(s: string): string` (effect `io`) in the on-board AIPL. The actor below is loaded automatically 50 s after boot, so `remote_call("192.168.3.101:9010","dofbot","cmd","pose 90 90 90 90 90 30 1500")` works from any AIPL implementation right after a power cycle. |
+| UVC camera | `device/usb/rp1usb.c` (end of file) | USB Video Class over **isochronous** transfers on the RP1 xHCI: descriptor probe (`/usb/cam-probe`), `SET_CONFIGURATION` → VS Probe/Commit → `SET_INTERFACE`, an Isoch-IN endpoint context, a 512-entry TRB ring re-armed as each TRB completes, and frame assembly from the UVC payload header (FID/EOF). 320×240 YUY2 at 10 fps from a Microdia `0c45:6340`; event ring enlarged 64→1024. |
+| Camera output | HTTP `/cam...` | `/cam/start?frame=3&fps=10`, `/cam/stat`, `/cam?w=160` (dimensions), `/cam?w=160&off=N` (RGB565 in 12 KB chunks, CORS, same shape as `/fb`), `/cam.yuv?off=N`. The frame is snapshotted on `off=0` so a multi-chunk fetch never straddles two frames. |
+| Fan | `device/genet/rp1fan.c` | RP1 PWM1 channel 3 on GPIO45, `clk_pwm1` from the 50 MHz xosc, the same 41566 ns period and inverted polarity as Linux's `cooling_fan`. Every 10 s the SoC temperature is read over the mailbox (`GET_TEMPERATURE`) and the fan follows Linux's steps (50/60/67.5/75 °C → 75/125/175/250). `/fan`, `/fan?level=`, `/fan?auto=1`. |
+
+```aipl
+// The actor that lives on the board (loaded at boot; also ~/dofbot_pi5/aipl/dofbot_arm.aipl)
+class Arm {
+  var count = 0;
+  method cmd(s: string) : string !{io, mut} { count = count + 1; reply(arm_cmd(s)); }
+  method served() : int !{} { reply(count); }
+}
+var arm = new Arm();
+web_expose("/dofbot", "arm");
+```
+
+```sh
+curl http://192.168.3.101/arm/read                      # angles 90 90 90 90 90 30
+curl http://192.168.3.101/arm/pose/90/90/90/90/90/30/2000
+curl http://192.168.3.101/cam/stat                      # frames=… pkts=… errs=0
+curl "http://192.168.3.101/fan"                         # fan level=75 auto=1 soc_temp_mC=40577 …
+```
+
+### Applications
+
+- **Plan on the Mac, act on the board.** The canonical AIPL (OCaml) gained
+  `remote_call(host:port, actor, method, arg, ms)` (effect `net`) — the same
+  one-line ASCII `Q`/`R` datagrams on UDP/9010 that the boards already speak —
+  and `arm_cmd` (effect `io`). A planner actor never touches the arm; the `Arm`
+  actor on the board is the only thing with `io`. A 22-move choreography
+  (Yahboom's look/grab/stack poses) runs first against a **software model of
+  the arm inside the desktop simulator** (`127.0.0.1:9010`, actor `dofbot`,
+  identical interface) and then against the real board, by changing only the
+  address. Measured: 44/44 replies `ok`.
+- **Watching the program run.** The OCaml evaluator sends `PC line col actor
+  file` over UDP/9011 for every statement; the simulator's *AIPL program*
+  window inverts that line. Writing each move as one line (`r = now d.go(b,
+  "pose …") …; wait(1750);`) keeps the executing move highlighted for as long
+  as the arm is moving.
+- **Camera in the loop.** The wrist camera is received by Xinu itself and
+  shown in the simulator window; it can be fetched by any client (CORS) at a
+  few frames per second. The next step is an AIPL built-in (`cam_frame()` /
+  tag detection) so the planner can see.
+- **Known limits.** The camera exposes YUY2 only (no MJPEG), so 640×480 would
+  need 18 MB/s — use 320×240 or smaller. The EP0 transfer ring is shared by all
+  USB devices, so the camera is re-addressed each time streaming starts.
+  Grasping the cube is still unsolved: the wrist camera cannot see the fingers.
+
+The full write-up (three-layer control path under Linux, the Xinu port, the
+AIPL actors, the simulator windows, the UVC driver and its first failure, fan)
+is the 8-page report *Mac から DOFBOT（Raspberry Pi 5）を動かす制御経路*
+(`reports/2026-09-14_dofbot_xinu_aipl_uvc.pdf` on kodamay.org). Hand-off notes
+for the next session: `NEXT_SESSION_DOFBOT.md`.
+
 ## Documentation
 
 - **User's manual** (operator-facing, EN + JA): typeset PDFs under `docs/`
@@ -232,7 +318,7 @@ restored after reboot — re-run `wifi adhoc` on each node.
   `docs/xinu-pi5-manual-en.tex` / `docs/xinu-pi5-manual.tex`). Markdown mirrors:
   `USERS_MANUAL_EN.md` / `USERS_MANUAL_JA.md`. They cover flashing, the OS
   variants, `kexec`, microSD, the shell, remote HTTP operation, WiFi, and USB.
-- Session handoff notes: `NEXT_SESSION.md`.
+- Session handoff notes: `NEXT_SESSION.md`; robot arm / camera / fan: `NEXT_SESSION_DOFBOT.md`.
 
 ## License
 
