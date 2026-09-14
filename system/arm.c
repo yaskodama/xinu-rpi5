@@ -79,7 +79,7 @@ int arm_read(int id)
     delay_ms(3);
     unsigned char r[2] = { 0, 0 };
     unsigned char reg = (unsigned char)(0x30 + id);
-    if (rp1i2c_write_read(ARM_ADDR, &reg, 1, r, 2) < 0) return -1;
+    if (rp1i2c_write_read(ARM_ADDR, &reg, 1, r, 2) < 0) { delay_ms(10); if (rp1i2c_write_read(ARM_ADDR, &reg, 1, r, 2) < 0) return -1; }
     unsigned int pos = ((unsigned int)r[0] << 8) | r[1];   /* Arm_Lib は word を上下入替して使う＝先頭バイトが上位 */
     if (pos == 0) return -1;
     return pos_to_angle(id, pos);

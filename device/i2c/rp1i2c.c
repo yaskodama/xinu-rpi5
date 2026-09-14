@@ -187,14 +187,14 @@ int rp1i2c_write_read(unsigned int addr, const unsigned char *wbuf, int wn, unsi
         if (wait_status(ST_TFNF, ST_TFNF, 100) < 0) return finish(1), -2;
         R(IC_DATA_CMD) = CMD_READ | (i == 0 && wn > 0 ? CMD_RESTART : 0) | (i == rn - 1 ? CMD_STOP : 0);
     }
-    unsigned long end = now_ticks() + ms_ticks(30);
+    unsigned long end = now_ticks() + ms_ticks(100);
     int got = 0;
     while (got < rn) {
         if (R(IC_RAW_INTR_STAT) & INTR_TX_ABRT) break;
         if (R(IC_STATUS) & ST_RFNE) { rbuf[got++] = (unsigned char)(R(IC_DATA_CMD) & 0xff); continue; }
         if (now_ticks() > end) { n_timeout++; break; }
     }
-    int r = finish(20);
+    int r = finish(100);
     if (r < 0) return r;
     return got == rn ? 0 : -2;
 }
