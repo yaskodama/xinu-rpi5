@@ -1327,6 +1327,74 @@ static int http_build(const char *req, char *out, int max)
         return p;
     }
 
+    /* USB カメラ（UVC, YUY2）: /fb と同じ形で分割配信する。
+     *   GET /cam/start[?frame=3&fps=10]  配信開始（frame: 1=640x480 2=352x288 3=320x240 4=176x144 5=160x120）
+     *   GET /cam/stop  /cam/stat        停止／統計
+     *   GET /cam[?w=W]                  "DW DH SRCW SRCH"
+     *   GET /cam?off=N[&w=W]            最新フレームを W 幅に縮めた RGB565 を 12 KB ずつ（CORS つき）
+     *   GET /cam.yuv?off=N              最新フレームの YUY2 そのまま 12 KB ずつ */
+    if (str_starts(rpath, "/cam")) {
+        extern int rp1usb_cam_start(int, int, char *, int);
+        extern int rp1usb_cam_stop(void);
+        extern int rp1usb_cam_stat(char *, int);
+        extern int rp1usb_cam_active(void), rp1usb_cam_width(void), rp1usb_cam_height(void);
+        extern const unsigned char *rp1usb_cam_frame(int *len);
+        static char cbody[12288 + 64];
+        int fl = 0; const char *cct = "text/plain";
+        if (str_starts(rpath, "/cam/start")) {
+            fl = rp1usb_cam_start(q_int(req, "frame", 3), q_int(req, "fps", 10), cbody, (int)sizeof cbody);
+            fl = 0; while (cbody[fl]) fl++;
+        } else if (str_starts(rpath, "/cam/stop")) {
+            rp1usb_cam_stop(); fl = s_put(cbody, 0, "cam stopped\n");
+        } else if (str_starts(rpath, "/cam/stat")) {
+            fl = rp1usb_cam_stat(cbody, (int)sizeof cbody);
+        } else {
+            int srcw = rp1usb_cam_width(), srch = rp1usb_cam_height();
+            int flen = 0; const unsigned char *fr = rp1usb_cam_frame(&flen);
+            char offbuf[12]; int has_off = q_param(req, "off", offbuf, sizeof offbuf);
+            int off = q_int(req, "off", 0); if (off < 0) off = 0; if (off & 1) off++;
+            if (str_starts(rpath, "/cam.yuv")) {
+                cct = "application/octet-stream";
+                int chunk = 12288; if (off + chunk > flen) chunk = flen - off; if (chunk < 0) chunk = 0;
+                for (int i = 0; i < chunk; i++) cbody[i] = (char)fr[off + i];
+                fl = chunk;
+            } else {
+                int dw = q_int(req, "w", 160); if (dw < 16) dw = 16; if (dw > 640) dw = 640;
+                int dh = (srcw && srch) ? dw * srch / srcw : dw * 3 / 4; if (dh < 1) dh = 1;
+                if (!has_off) {
+                    fl = s_putdec(cbody, fl, dw); fl = s_put(cbody, fl, " "); fl = s_putdec(cbody, fl, dh); fl = s_put(cbody, fl, " ");
+                    fl = s_putdec(cbody, fl, srcw); fl = s_put(cbody, fl, " "); fl = s_putdec(cbody, fl, srch); fl = s_put(cbody, fl, " ");
+                    fl = s_putdec(cbody, fl, flen); fl = s_put(cbody, fl, rp1usb_cam_active() ? " streaming\n" : " idle\n");
+                } else {
+                    cct = "application/octet-stream";
+                    int total = dw * dh * 2, chunk = 12288;
+                    if (off + chunk > total) chunk = total - off; if (chunk < 0) chunk = 0;
+                    int p0 = off / 2, np = chunk / 2;
+                    for (int i = 0; i < np; i++) {
+                        int pi = p0 + i, ox = pi % dw, oy = pi / dw;
+                        unsigned r = 0, g = 0, b = 0;
+                        if (fr && srcw && srch && flen >= srcw * srch * 2) {
+                            int sx = ox * srcw / dw, sy = oy * srch / dh;
+                            const unsigned char *q = fr + (sy * srcw + (sx & ~1)) * 2;   /* Y0 U Y1 V */
+                            int y = q[(sx & 1) ? 2 : 0], u = q[1] - 128, v = q[3] - 128;
+                            int c = (y - 16) * 298;
+                            int rr = (c + 409 * v + 128) >> 8, gg = (c - 100 * u - 208 * v + 128) >> 8, bb = (c + 516 * u + 128) >> 8;
+                            r = rr < 0 ? 0 : rr > 255 ? 255 : (unsigned)rr; g = gg < 0 ? 0 : gg > 255 ? 255 : (unsigned)gg; b = bb < 0 ? 0 : bb > 255 ? 255 : (unsigned)bb;
+                        }
+                        unsigned v565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                        cbody[fl++] = (char)(v565 & 0xFF); cbody[fl++] = (char)((v565 >> 8) & 0xFF);
+                    }
+                }
+            }
+        }
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: "); p = s_put(out, p, cct);
+        p = s_put(out, p, "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: ");
+        p = s_putdec(out, p, fl); p = s_put(out, p, "\r\n\r\n");
+        for (int i = 0; i < fl; i++) out[p++] = cbody[i];
+        return p;
+    }
+
     if (path_eq(req, "/send")) {
         int  to  = q_int(req, "to", -1);
         int  arg = q_int(req, "arg", 0);
@@ -1777,7 +1845,33 @@ static int http_build(const char *req, char *out, int max)
         extern int rp1usb_ctx_stride(void);
         ctype = "text/plain";
         /* Re-triggerable bring-up steps (iterate without reflashing): */
-        if (str_starts(rpath, "/usb/probe")) {
+        if (str_starts(rpath, "/usb/cam-probe")) {
+            /* UVC カメラの下見: 全ポートを当たって形式・フレーム・エンドポイントを一覧する */
+            extern int rp1usb_cam_probe(char *out, int cap);
+            /* 応答本文は 640 バイトなので、結果は静的な帳面に置き ?off= で少しずつ取り出す
+               （off=0 のときだけ実際に下見をする） */
+            static char cam_out[4000];
+            int off = q_int(req, "off", 0);
+            if (off == 0) rp1usb_cam_probe(cam_out, (int)sizeof cam_out);
+            int total = 0; while (cam_out[total]) total++;
+            int n = 0; while (off + n < total && n < 600) { body[n] = cam_out[off + n]; n++; }
+            body[n] = 0; bl = n;
+            if (off + n < total) { bl = s_put(body, bl, "\n...more: off="); bl = s_putdec(body, bl, off + n); bl = s_put(body, bl, "\n"); }
+        } else if (str_starts(rpath, "/usb/desc")) {
+            extern int rp1usb_get_descriptor(int,int,int,int);
+            extern unsigned int rp1usb_desc_cc(void); extern unsigned int rp1usb_desc_len(void);
+            extern unsigned int rp1usb_desc_byte(int);
+            int slot=q_int(req,"slot",1), type=q_int(req,"type",1);
+            int index=q_int(req,"index",0), len=q_int(req,"len",18), off=q_int(req,"off",0);
+            if (!q_int(req,"noread",0)) rp1usb_get_descriptor(slot, type, index, len);
+            bl = s_put(body, bl, "desc cc="); bl = s_putdec(body, bl, rp1usb_desc_cc());
+            bl = s_put(body, bl, " len=");    bl = s_putdec(body, bl, rp1usb_desc_len());
+            bl = s_put(body, bl, " hex@"); bl = s_putdec(body, bl, off); bl = s_put(body, bl, ":");
+            int dl = (int)rp1usb_desc_len(); const char *hx = "0123456789abcdef";
+            for (int i=off;i<dl && i<off+160 && bl<(int)sizeof body-4;i++){ unsigned v=rp1usb_desc_byte(i); body[bl++]=' '; body[bl++]=hx[v>>4]; body[bl++]=hx[v&15]; }
+            body[bl]=0;
+            bl = s_put(body, bl, "\n");
+        } else if (str_starts(rpath, "/usb/probe")) {
             extern void rp1usb_probe(void);
             rp1usb_probe();
             bl = s_put(body, bl, "probe done: hciver="); bl = s_putdec(body, bl, rp1usb_ver(0));
@@ -1813,19 +1907,6 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, " speed="); bl = s_putdec(body, bl, speed);
             bl = s_put(body, bl, " bsr="); bl = s_putdec(body, bl, bsr);
             bl = s_put(body, bl, " -> cc="); bl = s_putdec(body, bl, rp1usb_addr_cc());
-            bl = s_put(body, bl, "\n");
-        } else if (str_starts(rpath, "/usb/desc")) {
-            extern int rp1usb_get_descriptor(int,int,int,int);
-            extern unsigned int rp1usb_desc_cc(void); extern unsigned int rp1usb_desc_len(void);
-            extern unsigned int rp1usb_desc_byte(int);
-            int slot=q_int(req,"slot",1), type=q_int(req,"type",1);
-            int index=q_int(req,"index",0), len=q_int(req,"len",18);
-            rp1usb_get_descriptor(slot, type, index, len);
-            bl = s_put(body, bl, "desc cc="); bl = s_putdec(body, bl, rp1usb_desc_cc());
-            bl = s_put(body, bl, " len=");    bl = s_putdec(body, bl, rp1usb_desc_len());
-            bl = s_put(body, bl, " bytes:");
-            int dl = (int)rp1usb_desc_len();
-            for (int i=0;i<dl && i<64 && bl<700;i++){ bl=s_put(body,bl," "); bl=s_putdec(body,bl,rp1usb_desc_byte(i)); }
             bl = s_put(body, bl, "\n");
         } else if (str_starts(rpath, "/usb/hidsetup")) {
             extern int rp1usb_hid_setup(int,int,int,int);

@@ -139,7 +139,7 @@ void rp1usb_probe(void)
 struct trb { unsigned int p0, p1, status, control; };
 
 #define CMD_RING_N   64
-#define EVT_RING_N   64
+#define EVT_RING_N   1024   /* was 64: an isochronous camera can raise 80 events per 10 ms tick */
 #define NSCRATCH_MAX 64
 
 /* Per-controller ring memory + saved register/cursor state.  We run BOTH RP1
@@ -437,7 +437,7 @@ unsigned int rp1usb_addr_cc(void){ return g_addr_cc; }
 int          rp1usb_ctx_stride(void){ return g_ctx_stride; }
 
 /* ---------- Phase 3d: EP0 control transfer (GET_DESCRIPTOR) ---------- */
-static unsigned char g_xfer_buf[256] __attribute__((aligned(64)));
+static unsigned char g_xfer_buf[2048] __attribute__((aligned(64)));   /* UVC の構成記述子は 1 KB を超える */
 static unsigned int  g_desc_cc, g_desc_len;
 
 static void ep0_push(unsigned int p0, unsigned int p1, unsigned int status, unsigned int control)
@@ -479,7 +479,7 @@ int rp1usb_get_descriptor(int slot, int dtype, int dindex, int len)
 }
 unsigned int rp1usb_desc_cc(void)    { return g_desc_cc; }
 unsigned int rp1usb_desc_len(void)   { return g_desc_len; }
-unsigned int rp1usb_desc_byte(int i) { return (i>=0&&i<256)?g_xfer_buf[i]:0; }
+unsigned int rp1usb_desc_byte(int i) { return (i>=0&&i<(int)sizeof g_xfer_buf)?g_xfer_buf[i]:0; }
 
 /* HID class GET_REPORT(Input) on EP0 -> latest mouse report into g_mouse_buf.
  * Bypasses the (currently silent) interrupt endpoint entirely; control transfers
@@ -707,6 +707,81 @@ int rp1usb_mouse_fullsetup(int port)
     return rp1usb_hid_autosetup(slot, port, speed);
 }
 int rp1usb_full_slot(void) { return g_full_slot; }
+
+/* ---- UVC カメラ（USB Video Class）の下見 -----------------------------------------
+ * 両コントローラの全ポートを当たり、映像クラス（IAD 0xEF か VS インタフェース）を持つ装置の
+ * 構成記述子を全部読んで、VC/VS インタフェース・形式（YUYV/MJPEG）・フレーム寸法・VS の
+ * 代替設定ごとのエンドポイント（等時/バルク、最大パケット、間隔）を文章で出す。
+ * ここで分かる「等時かバルクか」「パケットの大きさ」がストリーミング側の設計を決める。 */
+static unsigned char g_camctx[33*64] __attribute__((aligned(64)));
+static int g_cam_active; static int g_cam_ctrl=-1, g_cam_slot=-1, g_cam_dci=3;
+static int g_cam_port=-1, g_cam_speed=0;
+static int g_cam_vs_if=1, g_cam_ep=0x81, g_cam_nalt=0;
+static struct { int alt, mps, mult; } g_cam_alt[12];   /* VS の代替設定と等時パケット長 */
+static int cp_put(char *o,int p,int cap,const char *s){ while(*s&&p<cap-1) o[p++]=*s++; o[p]=0; return p; }
+static int cp_num(char *o,int p,int cap,long v){ char nb[24]; int k=0; if(v<0){p=cp_put(o,p,cap,"-");v=-v;} if(!v)nb[k++]='0'; while(v){nb[k++]=(char)('0'+v%10);v/=10;} while(k){ if(p<cap-1)o[p++]=nb[--k]; else k=0; } o[p]=0; return p; }
+static int cp_hex(char *o,int p,int cap,unsigned v,int digits){ const char *hx="0123456789abcdef"; for(int i=digits-1;i>=0;i--) if(p<cap-1) o[p++]=hx[(v>>(i*4))&15]; o[p]=0; return p; }
+int rp1usb_cam_probe(char *out, int cap)
+{
+    extern int rp1usb_address_device(int,int,int,int);
+    int p=0; int found=0;
+    for (int c=0;c<2;c++) {
+        rp1usb_select_ctrl(c);
+        if (!g_cm[c].inited) { if (rp1usb_xhci_init()!=0) { p=cp_put(out,p,cap,"ctrl "); p=cp_num(out,p,cap,c); p=cp_put(out,p,cap,": xhci init failed\n"); continue; } }
+        for (int port=1; port<=3; port++) {
+            int slot=rp1usb_enum_slot(port);
+            if (slot<0) continue;
+            int speed=(int)((g_enum_portsc>>10)&0xf);
+            g_addr_ctx=g_camctx;
+            if (rp1usb_address_device(slot,port,speed,0)!=0) { g_addr_ctx=g_dev_ctx; continue; }
+            if (rp1usb_get_descriptor(slot,1,0,18)<18) { g_addr_ctx=g_dev_ctx; continue; }
+            unsigned vid=g_xfer_buf[8]|(g_xfer_buf[9]<<8), pid=g_xfer_buf[10]|(g_xfer_buf[11]<<8), cls=g_xfer_buf[4];
+            p=cp_put(out,p,cap,"ctrl "); p=cp_num(out,p,cap,c); p=cp_put(out,p,cap," port "); p=cp_num(out,p,cap,port);
+            p=cp_put(out,p,cap," speed "); p=cp_num(out,p,cap,speed); p=cp_put(out,p,cap," vid:pid ");
+            p=cp_hex(out,p,cap,vid,4); p=cp_put(out,p,cap,":"); p=cp_hex(out,p,cap,pid,4); p=cp_put(out,p,cap," class "); p=cp_hex(out,p,cap,cls,2);
+            if (rp1usb_get_descriptor(slot,2,0,9)<9) { p=cp_put(out,p,cap," (no config)\n"); g_addr_ctx=g_dev_ctx; continue; }
+            int wtot=g_xfer_buf[2]|(g_xfer_buf[3]<<8); if (wtot>(int)sizeof g_xfer_buf) wtot=sizeof g_xfer_buf;
+            int got=rp1usb_get_descriptor(slot,2,0,wtot);
+            p=cp_put(out,p,cap," config "); p=cp_num(out,p,cap,wtot); p=cp_put(out,p,cap," bytes (got "); p=cp_num(out,p,cap,got); p=cp_put(out,p,cap,")\n");
+            int pos=0, cur_class=-1, cur_sub=-1, cur_if=-1, cur_alt=-1, isvideo=0;
+            g_cam_nalt=0;
+            while (pos+2<=got) {
+                int bl=g_xfer_buf[pos], bt=g_xfer_buf[pos+1]; if (bl<2) break;
+                const unsigned char *d=g_xfer_buf+pos;
+                if (bt==4) { cur_if=d[2]; cur_alt=d[3]; cur_class=d[5]; cur_sub=d[6];
+                    if (cur_class==0x0E) { isvideo=1;
+                        p=cp_put(out,p,cap,"  if "); p=cp_num(out,p,cap,cur_if); p=cp_put(out,p,cap," alt "); p=cp_num(out,p,cap,cur_alt);
+                        p=cp_put(out,p,cap,cur_sub==1?" VideoControl":cur_sub==2?" VideoStreaming":" video?"); p=cp_put(out,p,cap," eps="); p=cp_num(out,p,cap,d[4]); p=cp_put(out,p,cap,"\n"); } }
+                else if (bt==0x24 && cur_class==0x0E && cur_sub==2) {
+                    int st=d[2];
+                    if (st==1) { p=cp_put(out,p,cap,"    input header: formats="); p=cp_num(out,p,cap,d[3]); p=cp_put(out,p,cap," ep=0x"); p=cp_hex(out,p,cap,d[6],2); p=cp_put(out,p,cap,"\n"); }
+                    else if (st==4||st==6) { p=cp_put(out,p,cap,st==4?"    format UNCOMPRESSED #":"    format MJPEG #"); p=cp_num(out,p,cap,d[3]); p=cp_put(out,p,cap," frames="); p=cp_num(out,p,cap,d[4]);
+                        if (st==4) { p=cp_put(out,p,cap," fourcc "); for(int i=5;i<9;i++){ char ch[2]={(char)(d[i]>=32&&d[i]<127?d[i]:'.'),0}; p=cp_put(out,p,cap,ch);} p=cp_put(out,p,cap," bpp="); p=cp_num(out,p,cap,d[21]); }
+                        p=cp_put(out,p,cap,"\n"); }
+                    else if (st==5||st==7) { p=cp_put(out,p,cap,"      frame #"); p=cp_num(out,p,cap,d[3]); p=cp_put(out,p,cap," "); p=cp_num(out,p,cap,d[5]|(d[6]<<8)); p=cp_put(out,p,cap,"x"); p=cp_num(out,p,cap,d[7]|(d[8]<<8));
+                        unsigned bufsz=d[17]|(d[18]<<8)|(d[19]<<16)|((unsigned)d[20]<<24); unsigned dint=d[21]|(d[22]<<8)|(d[23]<<16)|((unsigned)d[24]<<24);
+                        p=cp_put(out,p,cap," maxbuf="); p=cp_num(out,p,cap,(long)bufsz); p=cp_put(out,p,cap," default_fps="); p=cp_num(out,p,cap,dint?10000000L/dint:0);
+                        p=cp_put(out,p,cap," ivtype="); p=cp_num(out,p,cap,d[25]); p=cp_put(out,p,cap,"\n"); }
+                }
+                else if (bt==5 && cur_class==0x0E) { int attr=d[3]&3; unsigned mps=d[4]|(d[5]<<8);
+                    if (cur_sub==2 && attr==1 && g_cam_nalt<12) { g_cam_vs_if=cur_if; g_cam_ep=d[2]; g_cam_alt[g_cam_nalt].alt=cur_alt; g_cam_alt[g_cam_nalt].mps=(int)(mps&0x7ff); g_cam_alt[g_cam_nalt].mult=(int)(((mps>>11)&3)+1); g_cam_nalt++; }
+                    p=cp_put(out,p,cap,"    ep 0x"); p=cp_hex(out,p,cap,d[2],2); p=cp_put(out,p,cap,attr==1?" ISOC":attr==2?" BULK":attr==3?" INTR":" CTRL");
+                    p=cp_put(out,p,cap," mps="); p=cp_num(out,p,cap,mps&0x7ff); p=cp_put(out,p,cap," x"); p=cp_num(out,p,cap,((mps>>11)&3)+1); p=cp_put(out,p,cap," interval="); p=cp_num(out,p,cap,d[6]); p=cp_put(out,p,cap,"\n"); }
+                pos+=bl;
+            }
+            if (isvideo) { found++; g_cam_ctrl=c; g_cam_port=port; g_cam_slot=slot; g_cam_speed=speed; }
+            g_addr_ctx=g_dev_ctx;
+            if (p>cap-200) break;
+            /* EP0 の転送環は装置間で共有なので、映像装置を見つけたら他を当たらない
+               （別の装置をアドレスするとカメラの EP0 の状態が壊れ、以後の制御転送が時間切れになる。実測） */
+            if (found) break;
+        }
+        if (found) break;
+    }
+    p=cp_put(out,p,cap,"video devices: "); p=cp_num(out,p,cap,found); p=cp_put(out,p,cap,"\n");
+    return found;
+}
+int rp1usb_cam_slot(void){ return g_cam_slot; } int rp1usb_cam_ctrl(void){ return g_cam_ctrl; } int rp1usb_cam_port(void){ return g_cam_port; }
 int rp1usb_full_speed(void){ return g_full_speed; }
 
 /* One-shot boot auto-bind: bring up BOTH RP1 controllers and scan every port for
@@ -929,9 +1004,10 @@ static int g_poll_mode;     /* 1 = poll mouse via EP0 GET_REPORT instead of EP1 
 void rp1usb_set_poll_mode(int on){ g_poll_mode = on?1:0; }
 int  rp1usb_poll_mode_get(void) { return g_poll_mode; }
 
+static void cam_handle_event(const struct trb *ev);
 void rp1usb_mouse_pump(void)
 {
-    if (!g_mouse_active && !g_kbd_active) return;
+    if (!g_mouse_active && !g_kbd_active && !g_cam_active) return;
     if (g_kbd_active) kbd_repeat_tick();        /* auto-repeat held keys */
     if (g_mouse_active && g_poll_mode) {       /* control-pipe polling path */
         extern int rp1usb_get_report(int,int);
@@ -951,9 +1027,9 @@ void rp1usb_mouse_pump(void)
      * may live on different RP1 controllers, each with its own event ring). */
     for (int ci=0; ci<2; ci++) {
         if (!g_cm[ci].inited) continue;
-        if (!((g_mouse_active && g_mouse_ctrl==ci) || (g_kbd_active && g_kbd_ctrl==ci))) continue;
+        if (!((g_mouse_active && g_mouse_ctrl==ci) || (g_kbd_active && g_kbd_ctrl==ci) || (g_cam_active && g_cam_ctrl==ci))) continue;
         xhci_switch(ci);
-        for (int guard=0; guard<32; guard++) {
+        for (int guard=0; guard<((g_cam_active && g_cam_ctrl==ci)?1000:32); guard++) {
             struct trb *e=&g_evt_ring[g_evt_idx];
             __asm__ volatile ("dsb sy":::"memory");
             if ((e->control & 1u) != (unsigned)g_evt_cycle) break;   /* no more events */
@@ -976,6 +1052,8 @@ void rp1usb_mouse_pump(void)
                 ep1_queue_trb();
                 R32(g_db, g_mouse_slot*4) = (unsigned)g_mouse_dci;   /* re-ring mouse EP doorbell */
                 __asm__ volatile ("dsb sy":::"memory");
+            } else if (g_cam_active && g_cam_ctrl==ci && eslot==g_cam_slot && edci==g_cam_dci) {
+                cam_handle_event(&ev);
             } else if (g_kbd_active && g_kbd_ctrl==ci && eslot==g_kbd_slot && edci==g_kbd_dci) {
                 g_kbd_reports++;
                 kbd_decode(g_kbd_buf);
@@ -1298,5 +1376,205 @@ unsigned int rp1usb_msd_usbsts(void)     { return R32(g_oper, OP_USBSTS); }
 unsigned int rp1usb_msd_portsc2(void)    { return R32(g_oper, 0x400 + 0x10); }  /* c0 port2 */
 unsigned int rp1usb_msd_data_byte(int i){ return (i>=0&&i<(int)sizeof g_msd_data)?g_msd_data[i]:0; }
 void         rp1usb_msd_set_byte(int i, unsigned int v){ if(i>=0&&i<(int)sizeof g_msd_data) g_msd_data[i]=(unsigned char)v; }
+
+/* ================= UVC ストリーミング（等時 IN、非圧縮 YUY2） =========================
+ * 流れ: SET_CONFIGURATION → VS Probe(SET_CUR/GET_CUR) → Commit → SET_INTERFACE(代替設定)
+ *       → xHCI Configure Endpoint（等時 IN, DCI=3）→ TRB 環を満たして doorbell。
+ * 受け口: 100 Hz の pump が転送イベントを拾い、UVC ペイロードヘッダ（[0]=長さ, [1]=FID/EOF/ERR）
+ *         で組み立て、EOF で「最新フレーム」を差し替える。TRB は消費されるたび同じ位置に積み直す。
+ * 高速の等時は 125 µs ごとに 1 パケット。空でもヘッダだけの 12 バイトが来るので毎 µ フレームに
+ * イベントが立つ。イベント環は 1024（10 ms で 80 個）。 */
+#define CAM_NTRB   512
+#define CAM_PKTMAX 3072
+#define CAM_FRMAX  (640*480*2)
+static struct trb    g_cam_ring[CAM_NTRB]            __attribute__((aligned(64)));
+static unsigned char g_cam_pkt[CAM_NTRB][CAM_PKTMAX] __attribute__((aligned(64)));
+static unsigned char g_cam_frame[2][CAM_FRMAX]       __attribute__((aligned(64)));
+static int g_cam_idx, g_cam_cycle=1, g_cam_pktsz=800, g_cam_altsel=-1;
+static int g_cam_w, g_cam_h, g_cam_fps, g_cam_expect, g_cam_wr, g_cam_ready=-1, g_cam_ready_len, g_cam_fill, g_cam_fid=-1;
+static unsigned long g_cam_frames, g_cam_pkts, g_cam_bytes, g_cam_errs, g_cam_short, g_cam_bad, g_cam_overrun, g_cam_events;
+static unsigned int g_cam_lastcc, g_cam_cfg_cc, g_cam_probe_cc, g_cam_commit_cc, g_cam_setif_cc, g_cam_setcfg_cc;
+static unsigned int g_cam_maxpayload, g_cam_maxframe, g_cam_ivl;
+
+/* EP0 の汎用制御転送（データ OUT / IN）。既存の get_descriptor と同じ TRB 列。 */
+static int control_out(int slot, unsigned bmReqType, unsigned bReq, unsigned wValue, unsigned wIndex, const unsigned char *data, int len)
+{
+    for (int i=0;i<len && i<(int)sizeof g_xfer_buf;i++) g_xfer_buf[i]=data[i];
+    ep0_push(bmReqType | (bReq<<8) | (wValue<<16), wIndex | ((unsigned)len<<16), 8, (2u<<10)|(1u<<6)|(2u<<16));   /* setup, TRT=OUT */
+    if (len>0) { unsigned long ba=XDA(g_xfer_buf); ep0_push((unsigned)(ba&0xffffffff),(unsigned)(ba>>32),(unsigned)len,(3u<<10)|(0u<<16)); }
+    ep0_push(0,0,0,(4u<<10)|(1u<<16)|(1u<<5));      /* status IN + IOC */
+    R32(g_db, slot*4)=1; __asm__ volatile("dsb sy":::"memory");
+    struct trb ev=event_wait(32);
+    return ((ev.status>>24)&0xff);
+}
+static int control_in(int slot, unsigned bmReqType, unsigned bReq, unsigned wValue, unsigned wIndex, int len)
+{
+    for (int i=0;i<len && i<(int)sizeof g_xfer_buf;i++) g_xfer_buf[i]=0;
+    ep0_push(bmReqType | (bReq<<8) | (wValue<<16), wIndex | ((unsigned)len<<16), 8, (2u<<10)|(1u<<6)|(3u<<16));   /* setup, TRT=IN */
+    unsigned long ba=XDA(g_xfer_buf); ep0_push((unsigned)(ba&0xffffffff),(unsigned)(ba>>32),(unsigned)len,(3u<<10)|(1u<<16));
+    ep0_push(0,0,0,(4u<<10)|(1u<<5));               /* status OUT + IOC */
+    R32(g_db, slot*4)=1; __asm__ volatile("dsb sy":::"memory");
+    struct trb ev=event_wait(32);
+    g_cam_lastcc=(ev.status>>24)&0xff;
+    return (g_cam_lastcc==1||g_cam_lastcc==13) ? (len-(int)(ev.status&0xffffff)) : -1;
+}
+
+static void cam_queue_trb(void)
+{
+    struct trb *t=&g_cam_ring[g_cam_idx];
+    unsigned long ba=XDA(g_cam_pkt[g_cam_idx]);
+    t->p0=(unsigned)(ba&0xffffffff); t->p1=(unsigned)(ba>>32);
+    t->status=(unsigned)g_cam_pktsz;                                /* TD size 0, length = one packet */
+    /* Isoch TRB(5), IOC, ISP, SIA（次に空く µ フレームで送る）, TBC/TLBPC=0（1 パケット） */
+    t->control=(5u<<10)|(1u<<5)|(1u<<2)|(1u<<31)|(g_cam_cycle&1u);
+    __asm__ volatile("dsb sy":::"memory");
+    g_cam_idx++;
+    if (g_cam_idx==CAM_NTRB-1) { g_cam_ring[CAM_NTRB-1].control=(g_cam_ring[CAM_NTRB-1].control&~1u)|(g_cam_cycle&1u); __asm__ volatile("dsb sy":::"memory"); g_cam_idx=0; g_cam_cycle^=1; }
+}
+
+static void cam_publish(void)
+{
+    g_cam_ready=g_cam_wr; g_cam_ready_len=g_cam_fill; g_cam_wr^=1; g_cam_fill=0; g_cam_frames++;
+}
+static void cam_handle_event(const struct trb *ev)
+{
+    g_cam_events++;
+    unsigned cc=(ev->status>>24)&0xff;
+    unsigned long trbaddr=((unsigned long)ev->p1<<32)|ev->p0;
+    long idx=(long)((trbaddr-XDA(g_cam_ring))/16);
+    if (idx<0||idx>=CAM_NTRB) { g_cam_bad++; if (cc==14||cc==15) g_cam_overrun++; g_cam_lastcc=cc; return; }
+    int got=g_cam_pktsz-(int)(ev->status&0xffffff);
+    g_cam_pkts++;
+    if (cc!=1&&cc!=13) { g_cam_errs++; g_cam_lastcc=cc; }
+    else if (got>=2) {
+        const unsigned char *b=g_cam_pkt[idx];
+        int hdr=b[0]; unsigned fl=b[1];
+        if (hdr>=2 && hdr<=got) {
+            if (fl&0x40) { g_cam_errs++; g_cam_fill=0; }
+            else {
+                int fid=(int)(fl&1);
+                if (fid!=g_cam_fid) { if (g_cam_fill>0) cam_publish(); g_cam_fid=fid; g_cam_fill=0; }
+                int n=got-hdr;
+                if (n>0) { if (g_cam_fill+n<=CAM_FRMAX) { for (int i=0;i<n;i++) g_cam_frame[g_cam_wr][g_cam_fill+i]=b[hdr+i]; g_cam_fill+=n; g_cam_bytes+=(unsigned long)n; } else g_cam_short++; }
+                if (fl&2) { if (g_cam_fill>0) cam_publish(); }
+            }
+        } else g_cam_bad++;
+    } else if (got<0) g_cam_bad++;
+    cam_queue_trb();                                                /* 消費した分を積み直す */
+    R32(g_db, g_cam_slot*4)=(unsigned)g_cam_dci; __asm__ volatile("dsb sy":::"memory");
+}
+
+/* frame_index: 記述子の番号（1=640x480 2=352x288 3=320x240 4=176x144 5=160x120）、fps: 希望。 */
+int rp1usb_cam_start(int frame_index, int fps, char *out, int cap)
+{
+    extern int rp1usb_address_device(int,int,int,int);
+    int p=0;
+    if (g_cam_ctrl<0 || g_cam_nalt==0) { static char tmp[4000]; rp1usb_cam_probe(tmp,(int)sizeof tmp); }
+    if (g_cam_ctrl<0) { cp_put(out,0,cap,"cam: no video device\n"); return -1; }
+    static const int W[6]={0,640,352,320,176,160}, H[6]={0,480,288,240,144,120};
+    if (frame_index<1||frame_index>5) frame_index=3;
+    if (fps<1) fps=10;
+    g_cam_active=0;
+    /* 配信のたびにカメラをアドレスし直す: EP0 の環と装置文脈を新しくして、間に他の装置が
+       挟まっていても制御転送が通る状態から始める。 */
+    rp1usb_select_ctrl(g_cam_ctrl);
+    { int sl=rp1usb_enum_slot(g_cam_port); if (sl<0) { cp_put(out,0,cap,"cam: enum failed\n"); return -1; }
+      g_cam_speed=(int)((g_enum_portsc>>10)&0xf); g_addr_ctx=g_camctx;
+      int ar=rp1usb_address_device(sl,g_cam_port,g_cam_speed,0); g_addr_ctx=g_dev_ctx;
+      if (ar!=0) { cp_put(out,0,cap,"cam: address failed\n"); return -1; }
+      g_cam_slot=sl; }
+    int slot=g_cam_slot;
+    g_cam_setcfg_cc=(control_nodata(slot,0x00,9,1,0)==0)?1:0;                      /* SET_CONFIGURATION(1) */
+    /* VS Probe/Commit: 26 バイト。bmHint=1（間隔固定）, 形式 1, フレーム n, 間隔 100ns 単位 */
+    unsigned char pc[26]; for (int i=0;i<26;i++) pc[i]=0;
+    unsigned ivl=10000000u/(unsigned)fps;
+    pc[0]=1; pc[2]=1; pc[3]=(unsigned char)frame_index; pc[4]=(unsigned char)ivl; pc[5]=(unsigned char)(ivl>>8); pc[6]=(unsigned char)(ivl>>16); pc[7]=(unsigned char)(ivl>>24);
+    g_cam_probe_cc=(unsigned)control_out(slot,0x21,0x01,0x0100,(unsigned)g_cam_vs_if,pc,26);       /* SET_CUR(PROBE) */
+    int got=control_in(slot,0xA1,0x81,0x0100,(unsigned)g_cam_vs_if,26);                            /* GET_CUR(PROBE) */
+    if (got>=26) { for (int i=0;i<26;i++) pc[i]=g_xfer_buf[i]; }
+    g_cam_ivl=pc[4]|(pc[5]<<8)|(pc[6]<<16)|((unsigned)pc[7]<<24);
+    g_cam_maxframe=pc[18]|(pc[19]<<8)|(pc[20]<<16)|((unsigned)pc[21]<<24);
+    g_cam_maxpayload=pc[22]|(pc[23]<<8)|(pc[24]<<16)|((unsigned)pc[25]<<24);
+    g_cam_commit_cc=(unsigned)control_out(slot,0x21,0x01,0x0200,(unsigned)g_cam_vs_if,pc,26);      /* SET_CUR(COMMIT) */
+    /* 代替設定: 1 µ フレームの容量が dwMaxPayloadTransferSize 以上の最小のもの */
+    int sel=-1;
+    for (int i=0;i<g_cam_nalt;i++) { int capb=g_cam_alt[i].mps*g_cam_alt[i].mult; if (capb<=CAM_PKTMAX && (unsigned)capb>=g_cam_maxpayload) { if (sel<0 || capb<g_cam_alt[sel].mps*g_cam_alt[sel].mult) sel=i; } }
+    if (sel<0) { for (int i=0;i<g_cam_nalt;i++) if (g_cam_alt[i].mps*g_cam_alt[i].mult<=CAM_PKTMAX && (sel<0 || g_cam_alt[i].mps*g_cam_alt[i].mult>g_cam_alt[sel].mps*g_cam_alt[sel].mult)) sel=i; }
+    if (sel<0) { cp_put(out,0,cap,"cam: no usable alt setting\n"); return -2; }
+    g_cam_altsel=g_cam_alt[sel].alt; int mps=g_cam_alt[sel].mps, mult=g_cam_alt[sel].mult;
+    g_cam_pktsz=mps*mult;
+    g_cam_setif_cc=(control_nodata(slot,0x01,11,(unsigned)g_cam_altsel,(unsigned)g_cam_vs_if)==0)?1:0;  /* SET_INTERFACE(alt) */
+    /* xHCI: 等時 IN エンドポイント（DCI = ep*2+1） */
+    g_cam_dci=(g_cam_ep&0xf)*2+1;
+    for (int i=0;i<CAM_NTRB;i++){ g_cam_ring[i].p0=0;g_cam_ring[i].p1=0;g_cam_ring[i].status=0;g_cam_ring[i].control=0; }
+    g_cam_ring[CAM_NTRB-1].p0=(unsigned)(XDA(g_cam_ring)&0xffffffff); g_cam_ring[CAM_NTRB-1].p1=(unsigned)(XDA(g_cam_ring)>>32);
+    g_cam_ring[CAM_NTRB-1].control=(6u<<10)|(1u<<1)|1u;                    /* link, toggle cycle */
+    g_cam_idx=0; g_cam_cycle=1;
+    for (unsigned i=0;i<sizeof g_input_ctx;i++) g_input_ctx[i]=0;
+    unsigned int *icc=ctx_at(g_input_ctx,0); icc[1]=(1u<<0)|(1u<<g_cam_dci);
+    unsigned int *sc=ctx_at(g_input_ctx,1);
+    sc[0]=((unsigned)g_cam_dci<<27)|((unsigned)g_cam_speed<<20);
+    sc[1]=((unsigned)g_cam_port&0xff)<<16;
+    unsigned int *ep=ctx_at(g_input_ctx,g_cam_dci+1);
+    ep[0]=(0u<<16)|(0u<<8);                                                 /* Interval 0 = 125us（bInterval 1）, Mult 0 */
+    ep[1]=(5u<<3)|(0u<<1)|((unsigned)(mult-1)<<8)|((unsigned)mps<<16);      /* Isoch IN, CErr 0, MaxBurst, MPS */
+    unsigned long trd=XDA(g_cam_ring)|1u; ep[2]=(unsigned)(trd&0xffffffff); ep[3]=(unsigned)(trd>>32);
+    ep[4]=((unsigned)g_cam_pktsz<<16)|((unsigned)g_cam_pktsz);              /* Max ESIT payload, Avg TRB length */
+    g_dcbaa[slot]=XDA(g_camctx);
+    __asm__ volatile("dsb sy":::"memory");
+    unsigned long ic=XDA(g_input_ctx);
+    cmd_submit((unsigned)(ic&0xffffffff),(unsigned)(ic>>32),0,(12u<<10)|((unsigned)slot<<24));   /* Configure Endpoint */
+    struct trb ev=event_wait(33);
+    g_cam_cfg_cc=(ev.status>>24)&0xff;
+    g_cam_w=W[frame_index]; g_cam_h=H[frame_index]; g_cam_fps=fps; g_cam_expect=g_cam_w*g_cam_h*2;
+    g_cam_wr=0; g_cam_ready=-1; g_cam_fill=0; g_cam_fid=-1;
+    g_cam_frames=g_cam_pkts=g_cam_bytes=g_cam_errs=g_cam_short=g_cam_bad=g_cam_overrun=g_cam_events=0;
+    if (g_cam_cfg_cc==1) {
+        for (int i=0;i<CAM_NTRB-1;i++) cam_queue_trb();                     /* 環を満たす（link の手前まで） */
+        R32(g_db, slot*4)=(unsigned)g_cam_dci; __asm__ volatile("dsb sy":::"memory");
+        g_cam_active=1;
+    }
+    p=cp_put(out,p,cap,"cam start: slot "); p=cp_num(out,p,cap,slot); p=cp_put(out,p,cap," ctrl "); p=cp_num(out,p,cap,g_cam_ctrl);
+    p=cp_put(out,p,cap,"\n  setcfg="); p=cp_num(out,p,cap,g_cam_setcfg_cc); p=cp_put(out,p,cap," probe_cc="); p=cp_num(out,p,cap,g_cam_probe_cc);
+    p=cp_put(out,p,cap," getcur="); p=cp_num(out,p,cap,got); p=cp_put(out,p,cap," commit_cc="); p=cp_num(out,p,cap,g_cam_commit_cc);
+    p=cp_put(out,p,cap,"\n  negotiated: format "); p=cp_num(out,p,cap,pc[2]); p=cp_put(out,p,cap," frame "); p=cp_num(out,p,cap,pc[3]);
+    p=cp_put(out,p,cap," interval "); p=cp_num(out,p,cap,(long)g_cam_ivl); p=cp_put(out,p,cap," ("); p=cp_num(out,p,cap,g_cam_ivl?10000000L/(long)g_cam_ivl:0); p=cp_put(out,p,cap," fps) maxframe=");
+    p=cp_num(out,p,cap,(long)g_cam_maxframe); p=cp_put(out,p,cap," maxpayload="); p=cp_num(out,p,cap,(long)g_cam_maxpayload);
+    p=cp_put(out,p,cap,"\n  alt "); p=cp_num(out,p,cap,g_cam_altsel); p=cp_put(out,p,cap," pkt "); p=cp_num(out,p,cap,g_cam_pktsz); p=cp_put(out,p,cap," setif_cc="); p=cp_num(out,p,cap,g_cam_setif_cc);
+    p=cp_put(out,p,cap," cfgep_cc="); p=cp_num(out,p,cap,g_cam_cfg_cc); p=cp_put(out,p,cap," dci="); p=cp_num(out,p,cap,g_cam_dci);
+    p=cp_put(out,p,cap," -> "); p=cp_put(out,p,cap,g_cam_active?"STREAMING":"not started"); p=cp_put(out,p,cap,"\n");
+    return g_cam_active?0:-3;
+}
+int rp1usb_cam_stop(void)
+{
+    if (!g_cam_active) return 0;
+    g_cam_active=0;
+    xhci_switch(g_cam_ctrl);
+    (void)control_nodata(g_cam_slot,0x01,11,0,(unsigned)g_cam_vs_if);      /* alt 0 = 帯域を返す */
+    return 0;
+}
+int rp1usb_cam_stat(char *out, int cap)
+{
+    int p=0;
+    p=cp_put(out,p,cap,g_cam_active?"cam streaming ":"cam idle "); p=cp_num(out,p,cap,g_cam_w); p=cp_put(out,p,cap,"x"); p=cp_num(out,p,cap,g_cam_h);
+    p=cp_put(out,p,cap," alt "); p=cp_num(out,p,cap,g_cam_altsel); p=cp_put(out,p,cap," pkt "); p=cp_num(out,p,cap,g_cam_pktsz);
+    p=cp_put(out,p,cap,"\nframes="); p=cp_num(out,p,cap,(long)g_cam_frames); p=cp_put(out,p,cap," pkts="); p=cp_num(out,p,cap,(long)g_cam_pkts);
+    p=cp_put(out,p,cap," events="); p=cp_num(out,p,cap,(long)g_cam_events); p=cp_put(out,p,cap," bytes="); p=cp_num(out,p,cap,(long)g_cam_bytes);
+    p=cp_put(out,p,cap," errs="); p=cp_num(out,p,cap,(long)g_cam_errs); p=cp_put(out,p,cap," bad="); p=cp_num(out,p,cap,(long)g_cam_bad);
+    p=cp_put(out,p,cap," overrun="); p=cp_num(out,p,cap,(long)g_cam_overrun); p=cp_put(out,p,cap," short="); p=cp_num(out,p,cap,(long)g_cam_short);
+    p=cp_put(out,p,cap," lastcc="); p=cp_num(out,p,cap,(long)g_cam_lastcc);
+    p=cp_put(out,p,cap,"\nready="); p=cp_num(out,p,cap,g_cam_ready); p=cp_put(out,p,cap," ready_len="); p=cp_num(out,p,cap,g_cam_ready_len);
+    p=cp_put(out,p,cap," fill="); p=cp_num(out,p,cap,g_cam_fill); p=cp_put(out,p,cap," expect="); p=cp_num(out,p,cap,g_cam_expect);
+    p=cp_put(out,p,cap," ring_idx="); p=cp_num(out,p,cap,g_cam_idx);
+    if (g_cam_active) { unsigned st=ctx_at(g_camctx,g_cam_dci)[0]&7; p=cp_put(out,p,cap," epstate="); p=cp_num(out,p,cap,(long)st); }
+    p=cp_put(out,p,cap,"\n");
+    return p;
+}
+int rp1usb_cam_active(void){ return g_cam_active; }
+int rp1usb_cam_width(void){ return g_cam_w; }
+int rp1usb_cam_height(void){ return g_cam_h; }
+/* 最新フレーム（YUY2）への参照。無ければ 0。 */
+const unsigned char *rp1usb_cam_frame(int *len){ if (g_cam_ready<0) { *len=0; return 0; } *len=g_cam_ready_len; return g_cam_frame[g_cam_ready]; }
+unsigned long rp1usb_cam_frames(void){ return g_cam_frames; }
 
 #endif /* RP1_ETH_BASE */
