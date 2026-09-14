@@ -85,6 +85,11 @@ int arm_read(int id)
     return pos_to_angle(id, pos);
 }
 
+/* 基板のマイコンをリセット（0x05）。サーボ側との通信で固まると、書きは ACK されるのに
+   読みが全部時間切れになる（2026-09-14 実測）。その状態を read が 3 回続けて見たら自動でこれを打つ。 */
+static int g_arm_readfail = 0, g_arm_resets = 0;
+int arm_reset_board(void) { unsigned char m[2] = { 0x05, 1 }; g_arm_resets++; g_arm_readfail = 0; int r = rp1i2c_write(ARM_ADDR, m, 2); delay_ms(300); return r; }
+int arm_resets(void) { return g_arm_resets; }
 int arm_rgb(int r, int g, int b)  { unsigned char m[4] = { 0x02, (unsigned char)r, (unsigned char)g, (unsigned char)b }; return rp1i2c_write(ARM_ADDR, m, 4); }
 int arm_buzzer(int tenths)         { unsigned char m[2] = { 0x06, (unsigned char)tenths }; return rp1i2c_write(ARM_ADDR, m, 2); }
 int arm_torque(int on)             { unsigned char m[2] = { 0x1A, (unsigned char)(on ? 1 : 0) }; return rp1i2c_write(ARM_ADDR, m, 2); }
@@ -140,10 +145,14 @@ int arm_command(const char *args, char *out, int cap)
         p = a_put(out, p, cap, " ms="); p = a_putn(out, p, cap, ms); if (r) { p = a_put(out, p, cap, " rc="); p = a_putn(out, p, cap, r); } a_put(out, p, cap, "\n"); return r;
     }
     if (a_eq(cmd, "read")) {
+        int nfail = 0;
         p = a_put(out, p, cap, "angles");
-        for (int id = 1; id <= 6; id++) { int a = arm_read(id); p = a_put(out, p, cap, " "); if (a < 0) p = a_put(out, p, cap, "?"); else p = a_putn(out, p, cap, a); }
+        for (int id = 1; id <= 6; id++) { int a = arm_read(id); p = a_put(out, p, cap, " "); if (a < 0) { nfail++; p = a_put(out, p, cap, "?"); } else p = a_putn(out, p, cap, a); }
+        if (nfail == 6) { if (++g_arm_readfail >= 3) { arm_reset_board(); p = a_put(out, p, cap, " (board reset)"); } }
+        else g_arm_readfail = 0;
         a_put(out, p, cap, "\n"); return 0;
     }
+    if (a_eq(cmd, "reset"))  { int rc = arm_reset_board(); a_put(out, 0, cap, rc == 0 ? "ok reset (board restarting)\n" : "FAIL reset\n"); return rc; }
     if (a_eq(cmd, "rgb"))    { int r = a_int(&s, 0, &ok), g = a_int(&s, 0, &ok), b = a_int(&s, 0, &ok); int rc = arm_rgb(r, g, b); p = a_put(out, 0, cap, rc == 0 ? "ok rgb\n" : "FAIL rgb\n"); return rc; }
     if (a_eq(cmd, "buzz"))   { int n = a_int(&s, 3, &ok); int rc = arm_buzzer(n); a_put(out, 0, cap, rc == 0 ? "ok buzz\n" : "FAIL buzz\n"); return rc; }
     if (a_eq(cmd, "torque")) { int on = a_int(&s, 1, &ok); int rc = arm_torque(on); a_put(out, 0, cap, rc == 0 ? "ok torque\n" : "FAIL torque\n"); return rc; }
@@ -160,6 +169,21 @@ int arm_command(const char *args, char *out, int cap)
         a_put(out, p, cap, "\n"); return 0;
     }
     if (a_eq(cmd, "stat"))   { rp1i2c_stats(out, cap); return 0; }
-    a_put(out, 0, cap, "arm: pose a1..a6 [ms] | set id ang [ms] | read | rgb r g b | buzz n | torque 0|1 | ping id | ver | scan | stat\n");
+    a_put(out, 0, cap, "arm: pose a1..a6 [ms] | set id ang [ms] | read | rgb r g b | buzz n | torque 0|1 | ping id | ver | scan | stat | reset\n");
     return cmd[0] ? -4 : 0;
 }
+
+/* ---- 起動時に自動で載せるアクター（~/dofbot_pi5/aipl/dofbot_arm.aipl と同じ） ----
+   再起動のたびに POST /cc し直さなくても remote_call("…:9010","dofbot","cmd",…) が通るように。 */
+const char dofbot_arm_aipl[] =
+"class Arm {\n"
+"  var count = 0;\n"
+"  method cmd(s: string) : string !{io, mut} {\n"
+"    count = count + 1;\n"
+"    reply(arm_cmd(s));\n"
+"  }\n"
+"  method served() : int !{} { reply(count); }\n"
+"}\n"
+"var arm = new Arm();\n"
+"web_expose(\"/dofbot\", \"arm\");\n";
+int dofbot_arm_aipl_len(void) { int n = 0; while (dofbot_arm_aipl[n]) n++; return n; }

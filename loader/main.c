@@ -305,6 +305,21 @@ static void genet_rx_tick(void)
             s_usb_next = t + 300;                /* ~3 s between attempts */
         }
         rp1usb_mouse_pump();                                       /* USB mouse -> cursor */
+        /* DOFBOT の起動時仕事（USB の再結線が落ち着く 45 s 後に一度だけ）:
+         *   1) 腕のアクター "dofbot" を載せる —— 再起動後も remote_call が err にならない
+         *   2) USB カメラの配信を始める（320x240 @10fps）—— 窓が /cam/start を待たなくてよい
+         * どちらも HTTP の /cc・/cam/start と同じ文脈（net tick）で走る。 */
+        { static int s_dofbot_boot = 0;
+          if (!s_dofbot_boot && t >= 4500) {
+              s_dofbot_boot = 1;
+              extern const char dofbot_arm_aipl[]; extern int dofbot_arm_aipl_len(void);
+              extern int cc_actor_load(const char *, int, char *, int);
+              extern int rp1usb_cam_start(int, int, char *, int);
+              extern int rp1i2c_present(void);
+              static char bo[512];
+              if (rp1i2c_present()) { cc_actor_load(dofbot_arm_aipl, dofbot_arm_aipl_len(), bo, (int)sizeof bo); uart_puts("boot: dofbot actor loaded\n"); }
+              rp1usb_cam_start(3, 10, bo, (int)sizeof bo); uart_puts(bo);
+          } }
     }
 #endif
     g_rx_busy = 0;

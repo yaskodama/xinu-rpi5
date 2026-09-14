@@ -1500,6 +1500,13 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "}");
         }
         bl = s_put(body, bl, "]}\n");
+    } else if (str_starts(rpath, "/fan")) {
+        /* Pi 5 のファン: GET /fan → 状態、GET /fan?level=0..255 → 回す（250 で最速） */
+        extern int rp1fan_set(int); extern int rp1fan_status(char *, int);
+        ctype = "text/plain";
+        char lv[8];
+        if (q_param(req, "level", lv, sizeof lv)) { int r = rp1fan_set(q_int(req, "level", 0)); bl = s_put(body, bl, r == 0 ? "ok " : "FAIL(unclocked) "); }
+        bl += rp1fan_status(body + bl, (int)sizeof body - bl);
     } else if (str_starts(rpath, "/arm")) {
         /* DOFBOT アーム: GET /arm?cmd=pose+90+90+90+90+90+30+1000 ／ /arm?cmd=read ／ /arm/read ／ /arm/stat
            （system/arm.c の arm_command を呼ぶだけ。'+' と ',' は区切りとして扱う） */

@@ -798,6 +798,7 @@ static void autostart_scan_current_ctrl(void)
      * can't collide with the other controller's already-bound device. */
     unsigned char *ctx = (g_active_ctrl == 1) ? g_dev_ctx : g_kdevctx;
     for (int p = 1; p <= 3; p++) {
+        if (g_cam_active && g_active_ctrl == g_cam_ctrl && p == g_cam_port) continue;   /* 配信中のカメラは触らない */
         int slot = rp1usb_enum_slot(p);
         if (slot < 0) continue;
         int speed = (int)((g_enum_portsc >> 10) & 0xf);
