@@ -47,11 +47,14 @@ int arm_write1(int id, int angle, int ms)
     unsigned int pos = angle_to_pos(id, angle);
     unsigned char b[5] = { (unsigned char)(0x10 + id), (unsigned char)(pos >> 8), (unsigned char)pos,
                            (unsigned char)(ms >> 8), (unsigned char)ms };
-    return rp1i2c_write(ARM_ADDR, b, 5);
+    int r = rp1i2c_write(ARM_ADDR, b, 5);
+    if (r == -2) { delay_ms(5); r = rp1i2c_write(ARM_ADDR, b, 5); }
+    return r;
 }
 
-/* 6 軸一括。0 ok */
-int arm_write6(const int a[6], int ms)
+/* 6 軸一括。0 ok。I2C の時間切れ（-2）は一度だけやり直す —— 22 手中 1 手が -2 で抜けた実測
+   （2026-09-14、pose 180 35 65 0 90 135）。基板の STM8 がサーボと話している最中は応答が遅れる。 */
+static int arm_write6_once(const int a[6], int ms)
 {
     unsigned char t[3] = { 0x1E, (unsigned char)(ms >> 8), (unsigned char)ms };
     int r = rp1i2c_write(ARM_ADDR, t, 3);
@@ -59,6 +62,12 @@ int arm_write6(const int a[6], int ms)
     unsigned char b[13]; b[0] = 0x1D;
     for (int i = 0; i < 6; i++) { unsigned int p = angle_to_pos(i + 1, a[i]); b[1 + i * 2] = (unsigned char)(p >> 8); b[2 + i * 2] = (unsigned char)p; }
     return rp1i2c_write(ARM_ADDR, b, 13);
+}
+int arm_write6(const int a[6], int ms)
+{
+    int r = arm_write6_once(a, ms);
+    if (r == -2) { delay_ms(5); r = arm_write6_once(a, ms); }
+    return r;
 }
 
 /* 現在角。-1 = 読めない */
