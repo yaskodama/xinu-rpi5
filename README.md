@@ -311,6 +311,46 @@ is the 8-page report *Mac から DOFBOT（Raspberry Pi 5）を動かす制御経
 (`reports/2026-09-14_dofbot_xinu_aipl_uvc.pdf` on kodamay.org). Hand-off notes
 for the next session: `NEXT_SESSION_DOFBOT.md`.
 
+### 日本語：ロボットアーム（Yahboom DOFBOT）—— I²C・UVC カメラ・ファン・AIPL
+
+*2026-09-14.* **Yahboom DOFBOT（6 軸アーム、Raspberry Pi 5 版）**に付属する Pi 5 で、
+Linux の代わりにこのカーネルを起動し、アーム・手首カメラ・冷却ファンを Xinu 自身が直接動かしています。
+板の上には他に何も走っていません。
+
+上の 1 枚目の図は Mac 側の Xinu デスクトップシミュレータ（aice-avm）で、6 軸のサーボ角から描いた
+アームの 3D 模型、**Xinu 自身の UVC ドライバが受けた生映像**、実行中の文の行を反転する「AIPL program」窓です。
+2 枚目は 22 手の振り付け中に板の `/cam` から採った 5 コマ（腕が下を向いたときの床とケーブル、壁の接写、直立に戻ったときの天井）。
+
+**板ができること**
+
+| 部品 | 場所 | 内容 |
+|---|---|---|
+| RP1 I²C1 マスタ | `device/i2c/rp1i2c.c` | `0x1F00074000` の DesignWare I²C、GPIO2/3（FUNCSEL 3）、100 kHz、全部ポーリング＋`cntpct` の期限。`IC_COMP_TYPE` が DesignWare の値でなければ自分を無効化（RP1 は無クロックの周辺に `0xDEADDEAD` を返す）。 |
+| アーム層 | `system/arm.c` | DOFBOT の基板は I²C スレーブ `0x15`（STM8 が 6 個のバスサーボを駆動）。電文は Yahboom の `Arm_Lib.py` と同じ：`0x10+id` 1 軸、`0x1E`→`0x1D` 6 軸一括、`0x30+id` 読み戻し、`0x02` RGB、`0x06` ブザー、`0x1A` トルク、`0x38` ping、`0x05` リセット。角度→位置は `900+2200·θ/180`（サーボ 5 は `380+3320·θ/270`、2〜4 は `180−θ` に反転）。I²C 時間切れは 3 回まで再試行、読みが 3 回全滅なら基板をリセット（サーボと通信中は止まる）。 |
+| 文字列命令 | シェル `arm …`、HTTP `/arm/...` | `pose a1 a2 a3 a4 a5 a6 [ms]`、`set id ang [ms]`、`read`、`rgb r g b`、`buzz n`、`torque 0/1`、`ping id`、`ver`、`scan`、`stat`、`reset`。どちらも同じ `arm_command()`。 |
+| AIPL 組込み | `cc/cc.c` `v_arm_cmd` | 機内 AIPL の `arm_cmd(s: string): string`（効果 `io`）。下のアクターは起動 50 秒後に自動で載るので、電源を入れ直した直後から `remote_call("192.168.3.101:9010","dofbot","cmd","pose 90 90 90 90 90 30 1500")` が通る。 |
+| UVC カメラ | `device/usb/rp1usb.c`（末尾） | RP1 xHCI 上の **等時転送**による USB Video Class：記述子の下見（`/usb/cam-probe`）、`SET_CONFIGURATION` → VS Probe/Commit → `SET_INTERFACE`、等時 IN のエンドポイント文脈、512 個の TRB 環（消費のたび積み直し）、UVC ペイロードヘッダ（FID/EOF）でフレーム組み立て。Microdia `0c45:6340` から 320×240 YUY2 @10 fps。イベント環は 64→1024。 |
+| カメラ出力 | HTTP `/cam...` | `/cam/start?frame=3&fps=10`、`/cam/stat`、`/cam?w=160`（寸法）、`/cam?w=160&off=N`（RGB565 を 12 KB ずつ、CORS、`/fb` と同じ形）、`/cam.yuv?off=N`。`off=0` でフレームを写し取るので、分割取得が 2 枚にまたがらない。 |
+| ファン | `device/genet/rp1fan.c` | GPIO45 の RP1 PWM1 チャネル 3、`clk_pwm1` は xosc 50 MHz、周期 41566 ns・反転極性は Linux の `cooling_fan` と同じ。10 秒ごとにメールボックス（`GET_TEMPERATURE`）で SoC 温度を読み、Linux と同じ段（50/60/67.5/75 ℃ → 75/125/175/250）で追従。`/fan`、`/fan?level=`、`/fan?auto=1`。 |
+
+**応用例**
+
+- **計画は Mac、動作は板。** 正典 AIPL（OCaml）に `remote_call(host:port, actor, method, arg, ms)`（効果 `net`。板がすでに話している
+  UDP/9010 の一行 ASCII `Q`/`R` 電文をそのまま使う）と `arm_cmd`（効果 `io`）を足しました。計画側のアクターは腕に触らず、
+  板の `Arm` アクターだけが `io` を持ちます。22 手の振り付け（Yahboom の見る／掴む／積む姿勢）を、まず**デスクトップシミュレータの中の
+  アームの模型**（`127.0.0.1:9010`、同じ `dofbot` アクター）で、次に住所だけ変えて実機で走らせます。実測 44/44 応答 `ok`。
+- **プログラムの実行を見る。** OCaml の評価器が文ごとに `PC 行 列 アクター ファイル` を UDP/9011 へ撒き、シミュレータの
+  「AIPL program」窓がその行を反転します。一手を一行（`r = now d.go(b, "pose …") …; wait(1750);`）に書くと、
+  腕が動いているあいだその手の行が反転し続けます。
+- **カメラを輪の中へ。** 手首カメラは Xinu 自身が受け、シミュレータの窓に出ます。どのクライアントからも（CORS）毎秒数コマで取れます。
+  次は AIPL の組込み（`cam_frame()`／タグ検出）にして、計画側が見えるようにします。
+- **既知の制約。** カメラは YUY2 のみ（MJPEG なし）なので 640×480 だと 18 MB/s になります —— 320×240 以下で使います。
+  EP0 の転送環は全 USB 装置で共有なので、配信開始のたびにカメラをアドレスし直します。立方体の把持は未解決（手首カメラに指が映りません）。
+
+全体の記録（Linux 上の三層の制御経路、Xinu 移植、AIPL アクター、シミュレータの窓、UVC ドライバとその最初の失敗、ファン）は
+8 頁のレポート *Mac から DOFBOT（Raspberry Pi 5）を動かす制御経路*（kodamay.org の `reports/2026-09-14_dofbot_xinu_aipl_uvc.pdf`）。
+次回への引き継ぎは `NEXT_SESSION_DOFBOT.md`。
+
 ## Documentation
 
 - **User's manual** (operator-facing, EN + JA): typeset PDFs under `docs/`
