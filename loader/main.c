@@ -305,6 +305,10 @@ static void genet_rx_tick(void)
             s_usb_next = t + 300;                /* ~3 s between attempts */
         }
         rp1usb_mouse_pump();                                       /* USB mouse -> cursor */
+        /* ファン: 10 秒ごとに SoC 温度を読んで Linux と同じ段で回す（/fan?level= で手動にできる）。
+           d4eac11 で DOFBOT の起動時仕事を専用プロセスへ移したとき、一緒に消えていた（fan level=-1 のまま）。 */
+        { static unsigned long s_fan_next = 1500; extern void rp1fan_thermal_tick(void);
+          if (t >= s_fan_next) { s_fan_next = t + 1000; rp1fan_thermal_tick(); } }
     }
 #endif
     g_rx_busy = 0;

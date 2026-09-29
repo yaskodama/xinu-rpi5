@@ -148,7 +148,10 @@ int arm_command(const char *args, char *out, int cap)
         int nfail = 0;
         p = a_put(out, p, cap, "angles");
         for (int id = 1; id <= 6; id++) { int a = arm_read(id); p = a_put(out, p, cap, " "); if (a < 0) { nfail++; p = a_put(out, p, cap, "?"); } else p = a_putn(out, p, cap, a); }
-        if (nfail == 6) { if (++g_arm_readfail >= 3) { arm_reset_board(); p = a_put(out, p, cap, " (board reset)"); } }
+        /* 6 軸とも読めない回を数えるだけにする。以前はこれが 3 回続くと基板リセット（0x05）を送っていたが、
+           サーボ動作中の読みは ? になりやすく、動作直後に読みを重ねるとリセットが入り、基板は電源を入れ直すまで
+           応答しなくなった（2026-09-27〜28 に 4 回）。リセットは "arm reset" で明示的に頼んだときだけ送る。 */
+        if (nfail == 6) { ++g_arm_readfail; p = a_put(out, p, cap, " (no answer x"); p = a_putn(out, p, cap, g_arm_readfail); p = a_put(out, p, cap, ")"); }
         else g_arm_readfail = 0;
         a_put(out, p, cap, "\n"); return 0;
     }
