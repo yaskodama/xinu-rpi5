@@ -716,6 +716,51 @@ int rp1usb_full_slot(void) { return g_full_slot; }
 static unsigned char g_camctx[33*64] __attribute__((aligned(64)));
 static int g_cam_active; static int g_cam_ctrl=-1, g_cam_slot=-1, g_cam_dci=3;
 static int g_cam_port=-1, g_cam_speed=0;
+/* ★ 2026-10-27: 「配信中」の旗 g_cam_active が start/stop を通らずに 0 になる（E0m 試行 7〜13。
+   エージェントが板を離れるときの POST /cc の最中に起きる。15:00:36 に実測）。旗が 0 だと
+   ポンプがカメラの転送イベントを拾わず、環が枯れて新しいコマが来ない。
+   書いた命令を突き止めるため、旗にハードウェア監視点（DBGWVR0/DBGWCR0、EL1 の書き込み）を
+   掛けられるようにする（/cam/wp?on=1）。当たると exception.c が camwp_hit() を呼び、
+   PC を残して監視点を外す。書き込みはそのまま通る。
+   g_cam_want は旗の控え。.data に置いて旗（.bss）から離す。ポンプが食い違いを数える。 */
+static int g_cam_want = -1;
+static unsigned long g_cam_clobbers = 0, g_cam_clobber_tick = 0;
+static int g_camwp_on = 0;
+volatile unsigned long g_camwp_pc = 0, g_camwp_far = 0, g_camwp_hits = 0, g_camwp_tick = 0;
+static unsigned g_cam_dis_cc = 0;
+static void camwp_disarm(void)
+{
+    if (!g_camwp_on) return;
+    __asm__ volatile ("msr dbgwcr0_el1, xzr\n isb" ::: "memory");
+}
+static void camwp_arm(void)
+{
+    if (!g_camwp_on) return;
+    unsigned long a = (unsigned long)&g_cam_active, m;
+    __asm__ volatile ("msr oslar_el1, xzr\n isb" ::: "memory");            /* OS ロックを外す（コールド起動で掛かっている） */
+    __asm__ volatile ("mrs %0, mdscr_el1" : "=r"(m));
+    m &= ~1ul;                                                              /* SS（単一ステップ）は落とす */
+    m |= (1ul << 15) | (1ul << 13);                                         /* MDE, KDE: EL1 で監視点を効かせる */
+    __asm__ volatile ("msr mdscr_el1, %0\n isb" :: "r"(m) : "memory");
+    __asm__ volatile ("msr dbgwvr0_el1, %0" :: "r"(a & ~7ul) : "memory");
+    /* E=1, PAC=01(EL1), LSC=10(書き込み), BAS=0x0F（8 バイト境界から 4 バイト） */
+    unsigned long c = 1ul | (1ul << 1) | (2ul << 3) | (0x0Ful << 5);
+    __asm__ volatile ("msr dbgwcr0_el1, %0\n isb\n msr daifclr, #8" :: "r"(c) : "memory");
+}
+/* exception.c の同期例外（EC 0x35: 同じ EL の監視点）から。監視点を外して戻れば書き込みが通る。 */
+void camwp_hit(unsigned long elr, unsigned long far)
+{
+    extern unsigned long timer_ticks(void);
+    __asm__ volatile ("msr dbgwcr0_el1, xzr\n isb" ::: "memory");
+    if (!g_camwp_hits) { g_camwp_pc = elr; g_camwp_far = far; g_camwp_tick = timer_ticks(); }
+    g_camwp_hits++;
+}
+int rp1usb_cam_wp(int on)
+{
+    if (on) { g_camwp_on = 1; g_camwp_hits = 0; g_camwp_pc = g_camwp_far = 0; if (g_cam_active) camwp_arm(); }
+    else    { camwp_disarm(); g_camwp_on = 0; }
+    return g_camwp_on;
+}
 static int g_cam_vs_if=1, g_cam_ep=0x81, g_cam_nalt=0;
 static struct { int alt, mps, mult; } g_cam_alt[12];   /* VS の代替設定と等時パケット長 */
 static int cp_put(char *o,int p,int cap,const char *s){ while(*s&&p<cap-1) o[p++]=*s++; o[p]=0; return p; }
@@ -1008,6 +1053,10 @@ int  rp1usb_poll_mode_get(void) { return g_poll_mode; }
 static void cam_handle_event(const struct trb *ev);
 void rp1usb_mouse_pump(void)
 {
+    if (g_cam_want == 1 && !g_cam_active) {      /* start/stop を通らずに旗が落ちた（上の ★ 2026-10-27） */
+        extern unsigned long timer_ticks(void);
+        g_cam_clobbers++; g_cam_clobber_tick = timer_ticks(); g_cam_want = 0;
+    }
     if (!g_mouse_active && !g_kbd_active && !g_cam_active) return;
     if (g_kbd_active) kbd_repeat_tick();        /* auto-repeat held keys */
     if (g_mouse_active && g_poll_mode) {       /* control-pipe polling path */
@@ -1475,10 +1524,26 @@ int rp1usb_cam_start(int frame_index, int fps, char *out, int cap)
     static const int W[6]={0,640,352,320,176,160}, H[6]={0,480,288,240,144,120};
     if (frame_index<1||frame_index>5) frame_index=3;
     if (fps<1) fps=10;
-    g_cam_active=0;
+    /* 配信中に同じ寸法で頼まれたら何もしない。以前はここでも始動し直し、古い枠を残したまま
+       新しい枠を取るので、2 回目で帯域が尽きて cfgep_cc=8 になり電源断まで戻らなかった。 */
+    if (g_cam_active && g_cam_w==W[frame_index] && g_cam_fps==fps) {
+        p=cp_put(out,p,cap,"cam start: already streaming -> STREAMING\n");
+        return 0;
+    }
+    camwp_disarm();
+    g_cam_want=0; g_cam_active=0;
     /* 配信のたびにカメラをアドレスし直す: EP0 の環と装置文脈を新しくして、間に他の装置が
        挟まっていても制御転送が通る状態から始める。 */
     rp1usb_select_ctrl(g_cam_ctrl);
+    /* 前回の枠を返してから取り直す（Disable Slot）。返さないと等時エンドポイントの帯域が
+       残ったままになり、次の Configure Endpoint が帯域不足（cc=8）で断られる。 */
+    if (g_cam_slot>0) {
+        cmd_submit(0,0,0,(10u<<10)|((unsigned)g_cam_slot<<24));
+        struct trb dv=event_wait(33);
+        g_cam_dis_cc=(dv.status>>24)&0xff;
+        g_dcbaa[g_cam_slot]=0; __asm__ volatile("dsb sy":::"memory");
+        g_cam_slot=-1;
+    }
     { int sl=rp1usb_enum_slot(g_cam_port); if (sl<0) { cp_put(out,0,cap,"cam: enum failed\n"); return -1; }
       g_cam_speed=(int)((g_enum_portsc>>10)&0xf); g_addr_ctx=g_camctx;
       int ar=rp1usb_address_device(sl,g_cam_port,g_cam_speed,0); g_addr_ctx=g_dev_ctx;
@@ -1533,7 +1598,8 @@ int rp1usb_cam_start(int frame_index, int fps, char *out, int cap)
     if (g_cam_cfg_cc==1) {
         for (int i=0;i<CAM_NTRB-1;i++) cam_queue_trb();                     /* 環を満たす（link の手前まで） */
         R32(g_db, slot*4)=(unsigned)g_cam_dci; __asm__ volatile("dsb sy":::"memory");
-        g_cam_active=1;
+        g_cam_active=1; g_cam_want=1;
+        camwp_arm();
     }
     p=cp_put(out,p,cap,"cam start: slot "); p=cp_num(out,p,cap,slot); p=cp_put(out,p,cap," ctrl "); p=cp_num(out,p,cap,g_cam_ctrl);
     p=cp_put(out,p,cap,"\n  setcfg="); p=cp_num(out,p,cap,g_cam_setcfg_cc); p=cp_put(out,p,cap," probe_cc="); p=cp_num(out,p,cap,g_cam_probe_cc);
@@ -1549,7 +1615,8 @@ int rp1usb_cam_start(int frame_index, int fps, char *out, int cap)
 int rp1usb_cam_stop(void)
 {
     if (!g_cam_active) return 0;
-    g_cam_active=0;
+    camwp_disarm();
+    g_cam_want=0; g_cam_active=0;
     xhci_switch(g_cam_ctrl);
     (void)control_nodata(g_cam_slot,0x01,11,0,(unsigned)g_cam_vs_if);      /* alt 0 = 帯域を返す */
     return 0;
@@ -1568,6 +1635,12 @@ int rp1usb_cam_stat(char *out, int cap)
     p=cp_put(out,p,cap," fill="); p=cp_num(out,p,cap,g_cam_fill); p=cp_put(out,p,cap," expect="); p=cp_num(out,p,cap,g_cam_expect);
     p=cp_put(out,p,cap," ring_idx="); p=cp_num(out,p,cap,g_cam_idx);
     if (g_cam_active) { unsigned st=ctx_at(g_camctx,g_cam_dci)[0]&7; p=cp_put(out,p,cap," epstate="); p=cp_num(out,p,cap,(long)st); }
+    p=cp_put(out,p,cap,"\nslot="); p=cp_num(out,p,cap,g_cam_slot); p=cp_put(out,p,cap," disable_cc="); p=cp_num(out,p,cap,(long)g_cam_dis_cc);
+    p=cp_put(out,p,cap," clobbers="); p=cp_num(out,p,cap,(long)g_cam_clobbers); p=cp_put(out,p,cap," clobber_tick="); p=cp_num(out,p,cap,(long)g_cam_clobber_tick);
+    p=cp_put(out,p,cap,"\nwp="); p=cp_num(out,p,cap,g_camwp_on); p=cp_put(out,p,cap," hits="); p=cp_num(out,p,cap,(long)g_camwp_hits);
+    p=cp_put(out,p,cap," pc=0x"); p=cp_hex(out,p,cap,(unsigned)(g_camwp_pc>>32),8); p=cp_hex(out,p,cap,(unsigned)g_camwp_pc,8);
+    p=cp_put(out,p,cap," far=0x"); p=cp_hex(out,p,cap,(unsigned)(g_camwp_far>>32),8); p=cp_hex(out,p,cap,(unsigned)g_camwp_far,8);
+    p=cp_put(out,p,cap," tick="); p=cp_num(out,p,cap,(long)g_camwp_tick);
     p=cp_put(out,p,cap,"\n");
     return p;
 }

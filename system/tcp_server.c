@@ -1348,6 +1348,11 @@ static int http_build(const char *req, char *out, int max)
             rp1usb_cam_stop(); fl = s_put(cbody, 0, "cam stopped\n");
         } else if (str_starts(rpath, "/cam/stat")) {
             fl = rp1usb_cam_stat(cbody, (int)sizeof cbody);
+        } else if (str_starts(rpath, "/cam/wp")) {
+            /* カメラの旗の監視点: /cam/wp?on=1 で掛ける、?on=0 で外す（結果は /cam/stat の wp= 行） */
+            extern int rp1usb_cam_wp(int);
+            int on = rp1usb_cam_wp(q_int(req, "on", 1));
+            fl = s_put(cbody, 0, on ? "cam wp on\n" : "cam wp off\n");
         } else {
             int srcw = rp1usb_cam_width(), srch = rp1usb_cam_height();
             /* 1 枚を何回かに分けて取るあいだに「最新」が入れ替わると上下で別のフレームが継ぎ合わさる。
@@ -1355,8 +1360,12 @@ static int http_build(const char *req, char *out, int max)
             static unsigned char snap[640*480*2]; static int snap_len = 0;
             char offbuf[12]; int has_off = q_param(req, "off", offbuf, sizeof offbuf);
             int off = q_int(req, "off", 0); if (off < 0) off = 0; if (off & 1) off++;
+            /* ★ 2026-10-27: 新しいコマがまだ無いとき（始動し直した直後）は写しを捨てる。以前は前回の
+               写しをそのまま返したので、置き場を撮ったつもりが真上を向いていたときの天井の絵になった
+               （E0m 試行 7・10）。寸法行の長さが 0 なら「まだ無い」。 */
             if (!has_off || off == 0) { int fl0 = 0; const unsigned char *f0 = rp1usb_cam_frame(&fl0);
-                if (f0 && fl0 > 0 && fl0 <= (int)sizeof snap) { for (int i = 0; i < fl0; i++) snap[i] = f0[i]; snap_len = fl0; } }
+                if (f0 && fl0 > 0 && fl0 <= (int)sizeof snap) { for (int i = 0; i < fl0; i++) snap[i] = f0[i]; snap_len = fl0; }
+                else snap_len = 0; }
             int flen = snap_len; const unsigned char *fr = snap_len ? snap : 0;
             if (str_starts(rpath, "/cam.yuv")) {
                 cct = "application/octet-stream";

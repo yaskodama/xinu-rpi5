@@ -105,6 +105,12 @@ _real_start:
     msr     cnthctl_el2, x0
     msr     cntvoff_el2, xzr
 
+    // MDCR_EL2: TDE/TDA/TDOSA/TDRA を落とす。リセット値は不定で、TDE が立っていると EL1 の監視点
+    // （rp1usb.c のカメラ旗の見張り）が EL2 へ行ってしまう。2026-10-27
+    mrs     x0, mdcr_el2
+    bic     x0, x0, #0xf00
+    msr     mdcr_el2, x0
+
     mov     x0, #0x0800              // SCTLR_EL1 sane reset (MMU/caches off; mmu_init enables later)
     movk    x0, #0x30d0, lsl #16
     msr     sctlr_el1, x0
@@ -170,6 +176,9 @@ _smp_start:
     orr     x0, x0, #3
     msr     cnthctl_el2, x0
     msr     cntvoff_el2, xzr
+    mrs     x0, mdcr_el2             // TDE/TDA/TDOSA/TDRA を落とす（上と同じ）
+    bic     x0, x0, #0xf00
+    msr     mdcr_el2, x0
     mov     x0, #0x0800              // SCTLR_EL1 sane reset (MMU/caches off)
     movk    x0, #0x30d0, lsl #16
     msr     sctlr_el1, x0

@@ -73,6 +73,16 @@ void sync_dispatch_c(void)
     if (is_abort && is_xlat && vm_fault(far))
         return;                       /* mapped on demand -> retry the instruction */
 
+    /* EC 0x35 = 同じ EL の監視点。カメラの旗を見張る監視点（rp1usb.c の camwp）が当たった。
+       PC を残して監視点を外し、戻る（その書き込みはやり直しで通る）。 */
+    if (ec == 0x35) {
+        extern void camwp_hit(unsigned long elr, unsigned long far);
+        unsigned long elr;
+        __asm__ volatile ("mrs %0, elr_el1" : "=r"(elr));
+        camwp_hit(elr, far);
+        return;
+    }
+
     dump_and_halt("sync exception");  /* unhandled -> fatal */
 }
 
